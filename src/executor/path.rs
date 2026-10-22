@@ -667,9 +667,10 @@ fn find_user_command_uncached(
     if has_path_separator(name) {
         // `/bin/bash` / `/usr/bin/bash` normally resolve to the literal
         // file (execve semantics). The substitute chain below (explicit
-        // compatible-shell env, winuxsh, then a PATH search for `bash`)
-        // is the Windows fixture: hosts without /bin need SOME bash to
-        // satisfy suite shebangs. On unix the chain would invert lookup
+        // compatible-shell env, the configured shell root, then a PATH
+        // search for `bash`) is the Windows fixture: hosts without /bin need
+        // SOME bash to satisfy suite shebangs. On unix the chain would invert
+        // lookup
         // priority — e.g. on macOS a homebrew bash at the front of PATH
         // would shadow the real /bin/bash that the word names — so unix
         // takes the literal probe directly (GNU findcmd.c:383-385:
@@ -680,7 +681,7 @@ fn find_user_command_uncached(
             if let Some(found) = configured_compatible_shell(env_vars) {
                 return Some(found);
             }
-            if let Some(found) = configured_shell_root_winuxsh(env_vars) {
+            if let Some(found) = configured_shell_root_host(env_vars) {
                 return Some(found);
             }
             if let Some(found) = find_user_command("bash", env_vars) {
@@ -875,10 +876,14 @@ fn configured_compatible_shell(env_vars: &HashMap<String, String>) -> Option<Pat
     executable_candidate(&candidate, env_vars)
 }
 
+/// The host shell inside the configured installation root. The product binary
+/// is `native-shell.exe`; the pre-rename `niu.exe` / `winuxsh.exe` names are
+/// deliberately NOT probed, because that would keep an installation dependent
+/// on compatibility aliases the product no longer ships.
 #[cfg(windows)]
-fn configured_shell_root_winuxsh(env_vars: &HashMap<String, String>) -> Option<PathBuf> {
-    let candidate = configured_shell_root(env_vars)?.join("winuxsh.exe");
-    executable_candidate(&candidate, env_vars)
+fn configured_shell_root_host(env_vars: &HashMap<String, String>) -> Option<PathBuf> {
+    let root = configured_shell_root(env_vars)?;
+    executable_candidate(&root.join("native-shell.exe"), env_vars)
 }
 
 pub fn should_run_with_shell(path: &Path) -> bool {

@@ -1,12 +1,17 @@
-//! Thin Windows-compatible bash entry point for Niubash installations.
+//! Thin Windows-compatible bash entry point for Native Shell installations.
 //!
-//! AI invoker entry — forwards to the host shell (niu/winuxsh).
+//! AI invoker entry — forwards to the host shell (`native-shell.exe`).
 //!
 //! The shim intentionally forwards the command line and standard handles
 //! without interpreting shell syntax. It lets Unix scripts resolve
-//! `/usr/bin/bash` to the installed Niubash executable. The pre-rename
-//! `winuxsh.exe` / `WINUXSH_SHELL` names stay in the fallback chain so
-//! layouts built by older installers keep launching.
+//! `/usr/bin/bash` to the installed Native Shell executable.
+//!
+//! The pre-rename `niu.exe` / `winuxsh.exe` names are gone from the search
+//! chain: the product ships `native-shell.exe`, and keeping the old names
+//! would force every installation to carry compatibility aliases forever.
+//! The legacy *environment* variables (`NIU_SHELL`, `WINUXSH_SHELL`,
+//! `WINUXSH`) stay readable because an outer process of an older layout may
+//! still export them, but nothing here produces those names.
 
 use std::env;
 use std::io::{self, Write};
@@ -26,7 +31,7 @@ fn main() {
     let Some(shell) = locate_shell() else {
         let _ = writeln!(
             io::stderr(),
-            "bash shim: cannot locate niu.exe; set NIU_SHELL to its path",
+            "bash shim: cannot locate native-shell.exe; set NATIVE_SHELL_BIN to its path",
         );
         std::process::exit(127);
     };
@@ -196,8 +201,21 @@ fn interactive_launch_wanted() -> bool {
     false
 }
 
+/// The executable name this shim forwards to: the product binary.
+const HOST_SHELL_NAME: &str = "native-shell.exe";
+
+/// Names the host shell may be published under inside one installation.
+/// Exactly one: the product binary. There is deliberately no second alias -
+/// the pre-rename names were dropped rather than carried, and inventing a
+/// new one (`shell.exe`) would only create a name the product never ships.
+const HOST_SHELL_ALIASES: [&str; 1] = [HOST_SHELL_NAME];
+
 fn locate_shell() -> Option<PathBuf> {
-    for variable in ["NIU_SHELL", "WINUXSH_SHELL"] {
+    // 1. An explicit pointer always wins. These are the pre-rename variable
+    //    names on purpose: an outer process of an older layout may still
+    //    export them, and honouring a path that really points at a shell is
+    //    strictly better than failing. Nothing in this product sets them.
+    for variable in ["NATIVE_SHELL_BIN", "NIU_SHELL", "WINUXSH_SHELL"] {
         if let Some(path) = env::var_os(variable).map(PathBuf::from) {
             if is_executable_file(&path) && !same_as_current_exe(&path) {
                 return Some(path);
@@ -205,10 +223,15 @@ fn locate_shell() -> Option<PathBuf> {
         }
     }
 
+    // 2. The installation this shim lives in: walk up from the shim looking
+    //    for the product binary. This is the path that makes
+    //    `<root>/winuxcmd/usr/bin/bash.exe` find `<root>/native-shell.exe`
+    //    with no environment at all - the common case for a user typing
+    //    `bash` into cmd.exe or PowerShell.
     if let Ok(current) = env::current_exe() {
         let mut directory = current.parent().map(Path::to_path_buf);
         while let Some(path) = directory {
-            for name in ["niu.exe", "winuxsh.exe"] {
+            for name in HOST_SHELL_ALIASES {
                 let candidate = path.join(name);
                 if is_executable_file(&candidate) && !same_as_current_exe(&candidate) {
                     return Some(candidate);
@@ -218,6 +241,8 @@ fn locate_shell() -> Option<PathBuf> {
         }
     }
 
+    // 3. A shell the caller pointed at. `SHELL` is the POSIX convention; the
+    //    pre-rename `WINUXSH` is kept readable for the same reason as above.
     for variable in ["WINUXSH", "SHELL"] {
         if let Some(path) = env::var_os(variable).map(PathBuf::from) {
             if is_executable_file(&path) && !same_as_current_exe(&path) {
@@ -226,9 +251,10 @@ fn locate_shell() -> Option<PathBuf> {
         }
     }
 
-    find_on_path("niu.exe")
-        .or_else(|| find_on_path("winuxsh.exe"))
-        .or_else(|| find_on_path("winuxsh"))
+    // 4. Last resort: the product binary anywhere on PATH (the portable
+    //    install a user put in their own directory), then the extension-less
+    //    POSIX spelling a Unix-shaped layout would carry.
+    find_on_path(HOST_SHELL_NAME).or_else(|| find_on_path("native-shell"))
 }
 
 /// The invocation name worth forwarding to the host shell, if any. Returns
