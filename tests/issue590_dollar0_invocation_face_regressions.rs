@@ -4,7 +4,7 @@
 //! `dollar_vars[0] = argv[0]` (verbatim, shell.c:1797-1799) and keys the
 //! sh/ash (shell.c:733-737) and rbash (shell.c:1258-1299) contracts off its
 //! basename. One shim binary serves every installed face, so the invocation
-//! name travels in NIU_INVOKED_AS (rubash#504, extended to every shell face
+//! name travels in NATIVE_SHELL_INVOKED_AS (rubash#504, extended to every shell face
 //! by #590); the engine consumes it — ahead of the process argv[0] path,
 //! behind an explicit BASH_ARGV0 import (variables.c:1547-1555, which GNU
 //! ranks above argv[0]) — and consumes it on read so it never leaks into
@@ -36,10 +36,10 @@ impl ShimTree {
         let output = Command::new(self.dir.join(format!("{face}.exe")))
             .env("NIU_SHELL", env!("CARGO_BIN_EXE_rubash"))
             // The dev/CI parent may carry a niu session's BASH_ARGV0 or a
-            // stale NIU_INVOKED_AS; the chain under test must see a clean
+            // stale NATIVE_SHELL_INVOKED_AS; the chain under test must see a clean
             // invocation.
             .env_remove("BASH_ARGV0")
-            .env_remove("NIU_INVOKED_AS")
+            .env_remove("NATIVE_SHELL_INVOKED_AS")
             .args(["-c", script])
             .output()
             .expect("run shim face");
@@ -88,21 +88,21 @@ fn rbash_face_reports_rbash_as_dollar_zero() {
 }
 
 /// The forwarded name is consumed on read: the shell environment never sees
-/// NIU_INVOKED_AS (the #504 isolation rule).
+/// NATIVE_SHELL_INVOKED_AS (the #504 isolation rule).
 #[test]
 fn forwarded_name_does_not_leak_into_the_shell_env() {
     let tree = ShimTree::new();
-    let (stdout, stderr, rc) = tree.run_face("sh", "echo \"[$NIU_INVOKED_AS]\"");
+    let (stdout, stderr, rc) = tree.run_face("sh", "echo \"[$NATIVE_SHELL_INVOKED_AS]\"");
     assert_eq!(rc, Some(0), "stderr: {stderr:?}");
     assert_eq!(stdout, "[]\n", "stderr: {stderr:?}");
 }
 
-/// The engine alone consumes NIU_INVOKED_AS as its argv[0] reconstruction:
+/// The engine alone consumes NATIVE_SHELL_INVOKED_AS as its argv[0] reconstruction:
 /// `$0` and the invocation contract (posix for sh) both follow it.
 #[test]
 fn engine_honors_niu_invoked_as_directly() {
     let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
-        .env("NIU_INVOKED_AS", "sh")
+        .env("NATIVE_SHELL_INVOKED_AS", "sh")
         .env_remove("BASH_ARGV0")
         .args(["-c", "echo $0; set -o | grep -w posix"])
         .output()
@@ -119,7 +119,7 @@ fn engine_honors_niu_invoked_as_directly() {
 #[test]
 fn explicit_bash_argv0_outranks_the_forwarded_face() {
     let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
-        .env("NIU_INVOKED_AS", "sh")
+        .env("NATIVE_SHELL_INVOKED_AS", "sh")
         .env("BASH_ARGV0", "custom-zero")
         .args(["-c", "echo $0"])
         .output()
@@ -133,7 +133,7 @@ fn explicit_bash_argv0_outranks_the_forwarded_face() {
 #[test]
 fn explicit_c_operand_still_wins() {
     let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
-        .env("NIU_INVOKED_AS", "sh")
+        .env("NATIVE_SHELL_INVOKED_AS", "sh")
         .env_remove("BASH_ARGV0")
         .args(["-c", "echo $0", "operand-zero"])
         .output()
@@ -155,7 +155,7 @@ fn bare_name_invocation_reports_argv0_verbatim() {
     let output = Command::new("faceprov.exe")
         .env("PATH", &dir)
         .env_remove("BASH_ARGV0")
-        .env_remove("NIU_INVOKED_AS")
+        .env_remove("NATIVE_SHELL_INVOKED_AS")
         .args(["-c", "echo $0"])
         .output()
         .expect("run engine under bare name");
@@ -176,7 +176,7 @@ fn stdin_script_keeps_the_forwarded_face_as_dollar_zero() {
     let mut child = Command::new(tree.dir.join("sh.exe"))
         .env("NIU_SHELL", env!("CARGO_BIN_EXE_rubash"))
         .env_remove("BASH_ARGV0")
-        .env_remove("NIU_INVOKED_AS")
+        .env_remove("NATIVE_SHELL_INVOKED_AS")
         .arg("-s")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

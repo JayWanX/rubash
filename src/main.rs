@@ -35,7 +35,7 @@ fn run_main() -> i32 {
 
     // rubash#590: the bash.exe shim (src/bin/bash.rs) erases Windows argv[0]
     // when it re-execs this engine, so the invocation face travels in
-    // NIU_INVOKED_AS (rubash#504 forwarded the sh/ash faces for the POSIX
+    // NATIVE_SHELL_INVOKED_AS (rubash#504 forwarded the sh/ash faces for the POSIX
     // contract; #590 extends the forward to every shell face). GNU
     // set_shell_name (shell.c:1778-1806) binds dollar_vars[0] AND the
     // sh/su/rbash contracts to that same argv[0], so the forwarded name is
@@ -46,9 +46,11 @@ fn run_main() -> i32 {
     // describes how THIS process was invoked, never a shell variable or a
     // child-inheritable setting (the same consume-on-read rule the niubash
     // runtime host applies).
-    let invoked_as = env::var("NIU_INVOKED_AS").ok().filter(|v| !v.is_empty());
+    let invoked_as = env::var("NATIVE_SHELL_INVOKED_AS")
+        .ok()
+        .filter(|v| !v.is_empty());
     if invoked_as.is_some() {
-        env::remove_var("NIU_INVOKED_AS");
+        env::remove_var("NATIVE_SHELL_INVOKED_AS");
     }
     let mut args: Vec<String> = env::args().collect();
     // niubash#362: a respawned async `&` child too large for the
@@ -103,7 +105,7 @@ fn run_main() -> i32 {
     // AND shell_name, so "BASH_ARGV0=this-bash bash -c 'echo $0 $BASH_ARGV0'"
     // prints this-bash twice. The executable path is only the fallback when
     // the environment did not supply a value.
-    // rubash#590: the invocation face read above (NIU_INVOKED_AS, else
+    // rubash#590: the invocation face read above (NATIVE_SHELL_INVOKED_AS, else
     // argv[0]) reconstructs the argv[0] the shim erased, per GNU
     // set_shell_name (shell.c:1778-1806): it feeds dollar_vars[0]/shell_name
     // and apply_invocation_shell_mode below. It ranks behind an explicit

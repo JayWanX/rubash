@@ -42,7 +42,7 @@ fn main() {
     // (bash.exe, sh.exe, ...), so Windows argv[0] cannot carry the contract
     // through Command::new — the child would see the resolved host path and
     // `sh -c 'set -o | grep -w posix'` reported off with `$0` = niu. Forward
-    // the invocation name through NIU_INVOKED_AS instead; the host applies
+    // the invocation name through NATIVE_SHELL_INVOKED_AS instead; the host applies
     // the same shell.c rules (posix on for sh/ash, login marker) AND binds
     // `$0` to the face: GNU set_shell_name (shell.c:1778-1806) derives
     // dollar_vars[0] from the same argv[0], so `sh -c 'echo $0'` prints `sh`
@@ -57,10 +57,10 @@ fn main() {
     suppress_child_console_window(&mut command);
     match forwarded_invocation_name(env::args_os().next().as_deref()) {
         Some(invoked_as) => {
-            command.env("NIU_INVOKED_AS", invoked_as);
+            command.env("NATIVE_SHELL_INVOKED_AS", invoked_as);
         }
         None => {
-            command.env_remove("NIU_INVOKED_AS");
+            command.env_remove("NATIVE_SHELL_INVOKED_AS");
         }
     }
     let status = command
@@ -265,7 +265,7 @@ fn locate_shell() -> Option<PathBuf> {
 /// the same argv[0], so `$0` must read the invocation face, and
 /// shell.c:1258-1299 shell_is_restricted keys `rbash' off it). Any other
 /// name forwards nothing, and the caller scrubs any inherited
-/// NIU_INVOKED_AS instead.
+/// NATIVE_SHELL_INVOKED_AS instead.
 fn forwarded_invocation_name(argv0: Option<&std::ffi::OsStr>) -> Option<String> {
     let argv0 = argv0?.to_str()?;
     let basename = argv0.rsplit(['/', '\\']).next()?;
@@ -364,7 +364,7 @@ mod tests {
     fn bash_and_rbash_faces_forward_the_invocation_name() {
         // rubash#590: `$0` must read the invocation face — GNU set_shell_name
         // (shell.c:1797-1799) binds dollar_vars[0] to argv[0], which this
-        // forward erases, so the bash/rbash faces travel in NIU_INVOKED_AS
+        // forward erases, so the bash/rbash faces travel in NATIVE_SHELL_INVOKED_AS
         // the same way sh/ash already do.
         assert_eq!(
             forwarded_invocation_name(Some("bash".as_ref())),

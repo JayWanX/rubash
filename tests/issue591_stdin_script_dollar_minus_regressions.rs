@@ -18,7 +18,7 @@ fn run_stdin(args: &[&str], stdin: &[u8]) -> (String, String, Option<i32>) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rubash"));
     cmd.args(args)
         .env_remove("BASH_ARGV0")
-        .env_remove("NIU_INVOKED_AS")
+        .env_remove("NATIVE_SHELL_INVOKED_AS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

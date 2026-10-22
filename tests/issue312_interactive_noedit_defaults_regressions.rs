@@ -211,7 +211,7 @@ fn interactive_alias_output(args: &[&str], input: &str, rc: Option<&str>) -> std
         .env("HISTFILE", dir.join("history"))
         .env_remove("BASH_ENV")
         .env_remove("ENV")
-        .env_remove("NIU_INVOKED_AS")
+        .env_remove("NATIVE_SHELL_INVOKED_AS")
         .env_remove("BASH_ARGV0")
         .env_remove("__RUBASH_SHOPT_STATE")
         .env_remove("__RUBASH_ALIAS_STREAMED")

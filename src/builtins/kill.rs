@@ -2057,7 +2057,7 @@ pub fn new_background_wrapper_nonce() -> String {
 
 /// rubash#866: consume the background-wrapper spawn handshake — called from
 /// main() before any parser or executor touches argv (same consume-on-read
-/// face as NIU_INVOKED_AS and `--internal-yes|head|wc`). The wrapper role
+/// face as NATIVE_SHELL_INVOKED_AS and `--internal-yes|head|wc`). The wrapper role
 /// arms only when the argv flag nonce and the environment nonce AGREE (both
 /// were constructed by our own spawn site); afterwards the environment key
 /// is scrubbed unconditionally so a user-forged value can neither arm
