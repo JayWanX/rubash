@@ -1,0 +1,2 @@
+# (none) GNU baseline completes for all 83 tests at TIMEOUT_SECS=150.
+# rubash-side hangs (printf) are tracked as rubash bugs, not listed here.

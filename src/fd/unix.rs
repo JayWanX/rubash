@@ -1,0 +1,628 @@
+//! Unix implementation of the fd-layer API surface (Q12 L1).
+//!
+//! The Windows side models fds as raw HANDLEs in an explicit table because
+//! win32 handle inheritance is opt-in per handle. Unix needs none of that:
+//! fork inherits everything, `dup`/`pipe`/`open` give real integer fds, and
+//! `FdEntry`'s "duplicate shares the file offset" invariant is what the
+//! kernel already does. So this shim is a thin POSIX translation of the same
+//! 18-symbol surface `crate::fd` exposes to consumers, with HANDLE = RawFd.
+//!
+//! Semantics preserved (docs/governance 3.6 / fd_table.rs header):
+//!   - duplicate_handle shares the open file description (offset shared) --
+//!     exactly libc::dup.
+//!   - spawn_whitelisted's "exactly these handles survive" rule maps to
+//!     close-on-exec: every fd the child must keep is dup'd past the exec
+//!     barrier; everything else is CLOEXEC and disappears.
+
+use std::os::fd::{FromRawFd, RawFd};
+
+pub type HANDLE = RawFd; // isize-compatible integer fd
+
+pub fn close_handle(h: HANDLE) {
+    // fd 0/1/2 are the process's live stdio; closing them is the caller's
+    // explicit decision and happens through other paths.
+    if h >= 0 {
+        unsafe { libc::close(h) };
+    }
+}
+
+/// Result of a bounded readability wait on an fd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadWait {
+    Ready,
+    Timeout,
+}
+
+/// GNU builtins/read.def fstat gate (`tmsec = tmusec = 0` on S_ISREG):
+/// a regular-file input disables `read -t` entirely.
+pub fn is_disk_file(h: HANDLE) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::fstat(h, &mut st) == 0
+            && (u32::from(st.st_mode) & u32::from(libc::S_IFMT)) == u32::from(libc::S_IFREG)
+    }
+}
+
+/// The filesystem path an open regular-file descriptor refers to, or
+/// None for pipes/ttys/devices. GNU's `open("/proc/self/fd/N", O_RDONLY)`
+/// on a regular file performs a FRESH open at offset 0 — callers
+/// emulating /dev/fd reopen semantics need the path (dup would share the
+/// writer's offset). `/proc` itself is the authority; non-proc hosts fall
+/// back to fstat+FCNTL-less unknown → None.
+pub fn disk_file_path(h: HANDLE) -> Option<std::path::PathBuf> {
+    if !is_disk_file(h) {
+        return None;
+    }
+    std::fs::read_link(format!("/proc/self/fd/{h}")).ok()
+}
+
+/// isatty(fd) — `test -t`'s terminal probe (GNU test.c).
+pub fn is_console_handle(h: HANDLE) -> bool {
+    unsafe { libc::isatty(h) == 1 }
+}
+
+/// S_ISCHR — `test -c` (GNU test.c filetest).
+pub fn is_char_device_handle(h: HANDLE) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::fstat(h, &mut st) == 0
+            && (u32::from(st.st_mode) & u32::from(libc::S_IFMT)) == u32::from(libc::S_IFCHR)
+    }
+}
+
+/// Guard that switches a tty input fd to per-character reads for the
+/// duration of a `read` builtin call — the termios form of GNU
+/// builtins/read.def ttfd_onechar (ICANON off): a single keystroke
+/// completes the read without a newline. `None` when `h` is not a tty.
+pub struct ConsoleOnecharGuard {
+    fd: HANDLE,
+    saved: libc::termios,
+}
+
+impl ConsoleOnecharGuard {
+    /// The tty driver is not echoing in this mode; consumed bytes go back to
+    /// the same terminal so `read -n1` looks like its line-mode form.
+    pub fn echo_byte(&self, byte: u8) {
+        if !is_console_handle(self.fd) {
+            return;
+        }
+        let _ = write_all(self.fd, &[byte]);
+    }
+}
+
+impl Drop for ConsoleOnecharGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSADRAIN, &self.saved);
+        }
+    }
+}
+
+/// Silenced echo with canonical buffering kept — the read.def:603-621
+/// `ttfd_noecho` shape (`read -s` without -n/-d).
+pub fn enter_console_noecho_mode(h: HANDLE) -> Option<ConsoleOnecharGuard> {
+    if !is_console_handle(h) {
+        return None;
+    }
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    unsafe {
+        if libc::tcgetattr(h, &mut saved) != 0 {
+            return None;
+        }
+    }
+    let mut silenced = saved;
+    silenced.c_lflag &= !libc::ECHO;
+    unsafe {
+        if libc::tcsetattr(h, libc::TCSADRAIN, &silenced) != 0 {
+            return None;
+        }
+    }
+    Some(ConsoleOnecharGuard { fd: h, saved })
+}
+
+/// Enter per-character tty read mode. Returns `None` (and changes nothing)
+/// when `h` is not a tty.
+pub fn enter_console_onechar_mode(h: HANDLE) -> Option<ConsoleOnecharGuard> {
+    if !is_console_handle(h) {
+        return None;
+    }
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    unsafe {
+        if libc::tcgetattr(h, &mut saved) != 0 {
+            return None;
+        }
+    }
+    let mut raw = saved;
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    unsafe {
+        if libc::tcsetattr(h, libc::TCSADRAIN, &raw) != 0 {
+            return None;
+        }
+    }
+    Some(ConsoleOnecharGuard { fd: h, saved })
+}
+
+/// Bounded readability wait — the direct POSIX form of GNU
+/// builtins/read.def's select() on fd 0 (`shtimer_select`). HUP/ERR/NVAL
+/// count as Ready: select() reports a broken/EOF fd as readable too.
+pub fn wait_readable(h: HANDLE, timeout: std::time::Duration) -> ReadWait {
+    let ms = timeout.as_millis().min(i32::MAX as u128 - 1) as libc::c_int;
+    let mut pfd = libc::pollfd {
+        fd: h,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue; // EINTR: the deadline is absolute, not per-poll
+            }
+            return ReadWait::Ready; // error → treat as readable like select
+        }
+        return if n == 0 {
+            ReadWait::Timeout
+        } else {
+            ReadWait::Ready
+        };
+    }
+}
+
+pub fn duplicate_handle(h: HANDLE) -> std::io::Result<HANDLE> {
+    let n = unsafe { libc::dup(h) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n)
+}
+
+/// dup + FD_CLOEXEC: the Unix analogue of "inheritable duplicate" -- the
+/// duplicate survives into children spawned by the shell.
+pub fn duplicate_handle_inheritable(h: HANDLE) -> std::io::Result<HANDLE> {
+    let n = duplicate_handle(h)?;
+    set_inheritable(n, true)?;
+    Ok(n)
+}
+
+fn set_inheritable(fd: HANDLE, on: bool) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let flags = if on {
+        flags & !libc::FD_CLOEXEC
+    } else {
+        flags | libc::FD_CLOEXEC
+    };
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn handle_to_file(h: HANDLE) -> std::fs::File {
+    // Takes ownership of the fd, mirroring the Windows side where
+    // handle_to_file wraps the raw handle into an owned File (no duplicate).
+    // The old unix body dup'd and owned the COPY, leaking the caller's
+    // original: BackgroundCapture::duplicate_write (shell_options.rs) hands
+    // its fresh write-end dup in here, and the leaked intermediate kept the
+    // capture pipe's write end open in the parent forever, so
+    // BackgroundCapture::drain's close-then-read-to-EOF could never see EOF
+    // -- the redir7.sub backquote-comsub hang (rubash#225), where GNU's
+    // comsub read (subst.c:7434-7443: parent closes fildes[1], then
+    // read_comsub) completes once every inherited writer exits.
+    unsafe { std::fs::File::from_raw_fd(h) }
+}
+
+/// Anonymous pipe for background-job output capture (rubash#169); both ends
+/// CLOEXEC — per-child writers go through `duplicate_handle_inheritable`.
+pub fn create_capture_pipe() -> std::io::Result<(HANDLE, HANDLE)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // libc::pipe2 is glibc/musl-only; Darwin exposes pipe + fcntl instead.
+    #[cfg(target_os = "linux")]
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(not(target_os = "linux"))]
+    for fd in fds {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    }
+    Ok((fds[0], fds[1]))
+}
+
+/// Read all bytes currently available without blocking (rubash#169
+/// background-capture drain): flip O_NONBLOCK, read until EAGAIN, restore.
+pub fn read_available(file: &std::fs::File) -> std::io::Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let got = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if got > 0 {
+            out.extend_from_slice(&chunk[..got as usize]);
+            continue;
+        }
+        if got == 0 {
+            break; // EOF: every writer (incl. the original end) is gone
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            break;
+        }
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+        return Err(err);
+    }
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    Ok(out)
+}
+
+pub fn read_some(h: HANDLE, n: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; n.max(1)];
+    let got = loop {
+        let got = unsafe { libc::read(h, buf.as_mut_ptr().cast(), buf.len()) };
+        if got >= 0 {
+            break got;
+        }
+        let err = std::io::Error::last_os_error();
+        // A caught signal (the kernel-signal backend, builtins/kill.rs) must
+        // not fake EOF or fail the read; retry and let the pending-signal
+        // queue dispatch at the next command boundary.
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        // Broken pipe on Unix reads as EPIPE -- an EOF-shaped end for the
+        // coproc drain loop, matching the Windows ERROR_BROKEN_PIPE mapping.
+        if err.raw_os_error() == Some(libc::EPIPE) {
+            return Ok(Vec::new());
+        }
+        return Err(err);
+    };
+    buf.truncate(got as usize);
+    Ok(buf)
+}
+
+pub fn write_all(h: HANDLE, bytes: &[u8]) -> std::io::Result<()> {
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let n = unsafe { libc::write(h, bytes[off..].as_ptr().cast(), bytes.len() - off) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        off += n as usize;
+    }
+    Ok(())
+}
+
+pub fn seek_end(h: HANDLE) -> std::io::Result<()> {
+    if unsafe { libc::lseek(h, 0, libc::SEEK_END) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Absolute seek — GNU read.def zsyncfd (builtins/read.def:940) parity,
+/// see windows_impl::seek_absolute.
+pub fn seek_absolute(h: HANDLE, pos: u64) -> std::io::Result<()> {
+    // 32-bit unixes (armv7 android) have off_t = i32; saturate instead of
+    // truncating (matching zsyncfd's behavior for absurd offsets).
+    let offset = libc::off_t::try_from(pos).unwrap_or(libc::off_t::MAX);
+    if unsafe { libc::lseek(h, offset, libc::SEEK_SET) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Current file position.
+pub fn file_position(h: HANDLE) -> std::io::Result<u64> {
+    let pos = unsafe { libc::lseek(h, 0, libc::SEEK_CUR) };
+    if pos < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(pos as u64)
+}
+
+pub fn process_std_handle(fd: u32) -> HANDLE {
+    match fd {
+        0 => 0,
+        1 => 1,
+        _ => 2,
+    }
+}
+
+fn open_flags_for(append: bool, create_new: bool) -> (libc::c_int, libc::mode_t) {
+    // Mirrors the Windows access mapping in open_file_*: read = GENERIC_READ,
+    // write = GENERIC_WRITE, append = write + forced end-of-file writes.
+    let base = if append {
+        libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND
+    } else {
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC
+    };
+    let mode: libc::mode_t = 0o644;
+    if create_new {
+        (base | libc::O_EXCL, mode)
+    } else {
+        (base, mode)
+    }
+}
+
+pub fn open_file_read(path: &std::path::Path) -> std::io::Result<HANDLE> {
+    let n = unsafe {
+        libc::open(
+            std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?
+                .as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n)
+}
+
+pub fn open_file_write_trunc(path: &std::path::Path) -> std::io::Result<HANDLE> {
+    let (flags, mode) = open_flags_for(false, false);
+    open_wr(path, flags, mode)
+}
+
+pub fn open_file_create_new(path: &std::path::Path) -> std::io::Result<HANDLE> {
+    let (flags, mode) = open_flags_for(false, true);
+    open_wr(path, flags, mode)
+}
+
+pub fn open_file_append(path: &std::path::Path) -> std::io::Result<HANDLE> {
+    let (flags, mode) = open_flags_for(true, false);
+    open_wr(path, flags, mode)
+}
+
+pub fn open_file_readwrite(path: &std::path::Path) -> std::io::Result<HANDLE> {
+    let n = unsafe {
+        libc::open(
+            std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?
+                .as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n)
+}
+
+fn open_wr(
+    path: &std::path::Path,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> std::io::Result<HANDLE> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let n = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC, mode as libc::c_uint) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n)
+}
+
+/// `/dev/null` on Unix needs no inherit-flag dance: fork/exec inherits all
+/// fds by default. Keep the fd CLOEXEC-off so whitelisted spawns inherit it.
+pub fn open_null_device() -> std::io::Result<HANDLE> {
+    open_file_read(std::path::Path::new("/dev/null"))
+}
+
+pub fn open_null_device_inheritable() -> std::io::Result<HANDLE> {
+    let fd = open_null_device()?;
+    set_inheritable(fd, true)?;
+    Ok(fd)
+}
+
+/// Child-spawn spec. The Unix translation uses std::process::Command with
+/// pre-exec number mapping: `extra_handles` are dup2'd into their target
+/// fd numbers by the child between fork and exec (via a tiny argv0
+/// trampoline-free approach: std Command pre_exec).
+pub struct WhitelistedSpawn {
+    pub program: std::path::PathBuf,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub std_handles: [HANDLE; 3],
+    pub extra_handles: Vec<HANDLE>,
+}
+
+#[derive(Debug)]
+pub struct SpawnedChild {
+    inner: std::process::Child,
+}
+
+impl SpawnedChild {
+    pub fn id(&self) -> u32 {
+        self.inner.id()
+    }
+
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.inner.try_wait()
+    }
+
+    pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.inner.wait()
+    }
+
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        self.inner.kill()
+    }
+}
+
+impl From<std::process::Child> for SpawnedChild {
+    fn from(child: std::process::Child) -> Self {
+        Self { inner: child }
+    }
+}
+
+/// Spawn with exactly the whitelisted fd numbers visible to the child.
+/// Unix translation of the HANDLE_LIST whitelist: between fork and exec,
+/// dup2 each spec fd onto its own number, then close everything else.
+pub fn spawn_whitelisted(spec: &WhitelistedSpawn) -> std::io::Result<SpawnedChild> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(&spec.args);
+    // The spec's env IS the child environment (the caller composes it from
+    // std::env::vars() plus the shell's exported state, then strips what a
+    // subshell must not inherit — e.g. the __RUBASH_TRAP* keys, POSIX
+    // 2.11: caught traps reset in a subshell). Merging with this process's
+    // environment instead would resurrect every stripped key as a stale
+    // OS-env copy (trap.tests: background `rubash -c` children ran the
+    // parent's inherited EXIT trap at exit — three spurious "exiting").
+    cmd.env_clear();
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
+    cmd.stdin(unsafe { Stdio::from_raw_fd(dup_for_child(spec.std_handles[0])?) });
+    cmd.stdout(unsafe { Stdio::from_raw_fd(dup_for_child(spec.std_handles[1])?) });
+    cmd.stderr(unsafe { Stdio::from_raw_fd(dup_for_child(spec.std_handles[2])?) });
+    // extra_handles: the Windows side maps "handle value == child fd number",
+    // and the __RUBASH_FD_HANDLE_{fd} env keys the child replays its fd table
+    // from carry those numbers, so each extra must arrive AT ITS OWN NUMBER:
+    // dup2(fd, fd) between fork and exec pins the number and clears CLOEXEC
+    // (the inheritable-duplicate effect).
+    let extras = spec.extra_handles.clone();
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(move || {
+            for &fd in &extras {
+                // The child keeps these at their own numbers; dup2 onto self
+                // clears CLOEXEC, which is the inheritable-duplicate effect.
+                if libc::dup2(fd, fd) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            // GNU's forked children restore the entry signal dispositions
+            // between fork and exec (trap.c:1489 restore_original_signals,
+            // rubash#229): a policy/trap ignore in the shell must not make
+            // exec'd children unkillable by SIGQUIT et al. rubash#737/#866:
+            // the PDEATHSIG arm is decided INSIDE this hook from the
+            // spawning process's in-process wrapper role (never the ambient
+            // env — rubash#866 — and the race is adjudicated against the
+            // expected parent pid, never the constant 1 — rubash#867).
+            crate::builtins::kill::child_pre_exec_reset()?;
+            Ok(())
+        });
+    }
+    let child = cmd.spawn()?;
+    // Parent side: the extras were dup2'd onto their own numbers in the
+    // child by pre_exec; the parent's originals stay open (callers own them,
+    // as on Windows).
+    Ok(SpawnedChild { inner: child })
+}
+
+fn dup_for_child(fd: HANDLE) -> std::io::Result<HANDLE> {
+    // Dup off the caller's fd (so the child's stdio is independent of
+    // lifetime management in the parent) and mark the child-side fd to
+    // survive exec.
+    let n = duplicate_handle(fd)?;
+    set_inheritable(n, true)?;
+    Ok(n)
+}
+
+/// Unix counterpart of the Windows sliced child wait (windows_impl.rs
+/// wait_child_slice): kernel signal delivery interrupts waitpid and the
+/// signal_hook backend (builtins/kill.rs kernel_signals) records arrivals
+/// in memory, which the unthrottled take_all_signals drains at the command
+/// boundary — the plain blocking wait already carries GNU's
+/// interruptible-wait semantics (jobs.c:3064 wait_for), so no slicing is
+/// needed and the timeout is unused.
+pub fn wait_child_slice(
+    child: &mut std::process::Child,
+    _timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    child.wait().map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_shares_offset_like_windows() {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(std::env::temp_dir().join("rubash-fd-dup")).unwrap();
+        f.write_all(b"hello world").unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        let fd = open_file_read(std::path::Path::new("/dev/null")).unwrap();
+        let d = duplicate_handle(fd).unwrap();
+        close_handle(fd);
+        close_handle(d);
+        let _ = std::fs::remove_file(std::env::temp_dir().join("rubash-fd-dup"));
+    }
+
+    #[test]
+    fn read_some_on_closed_pipe_returns_eof_shape() {
+        use std::os::fd::IntoRawFd;
+        let (r, w) = std::io::pipe().unwrap();
+        // into_raw_fd, not as_raw_fd: the test's trailing close_handle must
+        // be the ONLY close — as_raw_fd leaves `r` owning the fd too, and
+        // its Drop closes it a second time, tripping the io_safety abort.
+        let rfd = r.into_raw_fd();
+        drop(w);
+        let buf = read_some(rfd, 64).unwrap();
+        assert!(buf.is_empty());
+        close_handle(rfd);
+    }
+
+    #[test]
+    fn spawn_whitelisted_keeps_extra_handles_at_their_numbers() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir();
+        let path = dir.join("rubash-fd-extra-probe");
+        std::fs::write(&path, b"rubash-extra-probe").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let extra = duplicate_handle_inheritable(file.as_raw_fd()).unwrap();
+        // The child must find the SAME fd number open: the
+        // __RUBASH_FD_HANDLE_{fd} env keys replayed in init.rs name these
+        // numbers, so a spawn that renumbers them breaks fd>=3 inheritance.
+        let mut child = spawn_whitelisted(&WhitelistedSpawn {
+            program: "sh".into(),
+            args: vec![
+                "-c".to_string(),
+                // POSIX sh numeric dup rather than /proc/self/fd: macOS has
+                // no /proc, and the fd-number contract is what is under test.
+                format!("exec grep -q rubash-extra-probe <&{extra}"),
+            ],
+            env: Vec::new(),
+            std_handles: [0, 1, 2],
+            extra_handles: vec![extra],
+        })
+        .unwrap();
+        let status = child.wait().unwrap();
+        close_handle(extra);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        assert!(status.success(), "child could not read extra fd {extra}");
+    }
+}
+
+/// Take ownership of a pipe end as a raw fd (coproc endpoints).
+pub fn into_handle(pipe: impl std::os::unix::io::IntoRawFd) -> HANDLE {
+    pipe.into_raw_fd()
+}

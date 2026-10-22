@@ -1,0 +1,349 @@
+use super::super::*;
+use std::fs;
+
+#[test]
+fn test_kill_translates_int_and_term_signals() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-common-signals-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "kill -l 2 > {output_path}; kill -l 130 >> {output_path}; \
+         kill -l TERM >> {output_path}; kill -l 15 >> {output_path}; \
+         kill -l 143 >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "INT\nINT\n15\nTERM\nTERM\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_kill_translates_quit_and_kill_signals() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-quit-kill-signals-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "kill -l 3 > {output_path}; kill -l 131 >> {output_path}; \
+         kill -l QUIT >> {output_path}; kill -l 9 >> {output_path}; \
+         kill -l 137 >> {output_path}; kill -l KILL >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "QUIT\nQUIT\n3\nKILL\nKILL\n9\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_kill_translates_more_common_signals() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-more-common-signals-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "kill -l 6 > {output_path}; kill -l 134 >> {output_path}; \
+         kill -l SIGABRT >> {output_path}; kill -l PIPE >> {output_path}; \
+         kill -l 141 >> {output_path}; kill -l ALRM >> {output_path}; \
+         kill -l 142 >> {output_path}; kill -l SIGSEGV >> {output_path}; \
+         kill -l 139 >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "ABRT\nABRT\n6\n13\nPIPE\n14\nALRM\n11\nSEGV\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_kill_translates_realtime_signals() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-realtime-signals-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "kill -l 32 > {output_path}; kill -l 160 >> {output_path}; \
+         kill -l SIGRTMIN >> {output_path}; kill -l RTMIN+1 >> {output_path}; \
+         kill -l SIGRTMIN+1 >> {output_path}; kill -l 49 >> {output_path}; \
+         kill -l RTMAX-1 >> {output_path}; kill -l SIGRTMAX >> {output_path}; \
+         kill -l 64 >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        // Linux signal table (GNU 5.3.0 contract, byte-verified):
+        // RTMIN=34, 32/33 unassigned so `kill -l 32` / `kill -l 160`
+        // produce no stdout lines; 49 = RTMIN+15.
+        "34\n35\n35\nRTMIN+15\n63\n64\nRTMAX\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_kill_lists_common_signals() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-list-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("kill -l > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("1) SIGHUP"));
+    assert!(output.contains("3) SIGQUIT"));
+    assert!(output.contains("9) SIGKILL"));
+    assert!(output.contains("15) SIGTERM"));
+    assert!(output.contains("31) SIGSYS"));
+    assert!(output.contains("34) SIGRTMIN"));
+    assert!(output.contains("64) SIGRTMAX"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_kill_capital_l_translates_and_lists_signals() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-capital-l-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("kill -L HUP > {output_path}; kill -L >> {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.starts_with("1\n"));
+    assert!(output.contains("1) SIGHUP"));
+    assert!(output.contains("15) SIGTERM"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_kill_zero_reports_missing_process() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-zero-missing-status-output.txt";
+    let error_path = "target/rubash-kill-zero-missing-error-output.txt";
+    let input = format!("kill -0 4294967294 2> {error_path}; echo $? > {output_path}");
+
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+    let result = executor.execute_ast(&ast);
+    assert!(result.is_ok());
+
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "1\n");
+    assert!(fs::read_to_string(error_path)
+        .unwrap()
+        .contains("kill: (4294967294) - No such process"));
+}
+
+#[test]
+fn test_kill_validates_signal_options_and_pid_operands() {
+    let _cwd_guard = CwdGuard::take();
+    let status_path = "target/rubash-kill-option-status-output.txt";
+    let error_path = "target/rubash-kill-option-error-output.txt";
+    let _ = fs::remove_file(status_path);
+    let _ = fs::remove_file(error_path);
+    let input = format!(
+        "kill -s NOPE 1 2> {error_path}; echo $? > {status_path}; \
+         kill -s TERM 2>> {error_path}; echo $? >> {status_path}; \
+         kill -- 4294967294 2>> {error_path}; echo $? >> {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "1\n2\n1\n");
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("kill: NOPE: invalid signal specification"));
+    assert!(error.contains("kill: usage:"));
+    assert!(error.contains("kill: (4294967294) - No such process"));
+    let _ = fs::remove_file(status_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_kill_signal_zero_accepts_negative_process_group_operand() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-signal-zero-group-status.txt";
+    let input = format!("kill -s 0 -1; echo $? > {output_path}");
+
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+    assert!(executor.execute_ast(&ast).is_ok());
+
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "0\n");
+}
+
+#[test]
+fn test_kill_redirects_stderr() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-kill-stderr-output.txt";
+    let status_path = "target/rubash-kill-stderr-status.txt";
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("kill -l NO_SUCH_SIGNAL 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "1\n");
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("kill: NO_SUCH_SIGNAL: invalid signal specification"));
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_kill_appends_stderr() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-kill-stderr-append-output.txt";
+    let _ = fs::remove_file(error_path);
+    fs::write(error_path, "before\n").unwrap();
+    let input = format!("kill -l NO_SUCH_SIGNAL 2>> {error_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 1);
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.starts_with("before\n"));
+    assert!(error.contains("kill: NO_SUCH_SIGNAL: invalid signal specification"));
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_ulimit_redirects_output() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-ulimit-redirect-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("ulimit -n > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    // Windows emulation default soft NOFILE mirrors the WSL GNU 5.3.0
+    // oracle (10240 — rubash#773 raised it from the stub's 1024 so the fd
+    // table capacity follows the limit instead of a homemade ceiling).
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "10240\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_ulimit_appends_output() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-ulimit-append-output.txt";
+    let _ = fs::remove_file(output_path);
+    fs::write(output_path, "before\n").unwrap();
+    let input = format!("ulimit -n >> {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "before\n10240\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_ulimit_all_lists_resource_limits() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-ulimit-all-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("ulimit -n 2048; ulimit -a > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("core file size"));
+    assert!(output.contains("(blocks, -f) unlimited"));
+    assert!(output.contains("open files"));
+    assert!(output.contains("(-n) 2048"));
+    assert!(output.contains("virtual memory"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_ulimit_redirects_stderr() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-ulimit-stderr-output.txt";
+    let status_path = "target/rubash-ulimit-stderr-status.txt";
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("ulimit -g 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    // ulimit.def:382-384: an invalid option letter is sh_invalidopt +
+    // builtin_usage + EX_USAGE (2), like GNU bash.
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "2\n");
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("ulimit: -g: invalid option"));
+    assert!(error.contains("ulimit: usage:"));
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+}

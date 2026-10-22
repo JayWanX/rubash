@@ -1,0 +1,420 @@
+use super::super::*;
+use std::fs;
+
+#[test]
+fn test_parameter_replacement_keeps_value_when_anchor_does_not_match() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-replace-anchor-miss-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("v=abcabc; echo ${{v/#bc/X}} ${{v/%ab/X}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "abcabc abcabc\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_replacement_anchor_uses_shell_patterns() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-replace-anchor-pattern-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("v=abcd; echo ${{v/#a?/X}} ${{v/%?d/X}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "Xcd abX\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_array_parameter_replacement_expands_elements() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-array-replace-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("arr=(banana gamma); echo ${{arr[@]/a/o}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "bonana gomma\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_array_parameter_replacement_expands_all_matches() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-array-replace-all-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("arr=(banana gamma); echo ${{arr[*]//a/o}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "bonono gommo\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_array_parameter_replacement_deletes_matches() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-array-replace-delete-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("arr=(banana gamma); echo ${{arr[@]//a}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "bnn gmm\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_array_pattern_replacement_and_case_expand_per_word() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-array-pattern-word-expansion-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "arr=(alpha 'a b' beta); \
+         printf 'Qp<%s>\\n' \"${{arr[@]#a}}\" > {output_path}; \
+         printf 'Up<%s>\\n' ${{arr[@]#a}} >> {output_path}; \
+         printf 'Qr<%s>\\n' \"${{arr[@]/a/X}}\" >> {output_path}; \
+         printf 'Ur<%s>\\n' ${{arr[@]/a/X}} >> {output_path}; \
+         printf 'Qc<%s>\\n' \"${{arr[@]^^}}\" >> {output_path}; \
+         printf 'Uc<%s>\\n' ${{arr[@]^^}} >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "Qp<lpha>\nQp< b>\nQp<beta>\nUp<lpha>\nUp<b>\nUp<beta>\nQr<Xlpha>\nQr<X b>\nQr<betX>\nUr<Xlpha>\nUr<X>\nUr<b>\nUr<betX>\nQc<ALPHA>\nQc<A B>\nQc<BETA>\nUc<ALPHA>\nUc<A>\nUc<B>\nUc<BETA>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_positional_parameter_replacement_expands_numeric_parameter() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-positional-replace-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "function p {{ echo ${{1/a/X}} ${{3//m/M}} > {output_path}; }}; p alpha beta gamma"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "Xlpha gaMMa\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_positional_parameter_replacement_expands_all_parameters() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-positional-replace-all-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("function p {{ echo ${{@/%a/Z}} > {output_path}; }}; p alpha beta gamma");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "alphZ betZ gammZ\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_positional_pattern_replacement_and_case_expand_per_word() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-positional-pattern-word-expansion-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "set -- alpha 'a b' beta; \
+         printf 'Qp<%s>\\n' \"${{@#a}}\" > {output_path}; \
+         printf 'Up<%s>\\n' ${{@#a}} >> {output_path}; \
+         printf 'Qr<%s>\\n' \"${{@/a/X}}\" >> {output_path}; \
+         printf 'Ur<%s>\\n' ${{@/a/X}} >> {output_path}; \
+         printf 'Qc<%s>\\n' \"${{@^^}}\" >> {output_path}; \
+         printf 'Uc<%s>\\n' ${{@^^}} >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "Qp<lpha>\nQp< b>\nQp<beta>\nUp<lpha>\nUp<b>\nUp<beta>\nQr<Xlpha>\nQr<X b>\nQr<betX>\nUr<Xlpha>\nUr<X>\nUr<b>\nUr<betX>\nQc<ALPHA>\nQc<A B>\nQc<BETA>\nUc<ALPHA>\nUc<A>\nUc<B>\nUc<BETA>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_case_mod_uppercases_first_and_all_chars() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-case-upper-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("v=hello; echo ${{v^}} ${{v^^}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "Hello HELLO\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_case_mod_lowercases_first_and_all_chars() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-case-lower-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("v=HELLO; echo ${{v,}} ${{v,,}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "hELLO hello\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_case_mod_unpatterned_all_preserves_unicode_case_mapping() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-case-unpatterned-unicode-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("v='Straße İ'; printf '%s\\n%s\\n' \"${{v^^}}\" \"${{v,,}}\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "STRASSE \u{0130}\nstra\u{00DF}e i\u{307}\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_case_mod_uses_pattern() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-case-pattern-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("v=abcde; echo ${{v^^[bd]}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "aBcDe\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_case_mod_toggles_case() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-case-toggle-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "v=abcDEF; echo ${{v~}} ${{v~~}} ${{v~~[aF]}} > {output_path}; \
+         arr=(abc Def); echo ${{arr[@]~~[ad]}} >> {output_path}; \
+         p() {{ echo ${{@~~[ad]}} >> {output_path}; }}; p abc Def"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "AbcDEF ABCdef AbcDEf\nAbc Def\nAbc Def\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#396: see issue (probe wt37-374 K080)"]
+#[test]
+fn test_indirect_parameter_case_mod_applies_to_target_value() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-case-indirect-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "value=abcDef; ref=value; arr=(abc Def); all='arr[@]'; elem='arr[1]'; \
+         declare -n nr=value; \
+         echo ${{!ref^^}} ${{!ref~}} ${{!ref~~[aF]}} > {output_path}; \
+         echo ${{!all^^}} / ${{!elem,,}} >> {output_path}; \
+         echo ${{!nr^^}} >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "ABCDEF AbcDef AbcDef\nABC DEF / def\nVALUE\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_array_parameter_case_mod_expands_elements() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-array-case-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("arr=(alpha beta); echo ${{arr[@]^^}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "ALPHA BETA\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_array_parameter_case_mod_uses_pattern() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-array-case-pattern-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("arr=(ALPHA BETA); echo ${{arr[*],,[PT]}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "ALpHA BEtA\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_quoted_array_star_case_and_transform_use_ifs_first_char() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-array-star-transform-ifs-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "IFS=,; arr=(zero 'two words'); \
+         printf 'case<%s>\\n' \"${{arr[*]^^}}\" > {output_path}; \
+         printf 'quote<%s>\\n' \"${{arr[*]@Q}}\" >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "case<ZERO,TWO WORDS>\nquote<'zero','two words'>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_positional_parameter_case_mod_expands_elements() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-positional-case-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("function p {{ echo ${{@^^}} / ${{1,,}} > {output_path}; }}; p alpha BETA");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "ALPHA BETA / alpha\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_indirect_parameter_expands_named_variable() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-indirect-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("target=value; ref=target; echo ${{!ref}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "value\n");
+    let _ = fs::remove_file(output_path);
+}

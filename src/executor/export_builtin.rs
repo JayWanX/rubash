@@ -1,0 +1,290 @@
+use super::*;
+
+impl Executor {
+    pub(in crate::executor) fn execute_export(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<i32, ExecuteError> {
+        if export_args_request_functions(&cmd.words[1..]) {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let status =
+                self.execute_export_functions(&cmd.words[1..], &mut stdout, &mut stderr)?;
+            self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+            return Ok(status);
+        }
+        // GNU export.def shares declare.def's operand handling: an
+        // `export name[sub]=value` subscript resolves under the same
+        // ExpandedOnce (W_ASSIGNMENT -> ASS_NOEXPAND) rules.
+        let args = match self.rewrite_declare_operand_subscripts(
+            &cmd.words[1..],
+            &cmd.word_metadata,
+            "export",
+        ) {
+            Ok(args) => args,
+            Err(()) => return Ok(1),
+        };
+        // Same GNU variables.c:2920-2937 make_variable_value rule as the
+        // readonly path: an operand whose target is integer-attributed
+        // evaluates the RHS arithmetic (`export i=3+4` binds 7). An evalexp
+        // failure follows variables.c:2938-2944: print `export: <evalerror>`,
+        // drop the failing operand and its successors, arm the DISCARD
+        // abort, and fail the command.
+        let (args, arith_eval_failure) = self.evaluate_integer_attribute_assignment_args(&args);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(message) = &arith_eval_failure {
+            if !message.is_empty() {
+                writeln!(stderr, "{}export: {message}", self.diagnostic_prefix())?;
+            }
+            self.raise_evalerror_abort();
+        }
+        let mut oob_word = None;
+        let status = crate::builtins::setattr::export_with_io(
+            args.iter().map(String::as_str),
+            &mut self.shell_state.env_vars,
+            &mut stdout,
+            &mut stderr,
+            &mut oob_word,
+        )?;
+        // rubash#616 (1a): `export -a name=(...)` rewrites the array mirror
+        // inside the pure builtin (setattr/apply.rs `env_vars.insert`), so
+        // refresh the structured cell for assignment operands — a previously
+        // typed array must not shadow the new storage (GNU keeps one owner,
+        // bind_variable variables.c:3286). The mark-aware dispatch also
+        // covers `export -A A=(...)` / `export -A A+=(...)`: the assoc render
+        // would otherwise leave ShellValue::AssociativeArray stale (the
+        // indexed sync drops no assoc cell), which the command-boundary
+        // verify_typed_cells net catches.
+        for arg in &args {
+            if let Some((raw, _)) = arg.split_once('=') {
+                let base = raw.trim_end_matches('+');
+                let base = base.split('[').next().unwrap_or(base);
+                if base.is_empty() {
+                    continue;
+                }
+                if let Some(mirror) = self.shell_state.env_vars.get(base).cloned() {
+                    if is_marked_var(&self.shell_state.env_vars, ASSOC_VARS, base) {
+                        sync_typed_assoc_storage(&mut self.shell_state.variables, base, &mirror);
+                    } else {
+                        sync_typed_indexed_storage(&mut self.shell_state.variables, base, &mirror);
+                    }
+                }
+            }
+        }
+        // GNU err_badarraysub + any_failed (arrayfunc.c:804-809,
+        // rubash#635): the nested declare_builtin reports the bare
+        // `<word>: bad array subscript` (report_error, no `export:`
+        // segment) and DISCARDs the command list (subst.c:11169
+        // bash_variable_assignment_error). Partial store already
+        // installed by the assign path; the early return skips the
+        // status-0 gates below, exactly like execute_declare.
+        if let Some(word) = oob_word {
+            writeln!(
+                stderr,
+                "{}{}: bad array subscript",
+                self.diagnostic_prefix(),
+                word
+            )?;
+            self.exit_code = 1;
+            // Bad-subscript class for the eval boundary (rubash#637
+            // primitive, reused): eval absorbs it and continues.
+            self.evalerror_subscript_pending.set(true);
+            self.raise_evalerror_abort();
+            // Flush here: this early return skips the normal
+            // buffered-output flush below, which would swallow the
+            // diagnostic (rubash#635).
+            self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+            return Ok(1);
+        }
+        let status = if arith_eval_failure.is_some() {
+            status.max(1)
+        } else {
+            status
+        };
+        // GNU execute_cmd.c:1004-1017 with the sh_invalidid/err_readonly
+        // assignment class: in POSIX mode a non-interactive shell exits when
+        // the special builtin export fails on an ASSIGNMENT (`export 9bad=1`,
+        // `export ro=2` with ro readonly — oracle g40 probes both exit rc=1),
+        // while `export -f nofn` ("not a function") only fails the builtin.
+        // The flag rides the same dispatch gate set/unset/trap use.
+        if status != 0 && self.special_assignment_operand_failure(&args) {
+            self.special_builtin_failed.set(true);
+        }
+        if status == 0 {
+            self.sync_setattr_typed_assignments(cmd.words[1..].iter().map(String::as_str));
+            // Check for locale environment changes (LC_ALL, LC_CTYPE, LANG)
+            for word in &cmd.words[1..] {
+                if word.starts_with("LC_ALL=")
+                    || word.starts_with("LC_CTYPE=")
+                    || word.starts_with("LANG=")
+                {
+                    crate::locale::check_setlocale_warning();
+                    // GNU variables.c sv_lang/sv_lc* call setlocale on the
+                    // assignment; sync the process env so the dynamic
+                    // locale readers (locale::is_utf8 - the dollar-quote
+                    // backslash-u locale gate, rubash#353) see the change.
+                    crate::locale::sync_process_locale(&self.shell_state.env_vars);
+                    break;
+                }
+            }
+        }
+        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+        Ok(status)
+    }
+
+    /// Whether any export/readonly operand is an assignment-class failure the
+    /// POSIX fatality rule (posix-mode notes item 40) keys on: an invalid
+    /// identifier (`sh_invalidid`) or an assignment to a readonly variable
+    /// (`err_readonly`). Mirrors setattr/apply.rs's per-operand checks — the
+    /// shared setattr status alone cannot distinguish them from `export -f`
+    /// failures ("not a function" / "cannot export"), which GNU does NOT
+    /// treat as fatal. Only consulted when the builtin actually failed, so
+    /// the nameref-cell quirk (`export ref` on an invalid cell reports
+    /// SUCCESS) stays non-fatal like GNU.
+    pub(in crate::executor) fn special_assignment_operand_failure(&self, args: &[String]) -> bool {
+        for arg in args {
+            if arg.starts_with('-') && arg != "-" {
+                continue;
+            }
+            if arg == "--" {
+                continue;
+            }
+            let (name, _append, value) = crate::builtins::setattr::value::split_assignment(arg);
+            let base = name.split('[').next().unwrap_or(name);
+            if !crate::builtins::setattr::value::valid_identifier(base) {
+                return true;
+            }
+            if value.is_some() && is_marked_var(&self.shell_state.env_vars, READONLY_VARS, base) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// export/readonly mutate only the legacy env_vars map, but parameter
+    /// expansion reads the typed shell_state.variables owner first, so a
+    /// scalar that already exists there (e.g. HOME seeded at startup) keeps a
+    /// stale value after an export NAME=value assignment. Mirror the assigned
+    /// values into the typed owner for plain scalar names; arrays/assocs/
+    /// namerefs are synced by their own paths. One attr_of probe covers the
+    /// three shape flags; a missing typed cell skips the mirror entirely
+    /// (expansion falls back to env_vars).
+    pub(in crate::executor) fn sync_setattr_typed_assignments<'a>(
+        &mut self,
+        args: impl Iterator<Item = &'a str>,
+    ) {
+        for arg in args {
+            if arg == "--" {
+                continue;
+            }
+            if (arg.starts_with('-') || arg.starts_with('+')) && arg != "-" && arg != "+" {
+                continue;
+            }
+            if !arg.contains('=') {
+                continue;
+            }
+            let (raw_name, _) = arg.split_once('=').unwrap_or((arg, ""));
+            let name = raw_name.strip_suffix('+').unwrap_or(raw_name);
+            let (base, _) = assignment_name_and_append(name);
+            let attrs = self.shell_state.env_vars.attr_of(base);
+            if attrs.array || attrs.assoc || attrs.nameref {
+                continue;
+            }
+            if self.shell_state.variables.get(base).is_none() {
+                continue;
+            }
+            if let Some(value) = self.shell_state.env_vars.get(base).cloned() {
+                if let Some(variable) = self.shell_state.variables.get_mut(base) {
+                    variable.value = crate::shell::ShellValue::Scalar(value);
+                }
+            } else {
+                self.shell_state.variables.remove(base);
+            }
+        }
+    }
+
+    pub(in crate::executor) fn execute_export_functions<W, E>(
+        &mut self,
+        args: &[String],
+        stdout: &mut W,
+        stderr: &mut E,
+    ) -> io::Result<i32>
+    where
+        W: Write,
+        E: Write,
+    {
+        let mut unset = false;
+        let mut print = false;
+        let mut index = 0;
+        while let Some(arg) = args.get(index) {
+            if arg == "--" {
+                index += 1;
+                break;
+            }
+            if !arg.starts_with('-') || arg == "-" {
+                break;
+            }
+            for option in arg[1..].chars() {
+                match option {
+                    'f' => {}
+                    'n' => unset = true,
+                    'p' => print = true,
+                    other => {
+                        writeln!(
+                            stderr,
+                            "{}export: -{other}: invalid option",
+                            self.diagnostic_prefix()
+                        )?;
+                        writeln!(
+                            stderr,
+                            "export: usage: export [-fn] [name[=value] ...] or export -p [-f]"
+                        )?;
+                        return Ok(2);
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        if print && index >= args.len() {
+            let mut names = marked_env_names(&self.shell_state.env_vars, EXPORTED_FUNCTIONS);
+            names.sort();
+            for name in names {
+                if let Some(body) = self.shell_state.functions.get(&name) {
+                    self.write_function_definition(&name, &body.commands, true, stdout)?;
+                }
+            }
+            return Ok(0);
+        }
+
+        let mut status = 0;
+        for name in &args[index..] {
+            if !self.shell_state.functions.contains_key(name) {
+                writeln!(
+                    stderr,
+                    "{}export: {name}: not a function",
+                    self.diagnostic_prefix()
+                )?;
+                status = 1;
+                continue;
+            }
+            if !unset && !is_exportable_function_name(name) {
+                writeln!(
+                    stderr,
+                    "{}export: {name}: cannot export",
+                    self.diagnostic_prefix()
+                )?;
+                status = 1;
+                continue;
+            }
+            if unset {
+                unmark_env_name(&mut self.shell_state.env_vars, EXPORTED_FUNCTIONS, name);
+            } else {
+                mark_env_name(&mut self.shell_state.env_vars, EXPORTED_FUNCTIONS, name);
+            }
+        }
+
+        Ok(status)
+    }
+}

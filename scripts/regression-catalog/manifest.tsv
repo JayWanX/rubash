@@ -1,0 +1,53 @@
+case	issue	expected	note
+issue-699	699	must-match	redirection/fd family: 2>&1 order, builtin write-error routing, closed-stderr rc, subshell cd diag, bare-cat self-redirect — fixed, closed
+issue-700	700	must-match	read /dev/stdin hang fixed; pipeline-context /dev/stdin & <&0 empty read fixed by #938
+issue-701	701	must-match	read /dev/fd/N + EOF-without-newline rc family (while-read off-by-one) — fixed, closed
+issue-702	702	must-match	errexit in until/break — fixed, closed 2026-10-17
+issue-703	703	must-match	heredoc + pipeline in quoted $() — fixed by the 703 batch, closed 2026-10-18
+issue-704	704	diverges	printf numeric / command -v multi / ~+ assignment / BASH_ARGC (R7 faces fixed by PR #778; rest open)
+issue-714	714	must-match	read -n/-N count decoded units — fixed by PR #775
+issue-723	723	must-match	pipeline while-read consumer stall — fixed by PR #793
+issue-726	726	must-match	definition-level dup splice + exec group-order escape — fixed by PR #783
+issue-733	733	must-match	compound-assignment quote leak — fixed by PR #792
+issue-734	734	must-match	assoc subscript via ANSI-C quoting — fixed (catalog PROMOTE 2026-10-19: matches GNU already on pristine b79e678a; row was stale, see tests/issue734)
+issue-735	735	diverges	PUA collision fixed by PR #791 but ${x@Q}-shape length/bytes still diverge (follow-up #794/#796)
+issue-737	737	diverges	kill reaches background children (stdout) — job Killed-notification wording still diverges (follow-up #794)
+issue-738	738	must-match	heredoc delimiter dequote — fixed, pinned also in tests/regression.rs
+issue-742	742	must-match	unbraced $name backslash-escape swallow — fixed, pinned also in tests/regression.rs
+issue-743	743	must-match	partially-quoted word field splitting — fixed by PR #789 (follow-up rework #795 open)
+issue-744	744	must-match	here-string in quoted whole-word $() — fixed
+issue-745	745	must-match	backtick word-final escaped backslash — fixed
+issue-753	753	must-match	failglob abort scope — fixed, pinned also in tests/regression.rs
+issue-754	754	diverges	path model: cd ~ HOME, ~260-char path — still open
+issue-755	755	must-match	scalar re-parsed as array by ${x[@]} — fixed by PR #785
+issue-756	756	must-match	history -w w/ HISTFILE unset: silent death fixed; wording face moved to #551 (case silences stderr)
+issue-757	757	diverges	prompt expansion / promptvars — partially fixed (#807, PR wave); residual faces open
+issue-758	758	must-match	malformed expansion swallowed — fixed by PR #785
+issue-759	759	diverges	dirs -l shape fixed; residual builtin faces open (see #810/#813)
+issue-761	761	must-match	unbounded producer + shell-side tail drain — fixed by PR #784
+issue-761b	761	must-match	'yes | :' same class, second shape — fixed by PR #784
+issue-776	776	must-match	read -N keeps embedded newline verbatim — fixed, pinned also in tests/regression.rs
+issue-788	788	must-match	compound operand sets the array attribute — fixed by PR #786
+issue-797	797	must-match	sourced bash-preexec DEBUG-trap assembly keeps the shell executable — fixed in #805 wave
+issue-798	798	must-match	exit inside source terminates the shell — fixed in #805 wave
+loc-l1-substring	772	must-match	${x:off:len} opaque bytes — fixed by PR #781
+loc-l2-comsub	772	diverges	$(cat) non-UTF-8 second shape still drops content + bogus UTF-8 diagnostic (residual of #781)
+loc-l5-read-cr	772	diverges	read -r still strips a trailing CR (#769-class byte-opacity face, still open)
+lim-f5-fd-cap	773	must-match	fd table no longer caps at 1014 — PROMOTE on the 2026-10-20 run (arm 62a30ab1)
+lim-f6-nul	773	diverges	read counts NUL bytes (8 vs 6); comsub does not warn
+lim-f7-closed-fd0	773	diverges	closed fd 0 then re-redirect -> Bad file descriptor
+issue-828	828	must-match	arith/let assoc ANSI-C subscript normalization - fixed; the scrambled let form is GNU parity (the CR Nit 2 unset-operand row landed as parity in #847, see tests/issue828)
+issue-830	830	must-match	popd default pop must chdir into the popped dir — fixed, closed
+issue-832	832	must-match	$(echo 's') fast-path detour must not consult CWD contents — fixed, closed
+issue-840	840	diverges	marker output-boundary residuals: declare -p E400-prefix leak + typed __RUBASH_CSB1_ re-decode (face3 \uE30D assign already matches) — open
+issue-846	846	diverges	top-level !{}>bad rc fixed; residuals (diagnostic bypass on ()/simple faces + nested-! abort) — tracked as rubash#940
+issue-847	847	must-match	#822 span scanner dquote state (E3b: dq-wrapped $'...' spelling stays raw on assign/read/arith) + unset deferred operand quote-removes $'...' (u1/u2/u3 keep the cell; bare/variable rows still delete) - fixed
+issue-856	856	diverges	isolated literal U+E000 at the output boundary — literal-PUA spelling still eaten (escape-spelling f0 control matches); issue open
+issue-860	860	must-match	unset empty-span/mask pseudo-diagnostic family — fixed by PR #883 (manifest row landed late under #746)
+issue-861	861	must-match	assoc kvlist self-read miss — fixed by PR #883 (manifest row landed late under #746)
+issue-866	866	must-match	forged ambient __RUBASH_BACKGROUND_WRAPPER arms nothing (nonce handshake, rubash#866) - fixed
+issue-868	868	must-match	mark_quoted_ifs_from_raw carrier-blind — fixed (manifest row landed late under #746)
+issue-871	871	must-match	printf inf/nan prefix subclass (infin/nann/infx/nanx) prints the value but emits invalid number + rc 1 — verified byte-identical to GNU incl. rc 1 + diag; promoted from diverges per PR #944 review
+issue-876	876	must-match	mark_quoted_ifs_from_raw byte-offset vs char-count on multibyte leads — fixed (manifest row landed late under #746)
+issue-879	879	must-match	printf %f/%e/%g long-double expansion (1e999 -> inf on the arm) + %a/%A mantissa style — verified byte-identical to GNU; promoted from diverges per #949 (pinned also in tests/issue879_printf_longdouble_regressions.rs)
+issue-948	948	must-match	-c operand marker-zone entry escape (rubash#948): respawn double-escape exclusion only; typed __RUBASH_CSB1_/U+E319 literals pass verbatim via -c

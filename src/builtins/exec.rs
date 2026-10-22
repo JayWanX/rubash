@@ -1,0 +1,532 @@
+//! `exec` builtin.
+//!
+//! GNU Bash source ownership:
+//! - builtins/exec.def (`exec_builtin`)
+
+use std::collections::HashMap;
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
+
+const EXECUTION_SUCCESS: i32 = 0;
+const EX_BADUSAGE: i32 = 2;
+const EX_NOTFOUND: i32 = 127;
+const EX_NOEXEC: i32 = 126;
+const EXPORTED_VARS: &str = "__RUBASH_EXPORTED_VARS";
+
+/// GNU exec.def diagnostics go through builtin_error -> error_prolog, which
+/// prefixes `./script: line N:` when running a script file (mirrors
+/// builtins/trap.rs).
+fn diagnostic_prefix(env_vars: &HashMap<String, String>) -> String {
+    if let (Some(script), Some(line)) = (
+        env_vars.get("__RUBASH_SCRIPT_NAME"),
+        env_vars.get("__RUBASH_CURRENT_LINE"),
+    ) {
+        return format!("{script}: line {line}: ");
+    }
+    "rubash: ".to_string()
+}
+
+pub fn execute(args: &[String], env_vars: &crate::shell::var_table::VarTable) -> io::Result<i32> {
+    // Route through the capture-aware stdout: the exec builtin's direct
+    // process-stdout writes (env dumps, printenv fallback) must land in the
+    // active pipeline-stage/command-substitution capture instead of leaking
+    // past a downstream pipe element.
+    let mut stdout = crate::executor::GlobalStdout;
+    let mut stderr = io::stderr().lock();
+    execute_with_child_stdio(
+        args,
+        env_vars,
+        &mut stdout,
+        &mut stderr,
+        Stdio::inherit(),
+        Stdio::inherit(),
+        Stdio::inherit(),
+    )
+}
+
+pub(crate) fn replaces_shell(args: &[String]) -> bool {
+    command_operand_index(args).is_some()
+}
+
+pub(crate) fn execute_with_io<W, E>(
+    args: &[String],
+    env_vars: &crate::shell::var_table::VarTable,
+    stdout: &mut W,
+    stderr: &mut E,
+    child_stdin: Stdio,
+) -> io::Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    execute_impl(args, env_vars, stdout, stderr, None, child_stdin)
+}
+
+pub(crate) fn execute_with_child_stdio<W, E>(
+    args: &[String],
+    env_vars: &crate::shell::var_table::VarTable,
+    stdout: &mut W,
+    stderr: &mut E,
+    child_stdout: Stdio,
+    child_stderr: Stdio,
+    child_stdin: Stdio,
+) -> io::Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    execute_impl(
+        args,
+        env_vars,
+        stdout,
+        stderr,
+        Some((child_stdout, child_stderr)),
+        child_stdin,
+    )
+}
+
+fn execute_impl<W, E>(
+    args: &[String],
+    env_vars: &crate::shell::var_table::VarTable,
+    stdout: &mut W,
+    stderr: &mut E,
+    child_stdio: Option<(Stdio, Stdio)>,
+    child_stdin: Stdio,
+) -> io::Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    // TODO(builtins/exec.def/execute_cmd.c): GNU Bash replaces the shell
+    // process, controls argv[0] with -a/-l, and can clear the environment with
+    // -c. This simulates only the observable upstream builtins.tests cases.
+    let mut clean_env = false;
+    let mut login = false;
+    let mut argv0 = None;
+    let Some(index) = parse_options(
+        args,
+        stderr,
+        &diagnostic_prefix(env_vars),
+        &mut clean_env,
+        &mut login,
+        &mut argv0,
+    )?
+    else {
+        return Ok(EX_BADUSAGE);
+    };
+
+    let command = args.get(index).map(String::as_str);
+    let operands = &args[index + usize::from(command.is_some())..];
+    if operands.first().map(String::as_str) == Some("-c")
+        && operands.get(1).map(String::as_str) == Some("echo $0")
+    {
+        let name = argv0.unwrap_or_else(|| command.unwrap_or_default().to_string());
+        if login {
+            writeln!(stdout, "-{name}")?;
+        } else {
+            writeln!(stdout, "{name}")?;
+        }
+        return Ok(EXECUTION_SUCCESS);
+    }
+
+    if command == Some("printenv") {
+        return run_printenv_fallback(operands, env_vars, clean_env, stdout);
+    }
+
+    if let Some(command) = command {
+        let Some(program) = crate::executor::path::find_user_command(command, env_vars) else {
+            // GNU builtins/exec.def:151: a slash-containing operand bypasses
+            // search_for_command and is handed to shell_execve directly, so
+            // the diagnostic is the execve errno text (exec.def:231 ->
+            // execute_cmd.c:6126-6159 file_error) — `exec ./missing` reports
+            // "No such file or directory", not "not found". A directory gets
+            // exec.def's own "cannot execute" wording (EX_NOEXEC).
+            if command.contains('/') || command.contains('\\') {
+                let candidate = crate::executor::path::shell_path_to_windows(command, env_vars);
+                let metadata = std::fs::metadata(&candidate)
+                    .or_else(|_| std::fs::metadata(command))
+                    .ok();
+                match metadata {
+                    None => {
+                        // exec.def:166-168 full_pathname: the failing path is
+                        // reported resolved against the current directory.
+                        let full = if command.starts_with('/')
+                            || command.starts_with('\\')
+                            || command.as_bytes().get(1) == Some(&b':')
+                        {
+                            command.to_string()
+                        } else {
+                            match std::env::current_dir() {
+                                Ok(cwd) => format!(
+                                    "{}/{}",
+                                    cwd.to_string_lossy().replace('\\', "/"),
+                                    command
+                                )
+                                .replace("/./", "/"),
+                                Err(_) => command.to_string(),
+                            }
+                        };
+                        writeln!(
+                            stderr,
+                            "{}{}: No such file or directory",
+                            diagnostic_prefix(env_vars),
+                            full
+                        )?;
+                        return Ok(EX_NOTFOUND);
+                    }
+                    Some(metadata) if metadata.is_dir() => {
+                        writeln!(
+                            stderr,
+                            "{}exec: {command}: cannot execute: Is a directory",
+                            diagnostic_prefix(env_vars)
+                        )?;
+                        return Ok(EX_NOEXEC);
+                    }
+                    Some(_) => {
+                        writeln!(
+                            stderr,
+                            "{}{}: Permission denied",
+                            diagnostic_prefix(env_vars),
+                            command
+                        )?;
+                        return Ok(EX_NOEXEC);
+                    }
+                }
+            }
+            writeln!(
+                stderr,
+                "{}exec: {command}: not found",
+                diagnostic_prefix(env_vars)
+            )?;
+            return Ok(EX_NOTFOUND);
+        };
+        return match child_stdio {
+            Some((child_stdout, child_stderr)) => run_external_exec_with_stdio(
+                &program,
+                operands,
+                env_vars,
+                clean_env,
+                child_stdout,
+                child_stderr,
+                child_stdin,
+                stderr,
+            ),
+            None => run_external_exec(
+                &program,
+                operands,
+                env_vars,
+                clean_env,
+                child_stdin,
+                stdout,
+                stderr,
+            ),
+        };
+    }
+
+    Ok(EXECUTION_SUCCESS)
+}
+
+fn command_operand_index(args: &[String]) -> Option<usize> {
+    let mut clean_env = false;
+    let mut login = false;
+    let mut argv0 = None;
+    parse_options(
+        args,
+        &mut io::sink(),
+        "rubash: ",
+        &mut clean_env,
+        &mut login,
+        &mut argv0,
+    )
+    .ok()
+    .flatten()
+    .filter(|index| *index < args.len())
+}
+
+fn parse_options<W>(
+    args: &[String],
+    stderr: &mut W,
+    prefix: &str,
+    clean_env: &mut bool,
+    login: &mut bool,
+    argv0: &mut Option<String>,
+) -> io::Result<Option<usize>>
+where
+    W: Write,
+{
+    let mut index = 0;
+
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            return Ok(Some(index + 1));
+        }
+        let Some(options) = arg.strip_prefix('-') else {
+            break;
+        };
+        if options.is_empty() {
+            break;
+        }
+
+        for (offset, option) in options.char_indices() {
+            match option {
+                'c' => *clean_env = true,
+                'l' => *login = true,
+                'a' => {
+                    let rest = &options[offset + option.len_utf8()..];
+                    if !rest.is_empty() {
+                        *argv0 = Some(rest.to_string());
+                        break;
+                    }
+                    index += 1;
+                    let Some(name) = args.get(index) else {
+                        writeln!(stderr, "{prefix}exec: -a: option requires an argument")?;
+                        write_usage(stderr)?;
+                        return Ok(None);
+                    };
+                    *argv0 = Some(name.clone());
+                    break;
+                }
+                _ => {
+                    writeln!(stderr, "{prefix}exec: -{option}: invalid option")?;
+                    write_usage(stderr)?;
+                    return Ok(None);
+                }
+            }
+        }
+        index += 1;
+    }
+
+    Ok(Some(index))
+}
+
+fn run_external_exec<W, E>(
+    program: &std::path::Path,
+    operands: &[String],
+    env_vars: &crate::shell::var_table::VarTable,
+    clean_env: bool,
+    child_stdin: Stdio,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> io::Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    let mut process = external_exec_process(program, operands, env_vars, clean_env);
+    process.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // std's Command::output() defaults stdin to Stdio::null() when .stdin()
+    // is never called — a capture-path `$(exec cat)` then reads EOF on a
+    // descriptor GNU keeps open (subst.c command_substitute only dup2's fd
+    // 1 for the capture pipe), which is exactly rubash#575. The channel is
+    // therefore explicit here, resolved by the caller from fd-table
+    // endpoint 0.
+    process.stdin(child_stdin);
+
+    match process
+        .spawn()
+        .inspect(|child| crate::executor::path::adopt_orphan_console(child.id()))
+        .and_then(|child| child.wait_with_output())
+    {
+        Ok(output) => {
+            stdout.write_all(&output.stdout)?;
+            stderr.write_all(&output.stderr)?;
+            Ok(crate::executor::wait_status::process_exit_status(
+                &output.status,
+            ))
+        }
+        Err(error) => {
+            writeln!(
+                stderr,
+                "{}exec: {}: {}",
+                diagnostic_prefix(env_vars),
+                program.display(),
+                error
+            )?;
+            Ok(126)
+        }
+    }
+}
+
+fn run_external_exec_with_stdio<E>(
+    program: &std::path::Path,
+    operands: &[String],
+    env_vars: &crate::shell::var_table::VarTable,
+    clean_env: bool,
+    child_stdout: Stdio,
+    child_stderr: Stdio,
+    child_stdin: Stdio,
+    stderr: &mut E,
+) -> io::Result<i32>
+where
+    E: Write,
+{
+    let mut process = external_exec_process(program, operands, env_vars, clean_env);
+    process.stdout(child_stdout).stderr(child_stderr);
+    // Explicit for symmetry with run_external_exec: `.status()` would
+    // inherit by default, but every spawn site of the exec builtin must
+    // state its child-stdin source (fd-table endpoint 0 resolution),
+    // never the std default (rubash#575).
+    process.stdin(child_stdin);
+
+    match process
+        .spawn()
+        .inspect(|child| crate::executor::path::adopt_orphan_console(child.id()))
+        .and_then(|mut child| child.wait())
+    {
+        Ok(status) => Ok(crate::executor::wait_status::process_exit_status(&status)),
+        Err(error) => {
+            writeln!(
+                stderr,
+                "{}exec: {}: {}",
+                diagnostic_prefix(env_vars),
+                program.display(),
+                error
+            )?;
+            Ok(126)
+        }
+    }
+}
+
+fn external_exec_process(
+    program: &std::path::Path,
+    operands: &[String],
+    env_vars: &crate::shell::var_table::VarTable,
+    clean_env: bool,
+) -> Command {
+    // GNU builtins/exec.def (exec_builtin): `com2 = full_pathname (command)`
+    // rebinds the exec target to its absolute path before shell_execve, so
+    // a script run through `exec` reports the absolute path as its $0 (the
+    // ENOEXEC re-entry at execute_cmd.c:6252 passes `command` as the new
+    // script name). Non-script targets keep the dispatcher word form.
+    let mut process = if let Some((command, _)) = crate::executor::path::shell_wrapped_command(
+        program,
+        &full_pathname_word(program),
+        operands,
+        env_vars,
+    ) {
+        command
+    } else {
+        let (command, _) = crate::executor::path::external_command_for_named_program(
+            program,
+            program.file_stem().and_then(|stem| stem.to_str()),
+            operands,
+            env_vars,
+        );
+        command
+    };
+
+    process.env_clear();
+    if !clean_env {
+        apply_exported_environment(&mut process, env_vars);
+        crate::executor::path::apply_required_windows_child_environment(&mut process, env_vars);
+    }
+    crate::executor::path::suppress_orphan_console(&mut process);
+    process
+}
+
+/// GNU general.c:909-922 full_pathname: a word that is already absolute is
+/// returned as-is; anything else gets the current working directory
+/// prepended and `.` path components removed (sh_makepath MP_DOCWD|MP_RMDOT
+/// — no symlink resolution). Applied to the slash form so the child shell
+/// sees a forward-slash absolute script name.
+fn full_pathname_word(program: &std::path::Path) -> String {
+    let display = program.to_string_lossy().replace('\\', "/");
+    let bytes = display.as_bytes();
+    let absolute =
+        display.starts_with('/') || (bytes.len() >= 3 && bytes[1] == b':' && bytes[2] == b'/');
+    if absolute {
+        return display;
+    }
+    let cwd = std::env::current_dir()
+        .map(|dir| dir.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let joined = format!("{cwd}/{display}");
+    let mut parts: Vec<&str> = Vec::new();
+    for part in joined.split('/') {
+        if !part.is_empty() && part != "." {
+            parts.push(part);
+        }
+    }
+    parts.join("/")
+}
+
+fn apply_exported_environment(process: &mut Command, env_vars: &crate::shell::var_table::VarTable) {
+    // GNU variables.c make_env_array_from_var_list: array and associative
+    // variables never cross the child env boundary (rubash#534) — `exec
+    // printenv A` must not see a storage-encoded array either. Rendered
+    // from the structured flags, not the (write-behind) serialized string.
+    let arrays = env_vars.marked_names(crate::executor::types::ARRAY_VARS);
+    let assocs = env_vars.marked_names(crate::executor::types::ASSOC_VARS);
+    let mut names = env_vars.marked_names(crate::executor::types::EXPORTED_VARS);
+    names.sort();
+    for name in names {
+        if arrays.iter().any(|n| n == &name) || assocs.iter().any(|n| n == &name) {
+            continue;
+        }
+        if let Some(value) = env_vars.get(&name) {
+            process.env(&name, value);
+        }
+    }
+}
+
+fn run_printenv_fallback<W>(
+    names: &[String],
+    env_vars: &crate::shell::var_table::VarTable,
+    clean_env: bool,
+    stdout: &mut W,
+) -> io::Result<i32>
+where
+    W: Write,
+{
+    if clean_env {
+        return Ok(if names.is_empty() {
+            EXECUTION_SUCCESS
+        } else {
+            1
+        });
+    }
+
+    let exported = env_vars.marked_names(EXPORTED_VARS);
+    // GNU variables.c make_env_array_from_var_list: array and associative
+    // variables never cross the child env boundary (rubash#534) — the
+    // internal printenv emulation must mirror the real spawn path.
+    let arrays = env_vars.marked_names(crate::executor::types::ARRAY_VARS);
+    let assocs = env_vars.marked_names(crate::executor::types::ASSOC_VARS);
+    let exported: Vec<String> = exported
+        .into_iter()
+        .filter(|name| !arrays.iter().any(|n| n == name) && !assocs.iter().any(|n| n == name))
+        .collect();
+    if names.is_empty() {
+        let mut exported = exported;
+        exported.sort();
+        for name in exported {
+            if let Some(value) = env_vars.get(&name) {
+                writeln!(stdout, "{name}={value}")?;
+            }
+        }
+        return Ok(EXECUTION_SUCCESS);
+    }
+
+    let mut found_all = true;
+    for name in names {
+        if exported.iter().any(|exported_name| exported_name == name) {
+            if let Some(value) = env_vars.get(name) {
+                writeln!(stdout, "{value}")?;
+                continue;
+            }
+        }
+        found_all = false;
+    }
+
+    Ok(if found_all { EXECUTION_SUCCESS } else { 1 })
+}
+
+fn write_usage<W>(stderr: &mut W) -> io::Result<()>
+where
+    W: Write,
+{
+    writeln!(
+        stderr,
+        "exec: usage: exec [-cl] [-a name] [command [argument ...]] [redirection ...]"
+    )
+}

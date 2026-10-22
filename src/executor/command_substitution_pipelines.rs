@@ -1,0 +1,648 @@
+use super::*;
+
+#[cfg(windows)]
+use std::ffi::OsString;
+#[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+/// True when the command-substitution source's first heredoc header line
+/// also carries the closing `)` (`cat << EOF)`). GNU treats this as an
+/// unterminated here-document inside the substitution (parse.y:4563-4567)
+/// and warns before gathering it (heredoc7.sub).
+///
+/// The `)` must be AFTER the heredoc delimiter word, not part of it.
+/// `cat <<\)` has `)` as the delimiter (backslash-quoted), so the `)` is
+/// NOT the command-substitution closer.  `cat <<EOF)` has `EOF` as the
+/// delimiter and `)` as the closer.
+fn heredoc_header_closes_command_substitution(source: &str) -> bool {
+    let Some(header) = source.lines().next() else {
+        return false;
+    };
+    let Some(ll_pos) = header.find("<<") else {
+        return false;
+    };
+    let after = &header[ll_pos + 2..];
+    // Skip optional '-' for <<-
+    let after = after.strip_prefix('-').unwrap_or(after);
+    // Skip leading whitespace
+    let after = after.trim_start();
+    // Parse the delimiter word: characters until unquoted whitespace, `;`,
+    // `|`, `&`, or `)`.  Backslash escapes the next character.  Single and
+    // double quotes delimit quoted sections that are part of the delimiter.
+    // Byte-level scan: the delimiter grammar is pure ASCII structure
+    // (backslash, quotes, whitespace, ;|&)). Comparing raw bytes avoids the
+    // byte->char widening hazard — a UTF-8 continuation byte 0x85 widened to
+    // char would read as U+0085 and satisfy char::is_whitespace(),
+    // truncating a multibyte delimiter mid-character (see
+    // scripts/check-utf8-boundary-hygiene.sh).
+    let bytes = after.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'\\' && i + 1 < bytes.len() {
+            // Escaped character is part of the delimiter
+            i += 2;
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            // Quoted section: skip to matching quote
+            let quote = byte;
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1; // skip closing quote
+            }
+            continue;
+        }
+        if byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b')') {
+            break;
+        }
+        i += 1;
+    }
+    // Check if there's a `)` after the delimiter word
+    after[i..].trim_start().starts_with(')')
+}
+
+fn mktemp_command_substitution_display_path(path: &std::path::Path) -> String {
+    #[cfg(windows)]
+    {
+        return windows_mktemp_display_path(path);
+    }
+
+    #[cfg(not(windows))]
+    {
+        let display = path.to_string_lossy().replace('\\', "/");
+        shell_display_path(&display)
+    }
+}
+
+#[cfg(windows)]
+fn windows_mktemp_display_path(path: &std::path::Path) -> String {
+    let native = windows_slash_drive_to_native(path);
+    let long = windows_long_path(&native);
+    windows_display_path(&long)
+}
+
+#[cfg(windows)]
+fn windows_slash_drive_to_native(path: &std::path::Path) -> std::path::PathBuf {
+    let display = path.to_string_lossy().replace('\\', "/");
+    if display.len() >= 3
+        && display.as_bytes()[0] == b'/'
+        && display.as_bytes()[2] == b'/'
+        && display.as_bytes()[1].is_ascii_alphabetic()
+    {
+        let drive = display.as_bytes()[1] as char;
+        return std::path::PathBuf::from(
+            format!("{}:\\{}", drive.to_ascii_uppercase(), &display[3..]).replace('/', "\\"),
+        );
+    }
+    path.to_path_buf()
+}
+
+#[cfg(windows)]
+fn windows_long_path(path: &std::path::Path) -> std::path::PathBuf {
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut buffer = vec![0u16; 32768];
+    let written =
+        unsafe { GetLongPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
+    if written == 0 || written as usize >= buffer.len() {
+        return path.to_path_buf();
+    }
+    buffer.truncate(written as usize);
+    std::path::PathBuf::from(OsString::from_wide(&buffer))
+}
+
+#[cfg(windows)]
+fn windows_display_path(path: &std::path::Path) -> String {
+    let display = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = display.strip_prefix("//?/UNC/") {
+        return format!("//{rest}");
+    }
+    if let Some(rest) = display.strip_prefix("//?/") {
+        return rest.to_string();
+    }
+    display
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetLongPathNameW(short_path: *const u16, long_path: *mut u16, buffer_length: u32) -> u32;
+}
+
+impl Executor {
+    pub(in crate::executor) fn mktemp_command_substitution(
+        &self,
+        words: &[String],
+    ) -> Option<String> {
+        // TODO(subst.c/execute_cmd.c): command substitution should fork a
+        // subshell and capture external command stdout. This covers common
+        // script prologues like `tmp=$(mktemp -t name.XXXXXX) || exit`.
+        if words.first().map(String::as_str) != Some("mktemp") {
+            return None;
+        }
+        let mut directory = false;
+        // coreutils default template: tmp.XXXXXXXXXX (10 X's, gnulib
+        // __gen_tempname base "tmp").
+        let mut template = "tmp.XXXXXXXXXX";
+        let mut index = 1;
+        while index < words.len() {
+            match words[index].as_str() {
+                "-d" => {
+                    directory = true;
+                    index += 1;
+                }
+                "-t" => {
+                    template = words.get(index + 1)?.as_str();
+                    index += 2;
+                }
+                "<" | ">" | ">>" | ">|" | "1>" | "1>>" | "1>|" | "2>" | "2>>" | "2>|" => {
+                    words.get(index + 1)?;
+                    index += 2;
+                }
+                value if value.starts_with('-') => return None,
+                value => {
+                    template = value;
+                    index += 1;
+                }
+            }
+        }
+        let dir = self
+            .shell_state
+            .env_vars
+            .get("TMPDIR")
+            .filter(|value| !value.contains('\0'))
+            .cloned()
+            .unwrap_or_else(safe_temp_dir_string);
+        let dir = shell_path_to_windows(&dir, &self.shell_state.env_vars);
+        std::fs::create_dir_all(&dir).ok()?;
+        let mut path = None;
+        // coreutils mktemp name generation (gnulib try_tempname_len /
+        // mktemp(1)): the trailing run of X's in the template (minimum 3)
+        // is replaced character-by-character from the 62-char
+        // [a-zA-Z0-9] alphabet — never a pid/timestamp string (rubash#232:
+        // `mktemp /tmp/t.XXXXXX` output must look like `TnVGKu`, and
+        // scripts parse/validate the shape). Randomness comes from a
+        // splitmix of (nanos, pid, attempt); the create_new retry loop
+        // below is the collision backstop.
+        let x_run = template.chars().rev().take_while(|c| *c == 'X').count();
+        for attempt in 0..32u64 {
+            let mut state = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0)
+                ^ ((std::process::id() as u64) << 32)
+                ^ attempt.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut random_suffix = |state: &mut u64| {
+                *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = *state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                const ALPHABET: &[u8; 62] =
+                    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+                char::from(ALPHABET[(z ^ (z >> 31)) as usize % 62])
+            };
+            let suffix: String = (0..x_run).map(|_| random_suffix(&mut state)).collect();
+            let filename = if x_run >= 3 {
+                format!("{}{}", &template[..template.len() - x_run], suffix)
+            } else {
+                // No X-run in the template: GNU mktemp appends its own
+                // 10-char random suffix (`tmp.XXXXXXXXXX` shape); keep the
+                // historical dotted-append with the same alphabet.
+                let dot_suffix: String = (0..10).map(|_| random_suffix(&mut state)).collect();
+                format!("{template}.{dot_suffix}")
+            };
+            let candidate = dir.join(filename);
+            let created = if directory {
+                std::fs::create_dir_all(&candidate).is_ok()
+            } else {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                    .is_ok()
+            };
+            if created {
+                path = Some(candidate);
+                break;
+            }
+        }
+        let path = path?;
+        self.last_command_substitution_status.set(Some(0));
+        Some(mktemp_command_substitution_display_path(&path))
+    }
+
+    pub(in crate::executor) fn command_substitution_heredoc_output_mut_typed(
+        &mut self,
+        source: &str,
+        context: SubstitutionQuoteContext,
+    ) -> Option<SubstitutionOutput> {
+        if !source.contains("<<") {
+            return None;
+        }
+        let closed_by_paren = source.contains(crate::executor::markers::IFS_GLUE);
+        let source = source.replace(crate::executor::markers::IFS_GLUE, "");
+        let source = self.comsub_body_alias_splice_extracted(&source);
+        if heredoc_header_closes_command_substitution(&source) {
+            // GNU parse.y:4563-4567: when the `)` that closes a command
+            // substitution sits on the heredoc header line (`cat << EOF)`),
+            // the heredoc has not been gathered yet, so bash warns and then
+            // gathers it anyway (heredoc7.sub line 17).
+            let start_line = self
+                .shell_state
+                .env_vars
+                .get("__RUBASH_CMD_START_LINE")
+                .or_else(|| self.shell_state.env_vars.get("__RUBASH_CURRENT_LINE"))
+                .and_then(|line| line.parse::<usize>().ok())
+                .unwrap_or(1);
+            eprintln!(
+                "{}warning: command substitution: 1 unterminated here-document",
+                self.diagnostic_prefix_for_line(start_line)
+            );
+        }
+        // The cat/heredoc-optimized comsub paths re-derive the here-document
+        // warning lines, which GNU reports from the outer script's physical
+        // parse (parse_comsub yyparse + gather_here_documents), so seed the
+        // body numbering from the command's START line, not the
+        // execution-time line_number (rubash#201: comsub-eof0.sub).
+        let comsub_start_line = self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_CMD_START_LINE")
+            .or_else(|| self.shell_state.env_vars.get("__RUBASH_CURRENT_LINE"))
+            .and_then(|line| line.parse::<usize>().ok())
+            .unwrap_or(1)
+            + self.comsub_leading_newlines.get();
+        let tokens = crate::lexer::tokenize_comsub_body(
+            &source,
+            self.posix_mode_enabled(),
+            comsub_start_line,
+            true,
+        );
+        let mut ast = crate::parser::parse(&tokens);
+        super::command_substitution::normalize_comsub_body_statement_lines(&mut ast, &tokens);
+        let first = ast.commands.first()?;
+        let (first, piped_next) = if let Some(pipeline_command) = &first.pipeline_command {
+            (
+                pipeline_command.stages.first()?,
+                pipeline_command.stages.get(1),
+            )
+        } else {
+            (first, ast.commands.get(1))
+        };
+        if first.words.first().map(String::as_str) != Some("cat") {
+            return None;
+        }
+        // rubash#320: admission whitelist — this fast path models only
+        // `cat <<EOF` reading its heredoc and echoing it to the captured
+        // stdout. GNU executes `cat <<EOF > /dev/null` with the redirect
+        // bound first (redir.c do_redirection_internal before exec), so the
+        // capture is EMPTY. A command carrying any file redirection (or an
+        // fd duplication) must fall through to the real executor instead of
+        // losing the redirect here — a false admission is a silent semantic
+        // bug; declining only costs the shortcut.
+        if command_has_file_redirect(first) {
+            return None;
+        }
+        if piped_next.is_some_and(command_has_file_redirect) {
+            return None;
+        }
+        if closed_by_paren || command_has_warned_heredoc(first) {
+            // Deduplicate: the same comsub can be expanded through multiple
+            // paths (expand_assignment_value_inner and
+            // expand_embedded_parameters_mut), which would emit the warning
+            // twice. Track the last warning source and skip duplicates.
+            let should_emit = self
+                .last_heredoc_warning_source
+                .borrow()
+                .as_deref()
+                .map(|last| last != source)
+                .unwrap_or(true);
+            if should_emit {
+                *self.last_heredoc_warning_source.borrow_mut() = Some(source.to_string());
+                self.report_command_substitution_heredoc_warning(&source, first);
+            }
+        }
+        let mut output = if first.pipe.is_none() && ast.commands.len() > 1 {
+            let mut output = String::new();
+            for command in &ast.commands {
+                if command.words.first().map(String::as_str) != Some("cat")
+                    || command.pipe.is_some()
+                    // rubash#320: redirect-carrying cats are not
+                    // shortcut-eligible (see command_has_file_redirect).
+                    || command_has_file_redirect(command)
+                {
+                    return None;
+                }
+                output.push_str(&self.stdin_string_for_command_mut(command)?);
+            }
+            output
+        } else {
+            let mut output = self.stdin_string_for_command_mut(first)?;
+            if first.pipe.is_some() {
+                let next = piped_next?;
+                match next.words.as_slice() {
+                    [cmd, option] if cmd == "sort" && option == "-u" => {
+                        let mut lines = output.lines().map(str::to_string).collect::<Vec<_>>();
+                        lines.sort();
+                        lines.dedup();
+                        output = lines.join("\n");
+                        output.push('\n');
+                    }
+                    _ => return None,
+                }
+            }
+            output
+        };
+        output = output.trim_capture_terminator().to_string();
+        self.last_command_substitution_status.set(Some(0));
+        Some(SubstitutionOutput::readback(
+            crate::executor::substitution_metadata::shell_text_to_raw_bytes(&output),
+            0,
+            context,
+        ))
+    }
+
+    pub(in crate::executor) fn command_substitution_heredoc_output(
+        &self,
+        source: &str,
+    ) -> Option<String> {
+        if !source.contains("<<") {
+            return None;
+        }
+
+        let closed_by_paren = source.contains(crate::executor::markers::IFS_GLUE);
+        let source = source.replace(crate::executor::markers::IFS_GLUE, "");
+        let source = self.comsub_body_alias_splice_extracted(&source);
+        // Start-line seeding like the heredoc path above: here-document
+        // warning lines are the outer script's physical lines (rubash#201).
+        let comsub_start_line = self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_CMD_START_LINE")
+            .or_else(|| self.shell_state.env_vars.get("__RUBASH_CURRENT_LINE"))
+            .and_then(|line| line.parse::<usize>().ok())
+            .unwrap_or(1)
+            + self.comsub_leading_newlines.get();
+        let tokens = crate::lexer::tokenize_comsub_body(
+            &source,
+            self.posix_mode_enabled(),
+            comsub_start_line,
+            true,
+        );
+        let mut ast = crate::parser::parse(&tokens);
+        super::command_substitution::normalize_comsub_body_statement_lines(&mut ast, &tokens);
+        let first = ast.commands.first()?;
+        let (first, piped_next) = if let Some(pipeline_command) = &first.pipeline_command {
+            (
+                pipeline_command.stages.first()?,
+                pipeline_command.stages.get(1),
+            )
+        } else {
+            (first, ast.commands.get(1))
+        };
+        if first.words.first().map(String::as_str) != Some("cat") {
+            return None;
+        }
+        // rubash#320: same admission whitelist as the typed path — a file
+        // redirection on the cat (or the piped stage) means the capture is
+        // redirect-owned, not heredoc-owned; fall through to the real
+        // executor (`cat <<EOF > /dev/null` must capture nothing).
+        if command_has_file_redirect(first) {
+            return None;
+        }
+        if piped_next.is_some_and(command_has_file_redirect) {
+            return None;
+        }
+
+        // Warning is emitted by command_substitution_heredoc_output_mut_typed
+        // (the typed path) to avoid duplicate warnings when both paths are
+        // called for the same comsub.
+        let _ = closed_by_paren;
+        let _ = command_has_warned_heredoc(first);
+
+        if first.pipe.is_none() && ast.commands.len() > 1 {
+            let mut output = String::new();
+            for command in &ast.commands {
+                if command.words.first().map(String::as_str) != Some("cat")
+                    || command.pipe.is_some()
+                    // rubash#320: redirect-carrying cats are not
+                    // shortcut-eligible (see command_has_file_redirect).
+                    || command_has_file_redirect(command)
+                {
+                    return None;
+                }
+                output.push_str(&self.stdin_string_for_command(command)?);
+            }
+            return Some(output.trim_capture_terminator().to_string());
+        }
+
+        let mut output = self.stdin_string_for_command(first)?;
+        if first.pipe.is_some() {
+            let next = piped_next?;
+            match next.words.as_slice() {
+                [cmd, option] if cmd == "sort" && option == "-u" => {
+                    let mut lines = output.lines().map(str::to_string).collect::<Vec<_>>();
+                    lines.sort();
+                    lines.dedup();
+                    output = lines.join("\n");
+                    output.push('\n');
+                }
+                _ => return None,
+            }
+        }
+
+        Some(output.trim_capture_terminator().to_string())
+    }
+
+    pub(in crate::executor) fn timed_command_substitution_output(
+        &self,
+        words: &[String],
+    ) -> Option<String> {
+        if words.first().map(String::as_str) != Some("time") {
+            return None;
+        }
+
+        let mut index = 1;
+        let mut inverted = false;
+        while let Some(word) = words.get(index).map(String::as_str) {
+            match word {
+                "-p" | "--" | "time" => index += 1,
+                "!" => {
+                    inverted = !inverted;
+                    index += 1;
+                }
+                _ => break,
+            }
+        }
+
+        let started = time_command_started();
+        let output = self.timed_command_substitution_inner(&words[index..])?;
+        // &self context: the executor's stderr endpoint needs &mut, so this
+        // site keeps the raw stream write. A command substitution binds only
+        // stdout — its stderr IS the shell's stderr in practice — so the
+        // item-6 posix routing has no observable difference to close here.
+        print_time(
+            &self.shell_state.env_vars,
+            words
+                .iter()
+                .skip(1)
+                .take_while(|word| word.as_str() != "!")
+                .any(|word| word == "-p"),
+            started,
+        );
+        let status = self.last_command_substitution_status.get().unwrap_or(0);
+        self.last_command_substitution_status.set(Some(if inverted {
+            invert_exit_status(status)
+        } else {
+            status
+        }));
+        Some(output)
+    }
+
+    fn timed_command_substitution_inner(&self, words: &[String]) -> Option<String> {
+        match words.first().map(String::as_str) {
+            None | Some(":") | Some("true") => {
+                self.last_command_substitution_status.set(Some(0));
+                Some(String::new())
+            }
+            Some("false") => {
+                self.last_command_substitution_status.set(Some(1));
+                Some(String::new())
+            }
+            Some("echo") => {
+                let args = words[1..]
+                    .iter()
+                    .map(|word| self.expand_word(word))
+                    .collect::<Vec<_>>();
+                self.last_command_substitution_status.set(Some(0));
+                Some(echo_command_substitution_output(&args))
+            }
+            Some("printf") => {
+                let expanded_args = words[1..]
+                    .iter()
+                    .flat_map(|word| self.expand_command_substitution_arg_values(word))
+                    .collect::<Vec<_>>();
+                let mut env_vars = self.shell_state.env_vars.clone();
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                let status = crate::builtins::printf::execute_with_io(
+                    expanded_args.iter().map(String::as_str),
+                    &mut env_vars,
+                    &mut stdout,
+                    &mut stderr,
+                )
+                .unwrap_or(1);
+                self.last_command_substitution_status.set(Some(status));
+                Some(
+                    bytes_to_shell_text(&stdout)
+                        .trim_capture_terminator()
+                        .to_string(),
+                )
+            }
+            Some("tty") | Some("/bin/tty") | Some("/usr/bin/tty") => {
+                let silent = words
+                    .iter()
+                    .skip(1)
+                    .any(|arg| arg == "-s" || arg == "--silent" || arg == "--quiet");
+                self.last_command_substitution_status.set(Some(1));
+                Some(if silent {
+                    String::new()
+                } else {
+                    "not a tty".to_string()
+                })
+            }
+            Some("cat") => {
+                // Bare `cat` (or flag/`-` operands) reads fd 0 — the shared
+                // FUNCTION_STDIN cursor — which this shortcut cannot model;
+                // fall back to real execution (external_cat owns it).
+                if words.len() <= 1 || words[1..].iter().any(|word| word.starts_with('-')) {
+                    return None;
+                }
+                let mut output = String::new();
+                for word in &words[1..] {
+                    let path = self.expand_word(word);
+                    // `/dev/fd/N` (N>0) needs the real descriptor table —
+                    // full execution owns it. fd 0 is the FUNCTION_STDIN
+                    // cursor when that channel exists; without it fd 0 is
+                    // the inherited process stdin, which full execution
+                    // drains (subst.c:7143).
+                    if let Some(fd) = crate::executor::dev_fd_operands::dev_operand_fd(&path) {
+                        if fd != 0 || !self.shell_state.env_vars.contains_key(FUNCTION_STDIN) {
+                            return None;
+                        }
+                        if let Some(text) = self.shell_state.env_vars.get(FUNCTION_STDIN) {
+                            self.comsub_stdin_writeback
+                                .set(Some((text.len(), Self::function_stdin_fingerprint(text))));
+                        }
+                        output.push_str(&self.function_stdin_remaining().unwrap_or_default());
+                        continue;
+                    }
+                    // niubash#177: same operand resolution as the argv
+                    // funnel — a virtual-root file operand may exist only
+                    // under its `.exe` spelling on disk.
+                    if let Ok(value) =
+                        fs::read_to_string(crate::executor::path::windows_operand_file_path(
+                            shell_path_to_windows(&path, &self.shell_state.env_vars),
+                            &self.shell_state.env_vars,
+                        ))
+                    {
+                        output.push_str(&value);
+                    }
+                }
+                self.last_command_substitution_status.set(Some(0));
+                Some(output.trim_capture_terminator().to_string())
+            }
+            Some(_) => self.run_external_command_substitution(words),
+        }
+    }
+}
+
+#[cfg(test)]
+mod mktemp_display_path_tests {
+    use super::*;
+
+    #[test]
+    fn mktemp_display_path_uses_native_windows_drive() {
+        let display = mktemp_command_substitution_display_path(std::path::Path::new(
+            "/c/Users/example/AppData/Local/Temp/rubash-mktemp.1",
+        ));
+
+        if cfg!(windows) {
+            assert_eq!(
+                display,
+                "C:/Users/example/AppData/Local/Temp/rubash-mktemp.1"
+            );
+        } else {
+            assert_eq!(
+                display,
+                "/c/Users/example/AppData/Local/Temp/rubash-mktemp.1"
+            );
+        }
+    }
+}
+
+/// rubash#320 admission predicate for the `cat` heredoc comsub shortcut:
+/// GNU binds file redirections (and fd duplications) before the command
+/// runs (redir.c do_redirection_internal), so `cat <<EOF > /dev/null`
+/// captures nothing. The shortcut only models heredoc/here-string input
+/// (`<<`, `<<-`, `<<<` operators — input plumbing), so any other redirect
+/// operator disqualifies the command and it falls through to the real
+/// executor.
+fn command_has_file_redirect(command: &CommandNode) -> bool {
+    command
+        .redirects
+        .iter()
+        .any(|r| !r.operator.starts_with("<<"))
+        || command.redirect_in.is_some()
+        || command.redirect_out.is_some()
+        || command.append.is_some()
+        || command.redirect_err.is_some()
+        || command.redirect_err_append.is_some()
+}

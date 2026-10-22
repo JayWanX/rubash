@@ -1,0 +1,1267 @@
+use std::collections::BTreeMap;
+
+use crate::executor::markers::STORAGE_WORD_PREFIX;
+use crate::executor::markers::STORAGE_WORD_PREFIX_STR;
+use crate::executor::{mark_env_name, split_storage_words, unquote_storage_value, ARRAY_VARS};
+
+pub(in crate::executor) fn normalize_array_expanded_value(value: String) -> String {
+    // GNU array.c: array element values are stored and retrieved verbatim.
+    // A previous version special-cased values containing only backslashes
+    // and double quotes (e.g. a single `"`), converting them to `""`.
+    // This corrupted values like [0x0022]=\" which stores a literal `"`
+    // (unicode1.sub C_UTF_8 array). The roundtrip must be identity.
+    value
+}
+
+pub(in crate::executor) fn array_values(value: &str) -> Vec<String> {
+    // TODO(array.c/assoc.c/subst.c): This is a lossy representation used while
+    // arrays are still stored in the scalar variable table.
+    if let Some(rendered) = value.strip_prefix(STORAGE_WORD_PREFIX) {
+        return rendered_array_values(rendered);
+    }
+
+    let Some(inner) = value
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return if value.is_empty() {
+            Vec::new()
+        } else {
+            vec![value.to_string()]
+        };
+    };
+
+    if inner.is_empty() {
+        return Vec::new();
+    }
+
+    split_storage_words(inner)
+        .map(|part| {
+            let value = part
+                .split_once('=')
+                .map(|(_, value)| value)
+                .map(unquote_storage_value)
+                .unwrap_or_else(|| unquote_storage_value(&part));
+            normalize_array_expanded_value(value)
+        })
+        .collect()
+}
+
+pub(in crate::executor) fn indexed_array_entries(value: &str) -> BTreeMap<usize, String> {
+    indexed_array_entries_cached(value).as_ref().clone()
+}
+
+/// Content-addressed memo of `indexed_array_entries_uncached`, same
+/// discipline as the assoc parse memo in assignment_helpers.rs: the cache
+/// key IS the exact storage string, so a hit requires the live value to be
+/// byte-identical to the parsed one — a stale parse cannot be served.
+/// Writers feed their render back through `format_indexed_array_storage`,
+/// so a run of `a[i]=v` assignments over a growing array parses once
+/// instead of once per element write (GNU array.c:516 array_insert is an
+/// O(1) linked-list append; the string representation made each write
+/// re-scan the whole array, O(n^2) per fill loop, ~70x GNU on the OMB
+/// element-write shape).
+pub(in crate::executor) fn indexed_array_entries_cached(
+    value: &str,
+) -> std::sync::Arc<BTreeMap<usize, String>> {
+    let mut cache = indexed_parse_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = cache.get(value) {
+        return std::sync::Arc::clone(hit);
+    }
+    drop(cache);
+    let parsed = std::sync::Arc::new(indexed_array_entries_uncached(value));
+    let mut cache = indexed_parse_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 128 {
+        cache.clear();
+    }
+    cache.insert(value.to_string(), std::sync::Arc::clone(&parsed));
+    parsed
+}
+
+fn indexed_parse_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<BTreeMap<usize, String>>>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<BTreeMap<usize, String>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn indexed_array_entries_uncached(value: &str) -> BTreeMap<usize, String> {
+    if let Some(rendered) = value.strip_prefix(STORAGE_WORD_PREFIX) {
+        return rendered_array_entries(rendered);
+    }
+
+    array_values(value).into_iter().enumerate().collect()
+}
+
+pub(in crate::executor) fn array_indices(value: &str) -> Vec<String> {
+    indexed_array_entries(value)
+        .keys()
+        .map(usize::to_string)
+        .collect()
+}
+
+pub(in crate::executor) fn array_value_at(value: &str, index: usize) -> Option<String> {
+    indexed_array_entries_cached(value)
+        .get(&index)
+        .map(|value| normalize_array_expanded_value(value.clone()))
+}
+
+pub(in crate::executor) fn resolve_indexed_array_subscript(
+    value: &str,
+    index: i128,
+) -> Option<usize> {
+    if index >= 0 {
+        return usize::try_from(index).ok();
+    }
+
+    let max_index = indexed_array_entries(value).keys().next_back().copied()?;
+    let resolved = i128::try_from(max_index)
+        .ok()?
+        .checked_add(1)?
+        .checked_add(index)?;
+    usize::try_from(resolved).ok()
+}
+
+pub(in crate::executor) fn parse_array_integer_subscript(name: &str) -> Option<(&str, i128)> {
+    let (array_name, subscript) = parse_array_subscript(name)?;
+    let index = subscript.parse::<i128>().ok()?;
+    Some((array_name, index))
+}
+
+pub(in crate::executor) fn parse_array_numeric_subscript(name: &str) -> Option<(&str, usize)> {
+    let (array_name, subscript) = parse_array_subscript(name)?;
+    let index = subscript.parse::<usize>().ok()?;
+    Some((array_name, index))
+}
+
+/// A clean negative-literal subscript (`-N`, nothing else): the raw text is
+/// exactly `-` followed by `[1-9][0-9]*` and parses as `i64`.
+///
+/// GNU arrayfunc.c:1581 normalizes a negative indexed subscript as
+/// `array_max_index + 1 + ind`, so a literal needs no evalexp — but only a
+/// literal with this exact shape is value-identical to its parse. A leading
+/// zero would be octal under shell arithmetic (`-08` is an evalexp operand
+/// error, not -8; `-0` is element 0, not `max + 1`), and any whitespace,
+/// quote, sign repetition or expansion (`- 1`, `'-1'`, `--1`, `-$i`) must
+/// keep the full expand+evalexp pipeline with its diagnostics. Whitelist
+/// admission: anything rejected here rides the slow path unchanged.
+pub(in crate::executor) fn clean_negative_literal_subscript(key: &str) -> Option<i64> {
+    let digits = key.strip_prefix('-')?;
+    if !matches!(digits.as_bytes().first(), Some(b'1'..=b'9')) {
+        return None;
+    }
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    key.parse::<i64>().ok()
+}
+
+/// Split a bare array reference `name[subscript]` into its parts.
+///
+/// GNU arrayfunc.c:1290-1333 tokenize_array_reference (via valid_array_reference):
+/// the subscript ends at the `]` that closes the FIRST `[` — found with
+/// skipsubscript/skip_matched_pair nesting (arrayfunc.c:1318, brackets nest,
+/// backslash escapes the next char) — and the reference is only valid when
+/// that `]` is the LAST character (`t[len+1] != '\0'` fails, arrayfunc.c:1322)
+/// and the subscript is non-empty (`len == 1` fails, arrayfunc.c:1322).
+/// A body like `arr[0]#[\'\"]` (bats-preprocess
+/// `${BASH_REMATCH[1]#[\'\"]}`) is therefore NOT an array reference — its
+/// name ends at the operator `#` (subst.c:9807 string_extract with the
+/// `#%^,:-=?+/@}` delimiter set skips the well-formed `[0]` and stops at
+/// `#`), so the residue belongs to the pattern-removal operator, not the
+/// subscript. The old `split_once('[')`+`strip_suffix(']')` accepted any
+/// tail that happened to end in `]` and fed `0]#[\'\"` to arithmetic.
+pub(in crate::executor) fn parse_array_subscript(name: &str) -> Option<(&str, &str)> {
+    let (array_name, rest) = name.split_once('[')?;
+    // skip_matched_pair from the opening `[`: depth 1, nested `[`/`]` adjust
+    // depth, a backslash protects the next character, and the first depth-0
+    // `]` closes the subscript.
+    let bytes = rest.as_bytes();
+    let mut depth = 1usize;
+    let mut index = 0usize;
+    let mut close = None;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                index += 2;
+                continue;
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    let close = close?;
+    if close != bytes.len() - 1 || close == 0 {
+        // Closing `]` must end the reference; `[]` is not a valid
+        // non-associative subscript (arrayfunc.c:1322 len == 1).
+        return None;
+    }
+    Some((array_name, &rest[..close]))
+}
+
+/// Tokenize an array reference in ALREADY-EXPANDED operand text (the `-v' /
+/// `printf -v' / `unset' operand rewrites). GNU's cond_expand_word ends in
+/// dequote_list, which only strips CTLESC pairs (subst.c:4807
+/// dequote_string) — a `"' around a `$var' still brackets the subscript
+/// when test.c's flag-0 skipsubscript runs, so GNU's scan sees balanced
+/// quotes. The rubash operand is fully dequoted, so an expansion-produced
+/// quote is DATA indistinguishable from syntax; a quote-active scan would
+/// swallow its `]' (`assoc["]' with value `"' — quotearray1.sub mytest
+/// '"'). Scan with quote state off — skip_matched_pair's flags&1 mode
+/// for text "after expansion has been performed" (subst.c:2080-2086):
+/// backslash pairs and bracket depth only.
+pub(in crate::executor) fn parse_expanded_array_subscript(name: &str) -> Option<(&str, &str)> {
+    let open = name.find('[')?;
+    let bytes = name.as_bytes();
+    let mut depth = 1usize;
+    let mut index = open + 1;
+    let mut close = None;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 1,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    let close = close?;
+    if close != bytes.len() - 1 || close == open + 1 {
+        return None;
+    }
+    Some((&name[..open], &name[open + 1..close]))
+}
+
+pub(in crate::executor) fn format_indexed_array_storage(
+    entries: BTreeMap<usize, String>,
+) -> String {
+    let entries = std::sync::Arc::new(entries);
+    let rendered = entries
+        .iter()
+        .map(|(index, value)| format!("[{index}]={}", quote_array_value(value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let storage = format!("{STORAGE_WORD_PREFIX_STR}({rendered})");
+    feed_indexed_parse_cache(&storage, &entries);
+    storage
+}
+
+pub(in crate::executor) fn format_indexed_array_values(values: Vec<String>) -> String {
+    let rendered = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| format!("[{index}]={}", quote_array_value(value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let storage = format!("{STORAGE_WORD_PREFIX_STR}({rendered})");
+    // Dense values form: parse reproduces the same 0..n map, so it can ride
+    // the memo as well (content-addressed, byte-identical hit required).
+    let entries: BTreeMap<usize, String> = values.into_iter().enumerate().collect();
+    feed_indexed_parse_cache(&storage, &std::sync::Arc::new(entries));
+    storage
+}
+
+fn feed_indexed_parse_cache(storage: &str, entries: &std::sync::Arc<BTreeMap<usize, String>>) {
+    let mut cache = indexed_parse_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 128 {
+        cache.clear();
+    }
+    cache.insert(storage.to_string(), std::sync::Arc::clone(entries));
+}
+
+pub(in crate::executor) fn store_indexed_array(
+    env_vars: &mut crate::shell::var_table::VarTable,
+    name: &str,
+    values: Vec<String>,
+) {
+    env_vars.insert(name.to_string(), format_indexed_array_values(values));
+    mark_env_name(env_vars, ARRAY_VARS, name);
+}
+
+/// rubash#616 (plan Phase 1a): structured-cell synchronization for indexed
+/// arrays. `shell_state.variables` (`ShellValue::IndexedArray`) is the
+/// O(1) truth `${#a[@]}` reads — GNU counts the ARRAY object directly
+/// (subst.c:7533 `array_num_elements`, array.h:121 the `num_elements`
+/// field) — while the rendered `env_vars` string stays the projection every
+/// storage reader sees (dynamic_arrays.rs parameter_array_storage is
+/// mirror-only). GNU has ONE owner (bind_variable writes the array cell,
+/// array.c array_insert); the typed/mirror split is ours during the
+/// typed-store migration, so every mirror write must either sync through
+/// here or drop the structured cell — a stale typed entry must never
+/// shadow the mirror.
+///
+/// `entries` always comes from the same `indexed_array_entries` parse the
+/// mirror render uses, so the structured count equals the mirror-derived
+/// count by construction. Keys are preserved (a sparse `a=([5]=x)` stays
+/// `{5}`) — `replace_indexed_array` enumerates positionally.
+pub(crate) fn sync_typed_indexed_array(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    entries: &BTreeMap<usize, String>,
+) {
+    let mapped = entries
+        .iter()
+        .map(|(index, value)| (i64::try_from(*index).unwrap_or(i64::MAX), value.clone()));
+    if store.replace_indexed_array_entries(name, mapped).is_err() {
+        // A readonly refusal would leave the structured cell older than the
+        // mirror — drop it so reads fall back to the mirror projection.
+        drop_typed_indexed_array(store, name);
+    }
+}
+
+/// rubash#616 (1a): single-element extension of the structured cell for the
+/// element-write hot path. Tries the in-place extension first (O(log n), GNU
+/// array.c:516 `array_insert` appends to the ARRAY object) and falls back to
+/// the full structured sync — which is also what drops a refused cell — when
+/// the cell is missing, of another shape, readonly, or size-inconsistent.
+/// `entries` is the caller's post-write parse of the mirror it is about to
+/// render, so `entries.len()` is the expected structured size.
+pub(crate) fn sync_typed_indexed_element(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    index: i64,
+    value: &str,
+    entries: &BTreeMap<usize, String>,
+) {
+    if !store.extend_indexed_element(name, index, value, entries.len()) {
+        sync_typed_indexed_array(store, name, entries);
+    }
+}
+
+/// rubash#616 (plan Phase 1c): extend a canonical indexed mirror in place by
+/// exactly the segments `format_indexed_array_storage` would have appended for
+/// each `(index, element)` pair, which the caller supplies in ascending index
+/// order. The caller has verified the mirror is a `STORAGE_WORD_PREFIX(...)`
+/// render with a trailing `)`, so when those pairs are the render's only
+/// change the result is byte-identical to a full re-render (GNU array.c:516
+/// `array_insert` appends to the ARRAY object and never re-serialises it;
+/// `array_max_index` + 1 is the append slot, arrayfunc.c:743). Returns `false`
+/// without touching the value when that precondition fails or there is
+/// nothing to append.
+pub(in crate::executor) fn append_indexed_mirror_segments<'a, I>(
+    env_vars: &mut crate::shell::var_table::VarTable,
+    name: &str,
+    segments: I,
+) -> bool
+where
+    I: IntoIterator<Item = (usize, &'a str)>,
+{
+    let mut segments = segments.into_iter();
+    let Some((first_index, first_element)) = segments.next() else {
+        return false;
+    };
+    let Some(mirror) = env_vars.get_mut(name) else {
+        return false;
+    };
+    let prefix_len = STORAGE_WORD_PREFIX_STR.len();
+    if !mirror.starts_with(STORAGE_WORD_PREFIX_STR)
+        || !mirror.ends_with(')')
+        || mirror.as_bytes().get(prefix_len) != Some(&b'(')
+    {
+        return false;
+    }
+    // Body emptiness must be judged by length, not by the last body byte: a
+    // value may itself end in `(` (e.g. `a[0]='a('`), so `ends_with('(')`
+    // would wrongly drop the separator.
+    let need_separator = mirror.len() != prefix_len + 2;
+    mirror.truncate(mirror.len() - 1);
+    if need_separator {
+        mirror.push(' ');
+    }
+    push_indexed_segment(mirror, first_index, first_element);
+    for (index, element) in segments {
+        mirror.push(' ');
+        push_indexed_segment(mirror, index, element);
+    }
+    mirror.push(')');
+    true
+}
+
+/// Append the decimal spelling of `value` to `out` without allocating (the
+/// element-fill hot path appends one segment per write, so the index digits
+/// must not cost a `to_string`).
+fn push_decimal(out: &mut String, mut value: usize) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    // Every byte is an ASCII digit, so the slice is valid UTF-8.
+    out.push_str(std::str::from_utf8(&digits[start..]).unwrap_or("0"));
+}
+
+/// Append one `[index]=<quoted>` render segment to `mirror`, byte-identical
+/// to `format!("[{index}]={}", quote_array_value(value))` but without the
+/// two intermediate `String` allocations for the plain (double-quotable)
+/// value form — the shape every numeric fill element takes. Non-plain
+/// values still ride the full quoter.
+fn push_indexed_segment(mirror: &mut String, index: usize, value: &str) {
+    mirror.push('[');
+    push_decimal(mirror, index);
+    mirror.push_str("]=");
+    if quote_array_value_is_plain(value) {
+        mirror.push('"');
+        mirror.push_str(value);
+        mirror.push('"');
+    } else {
+        mirror.push_str(&quote_array_value(value));
+    }
+}
+
+/// Sync (or invalidate) the structured cell from a rendered mirror value.
+/// Only the indexed storage render (`STORAGE_WORD_PREFIX`) syncs; any other
+/// shape (plain scalar text, assoc `([k]=v)`) drops an indexed cell so the
+/// mirror stays authoritative for it. Assoc cells are left exactly as they
+/// were — associative arrays are out of Phase 1a scope.
+pub(crate) fn sync_typed_indexed_storage(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    storage: &str,
+) {
+    if storage.starts_with(STORAGE_WORD_PREFIX) {
+        // Reuse the memoised parse directly. `indexed_array_entries` would
+        // deep-copy the whole map into a local and `sync_typed_indexed_array`
+        // would copy it again; taking the `Arc` means one copy total. The
+        // renderer that produced `storage` always feeds the memo first
+        // (`format_indexed_array_storage` / `format_indexed_array_values`),
+        // so this is a hit in the compound-write path (rubash#616 1a).
+        let parsed = indexed_array_entries_cached(storage);
+        // Append-shaped writes (compound `a+=(...)` in a loop) get the tail
+        // only; the retained prefix is verified, so this is still exactly
+        // `parsed`. Everything else rebuilds.
+        if store.extend_indexed_array_from_parsed(name, &parsed) {
+            return;
+        }
+        let mapped = parsed
+            .iter()
+            .map(|(index, value)| (i64::try_from(*index).unwrap_or(i64::MAX), value.clone()));
+        if store.replace_indexed_array_entries(name, mapped).is_err() {
+            drop_typed_indexed_array(store, name);
+        }
+    } else {
+        drop_typed_indexed_array(store, name);
+    }
+}
+
+/// Remove only an indexed structured cell (assoc/scalar cells keep their
+/// pre-1a behavior untouched). Used whenever a mirror write bypasses the
+/// indexed sync paths.
+pub(crate) fn drop_typed_indexed_array(store: &mut crate::shell::VariableStore, name: &str) {
+    if matches!(
+        store.get(name).map(|variable| &variable.value),
+        Some(crate::shell::ShellValue::IndexedArray(_))
+    ) {
+        store.remove(name);
+    }
+}
+
+/// Assoc analogue of `sync_typed_indexed_array`: structured-cell
+/// synchronization for associative arrays. `shell_state.variables`
+/// (`ShellValue::AssociativeArray`) is the O(1) `${A[k]}` truth — GNU reads
+/// it with `assoc_reference` (assoc.c:120, a single `hash_search`, never a
+/// table walk) — while the rendered `env_vars` string stays the projection
+/// every storage reader sees. `entries` always comes from the same parse the
+/// mirror render folds (`dedupe_assoc_entries`), so the structured key set
+/// equals the mirror-derived key set by construction. A readonly refusal
+/// would leave the structured cell older than the mirror — drop it so reads
+/// fall back to the mirror projection.
+pub(crate) fn sync_typed_assoc_array(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    entries: &[(String, String)],
+) {
+    if store
+        .replace_associative_array(
+            name,
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        )
+        .is_err()
+    {
+        drop_typed_assoc_array(store, name);
+    }
+}
+
+/// Outcome of a fast-append typed-cell upsert: the caller uses it to schedule
+/// the next canonical render without over-compacting a growing fill.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AssocElementUpsert {
+    /// The key was absent: the mirror gained a NEW canonical segment, so the
+    /// append produced no duplicate and the mirror is still compact.
+    NewKey,
+    /// The key already existed: the mirror now carries a duplicate segment
+    /// that a canonical render must eventually fold.
+    Overwrote,
+    /// No synced assoc cell to update (absent, wrong shape, or readonly): the
+    /// mirror grew but the cell did not, so the caller must force a canonical
+    /// re-sync.
+    NoCell,
+}
+
+/// Fast-append assoc write path (the rubash#618 budget scheme): the mirror
+/// grows by one `[k]=v` segment without a re-parse, so there is no canonical
+/// entry list to sync from. Upsert in place when the cell is already an assoc
+/// cell (the same O(1) `assoc_insert` shape GNU uses); report a missing or
+/// wrong-shape cell to the caller — the next canonical write re-syncs it. A
+/// readonly cell would go stale behind the mirror write, so drop it instead.
+pub(crate) fn upsert_typed_assoc_element(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    key: &str,
+    value: &str,
+) -> AssocElementUpsert {
+    let Some(variable) = store.get_mut(name) else {
+        return AssocElementUpsert::NoCell;
+    };
+    if variable.readonly {
+        drop_typed_assoc_array(store, name);
+        return AssocElementUpsert::NoCell;
+    }
+    if let crate::shell::ShellValue::AssociativeArray(entries) = &mut variable.value {
+        // GNU assoc.c assoc_insert: overwrite an existing binding in place.
+        // Reusing the stored key's allocation on the overwrite arm keeps a
+        // same-key burst (the common `m[k]=v` hot shape) from allocating a
+        // fresh key String per write.
+        match entries.get_mut(key) {
+            Some(slot) => {
+                *slot = value.to_string();
+                AssocElementUpsert::Overwrote
+            }
+            None => {
+                entries.insert(key.to_string(), value.to_string());
+                AssocElementUpsert::NewKey
+            }
+        }
+    } else {
+        AssocElementUpsert::NoCell
+    }
+}
+
+/// Remove only an assoc structured cell (indexed/scalar cells keep their
+/// behavior untouched). Used whenever a mirror write bypasses the assoc
+/// sync paths; reads then fall back to the mirror projection.
+pub(crate) fn drop_typed_assoc_array(store: &mut crate::shell::VariableStore, name: &str) {
+    if matches!(
+        store.get(name).map(|variable| &variable.value),
+        Some(crate::shell::ShellValue::AssociativeArray(_))
+    ) {
+        store.remove(name);
+    }
+}
+
+/// Assoc analogue of `sync_typed_indexed_storage`: sync (or invalidate) the
+/// structured assoc cell from a rendered mirror value. The caller gates on
+/// the ASSOC mark; any shape that is not an assoc render drops the cell so
+/// the mirror stays authoritative. Reuses the memoised assoc parse, so the
+/// compound-write path hits the previous write's render instead of
+/// re-scanning it.
+pub(crate) fn sync_typed_assoc_storage(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    storage: &str,
+) {
+    if storage.starts_with(STORAGE_WORD_PREFIX) {
+        // Indexed render — not an assoc cell's shape; drop so the mirror
+        // stays authoritative.
+        drop_typed_assoc_array(store, name);
+        return;
+    }
+    if storage.starts_with('(') && storage.ends_with(')') {
+        let parsed = crate::executor::assignment_helpers::assoc_entries(storage);
+        sync_typed_assoc_array(store, name, &parsed);
+    } else {
+        drop_typed_assoc_array(store, name);
+    }
+}
+
+/// rubash#616 (1a): dense typed replace for writers that render their own
+/// values (read -a, declare sync). A refused write — a readonly typed cell
+/// while the mirror write still lands (read -a on a readonly array) — must
+/// not leave the structured cell shadowing the mirror, so drop it and let
+/// reads fall back to the mirror projection.
+pub(crate) fn replace_typed_indexed_array<I, V>(
+    store: &mut crate::shell::VariableStore,
+    name: &str,
+    values: I,
+) where
+    I: IntoIterator<Item = V>,
+    V: Into<String>,
+{
+    if store.replace_indexed_array(name, values).is_err() {
+        drop_typed_indexed_array(store, name);
+    }
+}
+
+/// rubash#616 (Q4 escape hatch): `RUBASH_ARRAY_STORE=0` bypasses structured
+/// length reads. Writes still sync, so toggling the variable is safe in
+/// both directions (no stale cell can be observed after re-enabling).
+pub(in crate::executor) fn array_store_enabled(
+    env_vars: &crate::shell::var_table::VarTable,
+) -> bool {
+    env_vars
+        .get("RUBASH_ARRAY_STORE")
+        .map_or(true, |value| value.as_str() != "0")
+}
+
+/// rubash#616 (1a): runtime array replacers (mapfile, compgen -V, the
+/// COMP_WORDS/BASH_SOURCE/BASH_LINENO stacks) refresh the structured cell
+/// alongside the mirror so `${#name[@]}` reads the fresh count.
+/// `init.rs` keeps the plain mirror form: startup BASH_* arrays never gain
+/// a typed cell there, so reads fall back to the mirror.
+pub(in crate::executor) fn store_indexed_array_state(
+    state: &mut crate::shell::ShellState,
+    name: &str,
+    values: Vec<String>,
+) {
+    let entries: BTreeMap<usize, String> = values.iter().cloned().enumerate().collect();
+    sync_typed_indexed_array(&mut state.variables, name, &entries);
+    store_indexed_array(&mut state.env_vars, name, values);
+}
+
+/// GNU subst.c:4807 dequote_string: strip every CTLESC carrier pair, keeping
+/// the protected character (CTLESC + CTLESC yields a literal CTLESC byte,
+/// matching GNU). A trailing lone CTLESC contributes nothing.
+pub(in crate::executor) fn dequote_ctlesc_pairs(value: &str) -> String {
+    if !value.contains(crate::executor::markers::CTLESC) {
+        return value.to_string();
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == crate::executor::markers::CTLESC {
+            if let Some(data) = chars.next() {
+                output.push(data);
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+pub(in crate::executor) fn quote_array_value(value: &str) -> String {
+    // perf rubash#680 (mapfile store-side): fast path for values that need
+    // no escaping. GNU array.c:948-989 array_to_assign wraps every element
+    // via ansic_quote only when ansic_shouldquote fires (strtrans.c:341)
+    // and via sh_double_quote otherwise; sh_double_quote (shquote.c:134)
+    // escapes only slashify_in_quotes (`\`$"\n`, syntax.h:26), so a
+    // printable-ASCII value outside that set renders as `"value"` verbatim.
+    // Whitelist-only (rubash#117): anything else falls through below.
+    if quote_array_value_is_plain(value) {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        out.push_str(value);
+        out.push('"');
+        return out;
+    }
+    // The element value reaching storage may still carry the lexer's
+    // data-quote markers for $'...'-decoded quotes (U+E010/U+E011, the
+    // CTLESC analog for the protection GNU gives decoded bytes via
+    // sh_single_quote at parse.y:5566-5575). The markers exist so
+    // intermediate quote removal can tell data quotes from syntax quotes;
+    // the array cell holds the real character, exactly like GNU's
+    // assign_compound_array_list stores the dequoted word bytes
+    // (arrayfunc.c:700+). Restoring here — at the storage serialization
+    // boundary — keeps the rendered \x1d(...) form printable verbatim by
+    // declare -p (a bare marker inside "..." printed raw) while
+    // decode_rendered_array_value still hands readers the real quote
+    // (issue #109: `x=($'a"b')` then `declare -p x` printed the E011
+    // carrier bytes instead of "a\"b").
+    // E400-aware (rubash#840): a typed `$'\uE010'`/`$'\uE011'` arrives
+    // as the escaped member of an E400 pair and is user data — only BARE
+    // carriers restore; the pair stays transport for the read-back
+    // boundary (cell/mirror parity).
+    let value = crate::executor::markers::restore_bare_sentinels(
+        value,
+        &[
+            (crate::executor::markers::ANSI_C_QUOTE_MARKER, "'"),
+            (crate::executor::markers::ANSI_C_DQUOTE_MARKER, "\""),
+        ],
+    );
+    // GNU expand_string_assignment (subst.c:4345-4353) ends every expanded
+    // assignment RHS word with dequote_list -> dequote_string
+    // (subst.c:4807), stripping the CTLESC carrier pairs that the walker
+    // left on quoted glob characters before the value is bound. Testing
+    // ansic_shouldquote on the transport text instead octal-escaped the
+    // carriers themselves, so `local o=(-f -X "$x")` with x='!*.*' stored
+    // $'\021!\021*...' and the carrier bytes resurfaced as data at every
+    // later display of the element (rubash#145 `_filedir md` panic).
+    // Strip the pairs at this same boundary. Genuine control-byte data
+    // travels as U+E000 raw-byte marker pairs, never as a bare \x11, so
+    // this pass cannot touch it.
+    let value = dequote_ctlesc_pairs(&value);
+    let value = value.as_str();
+    // GNU array.c array_to_assign (947-989) / array_to_kvpair (895-945):
+    // every element value goes through ansic_quote when it holds a
+    // non-printing character (strtrans.c ansic_shouldquote, 341-361) and
+    // through sh_double_quote otherwise. Printable non-ASCII stays in the
+    // double-quoted form (ansic_wshouldquote passes it).
+    if ansic_shouldquote(value) {
+        return ansic_quote(value);
+    }
+
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+            .replace('\u{60}', "\\`")
+    )
+}
+
+/// shquote.c sh_contains_shell_metas (376-407): returns 1 if the string
+/// contains shell metacharacters that force quoting of a bare word.
+/// Whitelist for the `quote_array_value` fast path: non-empty ASCII that is
+/// printable (so strtrans.c:341 `ansic_shouldquote` stays false) and holds
+/// none of the sh_double_quote escapes (shquote.c:134 over
+/// slashify_in_quotes, syntax.h:26). Markers/CTLESC/non-ASCII fail the byte
+/// test and fall through to the full path.
+fn quote_array_value_is_plain(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|b| {
+            matches!(
+                b,
+                b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b' '
+                    | b'_' | b'-' | b'+' | b'.' | b'/' | b',' | b':' | b'='
+            )
+        })
+}
+
+pub(in crate::executor) fn sh_contains_shell_metas(value: &str) -> bool {
+    let chars: Vec<char> = value.chars().collect();
+    for (index, ch) in chars.iter().enumerate() {
+        match ch {
+            ' ' | '\t' | '\n' | '\'' | '"' | '\\' | '|' | '&' | ';' | '(' | ')' | '<' | '>'
+            | '!' | '{' | '}' | '*' | '[' | '?' | ']' | '^' | '$' | '`' => return true,
+            '~' => {
+                if index == 0 || chars[index - 1] == '=' || chars[index - 1] == ':' {
+                    return true;
+                }
+            }
+            '#' => {
+                if index == 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// assoc.c assoc_to_assign key rule (429-437): `$'...'` for keys holding
+/// non-printing characters (ansic_shouldquote), `sh_double_quote` for keys
+/// with shell metas, `sh_double_quote` for a bare `*` or `@` key
+/// (ALL_ELEMENT_SUB), otherwise the bare key.
+pub(in crate::executor) fn quote_assoc_display_key(key: &str) -> String {
+    if ansic_shouldquote(key) {
+        return ansic_quote(key);
+    }
+    if sh_contains_shell_metas(key) {
+        return format!(
+            "\"{}\"",
+            key.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('$', "\\$")
+                .replace('\u{60}', "\\`")
+        );
+    }
+    if key.len() == 1 && matches!(key, "*" | "@") {
+        return format!("\"{key}\"");
+    }
+    key.to_string()
+}
+
+/// strtrans.c ansic_shouldquote (341-361): dollar-single-quote quoting is
+/// value holds a non-printing byte. High-bit bytes follow the UTF-8-locale
+/// multibyte path (351-354): a printable decoded character is fine, an
+/// undecodable or non-printing one forces quoting.
+pub(crate) fn ansic_shouldquote(value: &str) -> bool {
+    // strtrans.c ansic_shouldquote (341-361) tests the raw byte stream;
+    // raw-byte markers (U+E000 series) must decode first or a stored
+    // non-printing byte reads as a printable PUA wide char.
+    let bytes = crate::executor::substitution_metadata::shell_text_to_raw_bytes(value);
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte < 0x80 {
+            if !is_print_byte(byte) {
+                return true;
+            }
+            index += 1;
+            continue;
+        }
+        match decode_utf8_char(&bytes[index..]) {
+            Some(ch) if is_printable_wide(ch) => index += ch.len_utf8(),
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// strtrans.c ansic_quote (230-308): the $'...' form with the named C
+/// escapes, backslash and single-quote escaped, printable bytes (and whole
+/// printable UTF-8 characters under a UTF-8 locale, 266-282) literal, and
+/// every other byte as a three-digit octal escape (291-294).
+pub(crate) fn ansic_quote(value: &str) -> String {
+    // strtrans.c ansic_quote (230-308) walks the raw byte stream; decode
+    // raw-byte markers first (same boundary as ansic_quote_with_markers in
+    // execution_misc.rs) so stored non-printing bytes render as octal.
+    let bytes = crate::executor::substitution_metadata::shell_text_to_raw_bytes(value);
+    let mut out = String::with_capacity(4 * bytes.len() + 4);
+    out.push_str("$'");
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match byte {
+            0x1b => {
+                out.push_str("\\E");
+                index += 1;
+            }
+            0x07 => {
+                out.push_str("\\a");
+                index += 1;
+            }
+            0x08 => {
+                out.push_str("\\b");
+                index += 1;
+            }
+            0x09 => {
+                out.push_str("\\t");
+                index += 1;
+            }
+            0x0a => {
+                out.push_str("\\n");
+                index += 1;
+            }
+            0x0b => {
+                out.push_str("\\v");
+                index += 1;
+            }
+            0x0c => {
+                out.push_str("\\f");
+                index += 1;
+            }
+            0x0d => {
+                out.push_str("\\r");
+                index += 1;
+            }
+            b'\\' => {
+                out.push_str("\\\\");
+                index += 1;
+            }
+            b'\'' => {
+                out.push_str("\\'");
+                index += 1;
+            }
+            0x20..=0x7e => {
+                out.push(byte as char);
+                index += 1;
+            }
+            _ if byte >= 0x80 => match decode_utf8_char(&bytes[index..]) {
+                Some(ch) if is_printable_wide(ch) => {
+                    out.push(ch);
+                    index += ch.len_utf8();
+                }
+                _ => {
+                    push_octal_escape(&mut out, byte);
+                    index += 1;
+                }
+            },
+            _ => {
+                push_octal_escape(&mut out, byte);
+                index += 1;
+            }
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn push_octal_escape(out: &mut String, byte: u8) {
+    out.push('\\');
+    out.push((b'0' + ((byte >> 6) & 0o7)) as char);
+    out.push((b'0' + ((byte >> 3) & 0o7)) as char);
+    out.push((b'0' + (byte & 0o7)) as char);
+}
+
+/// strtrans.c ISPRINT for single-byte characters.
+fn is_print_byte(byte: u8) -> bool {
+    (0x20..=0x7e).contains(&byte)
+}
+
+/// strtrans.c iswprint under a UTF-8 locale: Unicode control characters
+/// (C0, DEL, the C1 range) are non-printing, everything else prints.
+fn is_printable_wide(ch: char) -> bool {
+    !ch.is_control()
+}
+
+/// Decode one UTF-8 character at the slice start; None for an invalid or
+/// truncated sequence (the mbrtowc MB_INVALIDCH/MB_NULLWCH cases).
+fn decode_utf8_char(bytes: &[u8]) -> Option<char> {
+    let len = match bytes.first()? {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return None,
+    };
+    if bytes.len() < len {
+        return None;
+    }
+    std::str::from_utf8(&bytes[..len])
+        .ok()
+        .and_then(|s| s.chars().next())
+}
+
+pub(in crate::executor) fn is_array_storage(value: &str) -> bool {
+    value.starts_with('(') && value.ends_with(')') || value.starts_with(STORAGE_WORD_PREFIX)
+}
+
+pub(in crate::executor) fn is_marked_array_var(
+    env_vars: &crate::shell::var_table::VarTable,
+    name: &str,
+) -> bool {
+    // Structured flags, not the serialized string: writers stopped
+    // maintaining the string per mark (#916 follow-up). ASSOC counts as
+    // array-like here (same contract as before).
+    use crate::executor::types::{ARRAY_VARS, ASSOC_VARS};
+    env_vars.is_marked(ARRAY_VARS, name) || env_vars.is_marked(ASSOC_VARS, name)
+}
+
+fn rendered_array_values(value: &str) -> Vec<String> {
+    rendered_array_entries(value).into_values().collect()
+}
+
+fn rendered_array_entries(value: &str) -> BTreeMap<usize, String> {
+    let Some(inner) = value
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return BTreeMap::new();
+    };
+
+    rendered_array_parts(inner)
+        .into_iter()
+        .filter_map(|part| {
+            let (key, value) = part.as_str().split_once('=')?;
+            let index = key
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<usize>()
+                .ok()?;
+            Some((index, decode_rendered_array_value(value)))
+        })
+        .collect()
+}
+
+fn rendered_array_parts(inner: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut chars = inner.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(quote_ch) => {
+                current.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                } else if ch == quote_ch {
+                    quote = None;
+                }
+            }
+            None if ch == '"' || ch == '\'' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    parts
+}
+
+/// Decode the value side of a rendered storage entry. $'...' entries carry
+/// the full strtrans.c escape set ansic_quote emits (named C escapes,
+/// escaped backslash/quote and three-digit octal); the roundtrip must
+/// restore the original bytes (array29 control-character renders).
+/// Decode the value side of a rendered storage entry. $'...' entries carry
+/// the full strtrans.c escape set ansic_quote emits (named C escapes,
+/// escaped backslash/quote and three-digit octal); the roundtrip must
+/// restore the original bytes (array29 control-character renders).
+/// Decode the value side of a rendered storage entry. $'...' entries carry
+/// the full strtrans.c escape set ansic_quote emits (named C escapes,
+/// escaped backslash/quote and three-digit octal); the roundtrip must
+/// restore the original bytes (array29 control-character renders).
+/// Decode the value side of a rendered storage entry. $'...' entries carry
+/// the full strtrans.c escape set ansic_quote emits (named C escapes,
+/// escaped backslash/quote and three-digit octal); the roundtrip must
+/// restore the original bytes (array29 control-character renders).
+fn decode_rendered_array_value(value: &str) -> String {
+    if let Some(inner) = value
+        .strip_prefix("$'")
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        return decode_ansic_escapes(inner);
+    }
+
+    unquote_storage_value(value)
+}
+
+fn decode_ansic_escapes(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 1 < bytes.len() {
+            let escape = bytes[index + 1];
+            index += 2;
+            match escape {
+                b'E' => out.push(0x1b),
+                b'a' => out.push(0x07),
+                b'b' => out.push(0x08),
+                b't' => out.push(0x09),
+                b'n' => out.push(0x0a),
+                b'v' => out.push(0x0b),
+                b'f' => out.push(0x0c),
+                b'r' => out.push(0x0d),
+                b'\\' => out.push(b'\\'),
+                b'\'' => out.push(b'\''),
+                b'0'..=b'7' => {
+                    let mut decoded = (escape - b'0') as u32;
+                    let mut digits = 1;
+                    while digits < 3 && index < bytes.len() && matches!(bytes[index], b'0'..=b'7') {
+                        decoded = decoded * 8 + (bytes[index] - b'0') as u32;
+                        digits += 1;
+                        index += 1;
+                    }
+                    out.push(decoded as u8);
+                }
+                other => {
+                    out.push(b'\\');
+                    out.push(other);
+                }
+            }
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    // The decoded byte stream may not be UTF-8 (`$'\200'`): non-UTF-8 bytes
+    // re-encode as raw-byte markers so they round-trip verbatim instead of
+    // degrading to U+FFFD (array9.sub `a[2]=$'\x80'`). Carrier-range bytes
+    // (0x14..=0x1f: DATA_DQUOTE/QUOTED_WORD_PREFIX/IFS_GLUE/...) must enter
+    // pair-encoded exactly like scalar assignment storage
+    // (bytes_to_assignment_shell_text), otherwise `[ "${a[i]}" = "$x" ]`
+    // compares a raw carrier byte against the pair-encoded form (intl.tests
+    // unicode1.sub U+0018/U+001B/U+001C/U+001D).
+    crate::executor::substitution_metadata::bytes_to_assignment_shell_text(&out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell::{ShellValue, VariableStore};
+    use std::collections::BTreeMap;
+
+    fn readonly_indexed_store(name: &str, values: &[&str]) -> VariableStore {
+        let mut store = VariableStore::default();
+        store.set_scalar(name, "").unwrap();
+        let entries: BTreeMap<i64, String> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index as i64, value.to_string()))
+            .collect();
+        let variable = store.get_mut(name).unwrap();
+        variable.value = ShellValue::IndexedArray(entries);
+        variable.readonly = true;
+        store
+    }
+
+    fn usize_entries(values: &[&str]) -> BTreeMap<usize, String> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index, value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn readonly_refusal_drops_typed_cell_reads_fall_back_to_mirror() {
+        // storage.rs:432-436: a refused write (readonly typed cell while the
+        // mirror write still lands, e.g. `read -a` on a readonly array) must
+        // not leave the structured cell shadowing the mirror — drop it so
+        // reads fall back to the mirror projection.
+        let mut store = readonly_indexed_store("RUBASH_DIRTY_RO", &["old0", "old1"]);
+        let fresh = usize_entries(&["new0", "new1"]);
+        sync_typed_indexed_array(&mut store, "RUBASH_DIRTY_RO", &fresh);
+        assert!(
+            store.get("RUBASH_DIRTY_RO").is_none(),
+            "refused sync must drop the stale typed cell"
+        );
+        // The landed mirror still serves the fresh values.
+        let mirror = format_indexed_array_storage(fresh);
+        assert_eq!(array_value_at(&mirror, 0).as_deref(), Some("new0"));
+        assert_eq!(array_value_at(&mirror, 1).as_deref(), Some("new1"));
+    }
+
+    #[test]
+    fn readonly_refusal_drops_typed_cell_on_dense_replace() {
+        // Same contract through the dense replacer used by `read -a` /
+        // declare sync writers: refusal drops the cell, the mirror stays
+        // authoritative.
+        let mut store = readonly_indexed_store("RUBASH_DIRTY_RO2", &["old0"]);
+        replace_typed_indexed_array(&mut store, "RUBASH_DIRTY_RO2", ["new0"]);
+        assert!(
+            store.get("RUBASH_DIRTY_RO2").is_none(),
+            "refused replace must drop the stale typed cell"
+        );
+        let mirror = format_indexed_array_values(vec!["new0".to_string()]);
+        assert_eq!(array_value_at(&mirror, 0).as_deref(), Some("new0"));
+    }
+
+    #[test]
+    fn clean_negative_literal_admits_only_dash_nonzero_digits() {
+        // The negative-subscript fast lane (executor.rs) must admit exactly
+        // the spellings whose shell-arithmetic value equals the literal:
+        // `-[1-9][0-9]*`. A leading zero is octal (`-08` is an evalexp
+        // error, `-0` is element 0), and whitespace/quotes/signs/expansions
+        // keep the full expand+evalexp pipeline with its diagnostics.
+        assert_eq!(clean_negative_literal_subscript("-1"), Some(-1));
+        assert_eq!(clean_negative_literal_subscript("-10"), Some(-10));
+        assert_eq!(clean_negative_literal_subscript("-0"), None);
+        assert_eq!(clean_negative_literal_subscript("-08"), None);
+        assert_eq!(clean_negative_literal_subscript("-01"), None);
+        assert_eq!(clean_negative_literal_subscript("1"), None);
+        assert_eq!(clean_negative_literal_subscript("-"), None);
+        assert_eq!(clean_negative_literal_subscript("--1"), None);
+        assert_eq!(clean_negative_literal_subscript("- 1"), None);
+        assert_eq!(clean_negative_literal_subscript("-1 "), None);
+        assert_eq!(clean_negative_literal_subscript(" -1"), None);
+        assert_eq!(clean_negative_literal_subscript("'-1'"), None);
+        assert_eq!(clean_negative_literal_subscript("-$i"), None);
+        assert_eq!(clean_negative_literal_subscript(""), None);
+        // i64 overflow rides the slow path (whose i128 evalexp owns the
+        // diagnostic), exactly like any other rejected spelling.
+        assert_eq!(
+            clean_negative_literal_subscript("-99999999999999999999"),
+            None
+        );
+    }
+
+    #[test]
+    fn indexed_mirror_segment_append_matches_full_render() {
+        // The write-path in-place append must stay byte-identical to the
+        // canonical renderer for every value shape: plain double-quotable
+        // values (the numeric fill-loop case) go through the direct push,
+        // and anything the quoter special-cases still rides
+        // `quote_array_value`. This is the `declare -p` correctness bar for
+        // `append_indexed_mirror_segments`.
+        let values = [
+            "0",
+            "7999",
+            "plain value",
+            "",
+            "a\"b",
+            "a$b",
+            "a`b",
+            "a\\b",
+            "a(b",
+            "$'x'",
+            "a b c",
+        ];
+        let mut entries: BTreeMap<usize, String> = BTreeMap::new();
+        let mut table = crate::shell::var_table::VarTable::default();
+        table.insert("m".to_string(), format!("{STORAGE_WORD_PREFIX_STR}()"));
+        for (index, value) in values.iter().enumerate() {
+            entries.insert(index, (*value).to_string());
+            assert!(append_indexed_mirror_segments(
+                &mut table,
+                "m",
+                std::iter::once((index, *value)),
+            ));
+        }
+        let rendered = format_indexed_array_storage(entries);
+        assert_eq!(table.get("m").map(String::as_str), Some(rendered.as_str()));
+    }
+
+    #[test]
+    fn assoc_upsert_reports_new_overwrite_and_missing_cell() {
+        // The fast-append budget spends only on an OVERWRITE (a new key adds no
+        // duplicate segment, so a fill stays compact), so the upsert outcome
+        // must distinguish the two. A cell the append cannot sync reports
+        // NoCell so the caller forces a canonical re-sync.
+        let mut store = VariableStore::default();
+        assert_eq!(
+            upsert_typed_assoc_element(&mut store, "A", "k", "v"),
+            AssocElementUpsert::NoCell,
+            "no cell yet"
+        );
+        store.set_scalar("A", "").unwrap();
+        store.get_mut("A").unwrap().value =
+            ShellValue::AssociativeArray(std::collections::HashMap::new());
+        assert_eq!(
+            upsert_typed_assoc_element(&mut store, "A", "k", "v"),
+            AssocElementUpsert::NewKey
+        );
+        assert_eq!(
+            upsert_typed_assoc_element(&mut store, "A", "k", "v2"),
+            AssocElementUpsert::Overwrote
+        );
+        assert_eq!(store.associative_element("A", "k"), Some("v2"));
+        // A readonly cell is dropped behind the mirror write and reports
+        // NoCell so reads fall back and the next canonical write re-syncs.
+        store.get_mut("A").unwrap().readonly = true;
+        assert_eq!(
+            upsert_typed_assoc_element(&mut store, "A", "k", "v3"),
+            AssocElementUpsert::NoCell
+        );
+        assert!(store.get("A").is_none(), "readonly cell dropped");
+    }
+}

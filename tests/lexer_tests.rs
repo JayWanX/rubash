@@ -1,0 +1,313 @@
+//! Lexer Tests - TDD for Bash Tokenizer
+//!
+//! Run with: cargo test --test lexer_tests
+
+use rubash::lexer::{tokenize, TokenKind};
+
+#[path = "lexer_comment_tests.rs"]
+mod comments;
+#[path = "lexer_operator_tests.rs"]
+mod operators;
+#[path = "lexer_quote_tests.rs"]
+mod quotes;
+
+// ============================================================================
+// Test Module: Basic Tokens
+// ============================================================================
+
+mod basic_tokens {
+    use super::*;
+
+    #[test]
+    fn test_empty_input() {
+        let input = "";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 0);
+    }
+
+    #[test]
+    fn test_whitespace_only() {
+        let input = "   \t\n  ";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 0);
+    }
+
+    #[test]
+    fn test_simple_command() {
+        let input = "ls";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Word);
+        assert_eq!(tokens[0].value, "ls");
+    }
+
+    #[test]
+    fn test_command_with_args() {
+        let input = "ls -la /home";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0].kind, TokenKind::Word);
+        assert_eq!(tokens[0].value, "ls");
+        assert_eq!(tokens[1].kind, TokenKind::Word);
+        assert_eq!(tokens[1].value, "-la");
+        assert_eq!(tokens[2].kind, TokenKind::Word);
+        assert_eq!(tokens[2].value, "/home");
+    }
+}
+
+// ============================================================================
+// Test Module: Control Structures
+// ============================================================================
+
+mod control_structures {
+    use super::*;
+
+    #[test]
+    fn test_if_keyword() {
+        let input = "if true; then echo yes; fi";
+        let tokens = tokenize(input);
+        // if, true, ;, then, echo, yes, ;, fi = 8 tokens
+        // Keywords: if, then, fi = 3
+        let keywords: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.kind == TokenKind::Keyword)
+            .collect();
+        assert_eq!(
+            keywords.len(),
+            3,
+            "Expected 3 keywords, got {}",
+            keywords.len()
+        );
+        assert_eq!(tokens[0].kind, TokenKind::Keyword);
+        assert_eq!(tokens[0].value, "if");
+    }
+
+    #[test]
+    fn test_while_keyword() {
+        let input = "while true; do echo loop; done";
+        let tokens = tokenize(input);
+        // while, true, ;, do, echo, loop, ;, done = 8 tokens
+        // Keywords: while, do, done = 3
+        let keywords: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.kind == TokenKind::Keyword)
+            .collect();
+        assert_eq!(
+            keywords.len(),
+            3,
+            "Expected 3 keywords, got {}",
+            keywords.len()
+        );
+    }
+
+    #[test]
+    fn test_for_keyword() {
+        let input = "for i in 1 2 3; do echo $i; done";
+        let tokens = tokenize(input);
+        // for, i, in, 1, 2, 3, ;, do, echo, $i, ;, done = 12 tokens
+        let keywords: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.kind == TokenKind::Keyword)
+            .collect();
+        assert!(
+            keywords.len() >= 4,
+            "Expected at least 4 keywords, got {}",
+            keywords.len()
+        );
+    }
+}
+
+// ============================================================================
+// Test Module: Assignments
+// ============================================================================
+
+mod assignments {
+    use super::*;
+
+    #[test]
+    fn test_simple_assignment() {
+        let input = "VAR=value";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Assignment);
+        assert_eq!(tokens[0].value, "VAR=value");
+    }
+
+    #[test]
+    fn test_assignment_with_path() {
+        let input = "PATH=/usr/bin:$PATH";
+        let tokens = tokenize(input);
+        // PATH=/usr/bin: and $PATH are separate tokens because $ starts a new word
+        assert!(
+            tokens.len() >= 1,
+            "Expected at least 1 token, got {}",
+            tokens.len()
+        );
+        assert_eq!(tokens[0].kind, TokenKind::Assignment);
+    }
+
+    #[test]
+    fn test_command_after_assignment() {
+        let input = "X=5 echo $X";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0].kind, TokenKind::Assignment);
+        assert_eq!(tokens[1].kind, TokenKind::Word);
+        assert_eq!(tokens[2].kind, TokenKind::Variable);
+    }
+}
+
+// ============================================================================
+// Test Module: Command Substitution
+// ============================================================================
+
+mod command_substitution {
+    use super::*;
+
+    #[test]
+    fn test_backtick_substitution() {
+        let input = "`echo hello`";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::CommandSubst);
+    }
+
+    #[test]
+    fn test_backtick_substitution_with_literal_suffix_stays_one_word() {
+        let input = "`echo left`:`echo right`";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Word);
+        assert_eq!(tokens[0].value, "`echo left`:`echo right`");
+    }
+
+    #[test]
+    fn test_dollar_paren_substitution() {
+        let input = "$(echo hello)";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::CommandSubst);
+    }
+
+    #[test]
+    fn test_dollar_paren_substitution_with_literal_suffix_stays_one_word() {
+        let input = "$(echo left):$(echo right)";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Word);
+        assert_eq!(tokens[0].value, "$(echo left):$(echo right)");
+    }
+
+    #[test]
+    fn test_adjacent_pipe_braced_command_substitutions_stay_in_one_word() {
+        let input = "${| REPLY=left; }-${| REPLY=right; }-$REPLY";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Word);
+        assert_eq!(
+            tokens[0].value,
+            "${| REPLY=left; }-${| REPLY=right; }-$REPLY"
+        );
+    }
+}
+
+// ============================================================================
+// Test Module: Variables
+// ============================================================================
+
+mod variables {
+    use super::*;
+
+    #[test]
+    fn test_simple_variable() {
+        let input = "$HOME";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Variable);
+        // Variable token includes the $ prefix
+        assert_eq!(tokens[0].value, "$HOME");
+    }
+
+    #[test]
+    fn test_braced_variable_with_literal_suffix_stays_one_word() {
+        let input = "${left}:${right}";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Word);
+        assert_eq!(tokens[0].value, "${left}:${right}");
+    }
+
+    #[test]
+    fn test_positional_parameter() {
+        let input = "$1 $2 $3";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0].kind, TokenKind::Variable);
+        assert_eq!(tokens[0].value, "$1");
+    }
+
+    #[test]
+    fn test_special_variables() {
+        let input = "$@ $* $$ $! $? $-";
+        let tokens = tokenize(input);
+        // Each $X becomes a separate token
+        // Note: input may have trailing space in source, so accept 6-7
+        assert!(
+            tokens.len() >= 6,
+            "Expected at least 6 tokens, got {}",
+            tokens.len()
+        );
+        for token in tokens {
+            assert_eq!(token.kind, TokenKind::Variable);
+        }
+    }
+}
+
+// ============================================================================
+// Test Module: Brace Expansion
+// ============================================================================
+
+mod brace_expansion {
+    use super::*;
+
+    #[test]
+    fn test_brace_sequence() {
+        let input = "{1..5}";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::BraceExpand);
+    }
+
+    #[test]
+    fn test_brace_list() {
+        let input = "{foo,bar,baz}";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::BraceExpand);
+    }
+
+    #[test]
+    fn test_brace_list_with_literal_prefix_stays_one_word() {
+        let input = "pre{foo,bar}";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Word);
+        assert_eq!(tokens[0].value, "pre{foo,bar}");
+    }
+
+    #[test]
+    fn test_brace_list_with_literal_suffix_stays_one_word() {
+        let input = "{foo,bar}post";
+        let tokens = tokenize(input);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Word);
+        assert_eq!(tokens[0].value, "{foo,bar}post");
+    }
+}
+
+// ============================================================================
+// Test Module: Edge Cases
+// ============================================================================
+
+#[path = "lexer_tests/edge_cases.rs"]
+mod edge_cases;

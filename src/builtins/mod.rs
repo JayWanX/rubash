@@ -1,0 +1,46 @@
+//! Builtin command implementations.
+
+pub mod alias;
+pub(crate) mod arrayref;
+pub mod bind;
+pub mod caller;
+pub mod cd;
+pub mod colon;
+pub mod command;
+pub mod complete;
+pub mod declare;
+pub mod disown;
+pub mod echo;
+pub mod enable;
+pub mod eval;
+pub mod exec;
+pub mod exit;
+pub mod fc;
+pub mod fg_bg;
+pub mod hash;
+pub mod help;
+pub mod history;
+pub mod jobs;
+pub mod kill;
+pub mod logout;
+pub mod printf;
+pub mod pushd;
+pub mod pwd;
+pub mod set;
+pub mod setattr;
+pub mod shift;
+pub mod shopt;
+pub mod sleep;
+pub mod source;
+pub mod stty;
+#[cfg(windows)]
+pub mod sudo;
+pub mod suspend;
+pub mod test;
+pub mod times;
+pub mod trap;
+pub mod r#type;
+pub mod ulimit;
+pub mod umask;
+pub mod uname;
+pub mod wait;

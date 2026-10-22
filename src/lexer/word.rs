@@ -1,0 +1,887 @@
+use super::classification::{
+    assignment_rhs_is_fully_single_quoted, assignment_rhs_opens_compound,
+    assignment_value_is_quoted, is_assignment, is_keyword, mark_quoted_assignment_value,
+    protect_fully_single_quoted_assignment, quoted_literal_tilde,
+};
+use super::quotes::{
+    remove_shell_quotes_assignment, remove_shell_quotes_outside_backticks,
+    remove_shell_quotes_with_posix,
+};
+use super::scanner::Lexer;
+use super::token::{Token, TokenKind};
+use crate::executor::markers::STORAGE_WORD_PREFIX_STR;
+
+/// niubash#200: a raw ESC (U+001B) that reaches a word value as DATA — source
+/// bytes inside single/double quotes or an unquoted word, or a literal ESC
+/// character inside a `$'...'` span (only `\e`/`\c[`/`\033` get the
+/// raw-byte carrier; an already-raw byte is pushed verbatim by
+/// decode_ansi_c_quoted) — is byte-identical to QUOTED_WORD_PREFIX, the
+/// quoted-literal-tilde marker this lexer itself emits. Downstream consumers
+/// answer `strip_prefix(QUOTED_WORD_PREFIX)`, so a word-initial data ESC was
+/// silently eaten (`printf '%s' '<ESC>[31m'` lost the ESC; GNU bash keeps a
+/// raw ESC in every position of every quoting context). Tag a leading data
+/// ESC as the U+E000 raw-byte marker pair at the dequote boundary — the same
+/// carrier ANSI-C decoding already uses for 0x1B — so no marker consumer can
+/// claim it; the output boundary decodes it back to the ESC byte. A mid-word
+/// ESC is never claimed (strip_prefix only fires at position 0) and stays
+/// verbatim, matching GNU.
+fn tag_word_initial_raw_esc(mut value: String) -> String {
+    if value.starts_with(crate::executor::markers::QUOTED_WORD_PREFIX) {
+        let tagged = crate::executor::substitution_metadata::encode_raw_byte_marker(0x1b);
+        // U+001B is one byte, and starts_with above pinned the first char.
+        value.replace_range(0..1, &tagged);
+    }
+    value
+}
+
+/// The raw->value dequote dispatch of finish_word_token (GNU read_token_word
+/// quote removal, parse.y:5305+), extracted verbatim so the executor's
+/// locale re-derivation (rubash#353) can reproduce EXACTLY the value the
+/// lexer would produce for a raw word — only the ANSI-C `\u`/`\U` locale
+/// gate may answer differently, pinned via locale::with_ansi_lex_locale.
+/// Returns the value plus the token kind the lexer would assign.
+pub(crate) fn word_value_from_raw(
+    raw: &str,
+    posix: bool,
+    allow_keyword: bool,
+) -> (String, TokenKind) {
+    let value = if is_assignment(raw) && assignment_rhs_opens_compound(raw) {
+        // GNU parse.y:5652-5671 read_token_word: a compound array
+        // assignment (`name=(...)` or `name[sub]=(...)`) preserves the
+        // raw parenthesized RHS text verbatim. parse_compound_assignment
+        // (parse.y:7104) clears PST_NOEXPAND (parse.y:7127), so the normal
+        // backslash branch (parse.y:5377-5397) keeps `\` in the token and
+        // sets pass_next_character to mark the next char literal. This
+        // means `\"`, `\'`, `\`` survive as literal `\"`, `\'`, `\`` in
+        // the token so assign_compound_array_list (arrayfunc.c) can
+        // tokenize the raw text with the original quoting intact.
+        // remove_shell_quotes_outside_backticks would convert `\"` to a
+        // data marker, corrupting the element tokenization.
+        //
+        // Compound detection is positional, not textual: parse.y:5648-5657
+        // peeks the character immediately after the assignment `=` and
+        // only an unquoted `(` begins parse_compound_assignment. An `=(`
+        // inside a quoted RHS (`a4='x=(1) y'`, `d1="a=(b)"`) is data —
+        // the raw text must still go through quote removal and store the
+        // scalar with the quotes stripped. The old `raw.contains("=(")`
+        // test matched those quoted spans and leaked the outer quotes
+        // into the stored value (BASH_REMATCH probes then carried them).
+        raw.to_string()
+    } else if is_assignment(raw) && assignment_rhs_is_fully_single_quoted(raw) {
+        // GNU subst.c never scans a single-quoted span: a wholly
+        // single-quoted RHS is literal data, so `x='$(date)'` stores the
+        // text `$(date)` and `x='$(date)'` must not reach the expander's
+        // `$(`/backtick fast paths. Strip the quoting here and mark the
+        // dollars/backticks as literal (restored on the way out).
+        protect_fully_single_quoted_assignment(raw)
+    } else if is_assignment(raw) && raw.contains("$(") {
+        // GNU subst.c preserves quotes inside `$(...)` command
+        // substitutions during assignment-word quote removal.
+        // `remove_shell_quotes_assignment` copies `$(...)` bodies
+        // verbatim via `copy_dollar_paren_substitution`, so quotes
+        // inside the substitution are preserved while backslash
+        // escapes outside it are converted to internal markers, and —
+        // unlike the plain word dequote — expansion triggers inside
+        // single-quoted spans travel as data carriers
+        // (`x='a'\''`b`'$(echo z)` must keep `` `b` `` literal,
+        // rubash#144; GNU parse.y:5366-5398 + subst.c:11882-11886).
+        // Without this, `eval c=\$\'\\$(printf %o $a)\'` kept literal
+        // backslashes that the expansion walker treated as escaping
+        // the `$`, suppressing the command substitution (iquote.tests
+        // line 69).
+        remove_shell_quotes_assignment(raw, posix)
+    } else if raw.starts_with("$((") {
+        // GNU keeps the text of a `$((...))` expansion verbatim at the
+        // word level; the arithmetic stage applies its own double-quote
+        // rules there (`\"` is a literal quote, `(( "1" ))` loses the
+        // quotes in the evaluator, not by word-level quote removal).
+        raw.to_string()
+    } else if is_assignment(raw) && raw.contains('`') {
+        // TODO(parse.y/subst.c): Assignment-word quote removal must not
+        // consume quotes inside command substitutions. Preserve the
+        // backquote body for the substitution stage.
+        remove_shell_quotes_outside_backticks(raw)
+    } else {
+        remove_shell_quotes_with_posix(raw, posix)
+    };
+    let value = tag_word_initial_raw_esc(value);
+    let kind = if allow_keyword && is_keyword(raw) {
+        TokenKind::Keyword
+    // GNU parse.y calls assignment() on the raw token (general.c:480):
+    // the name part may contain only [A-Za-z0-9_], so any quote or
+    // backslash in it disqualifies the word (a''=b is the command
+    // a=b, not an assignment). Validating the de-quoted value instead
+    // wrongly accepted a''=b because the empty quotes vanish.
+    } else if is_assignment(raw) {
+        TokenKind::Assignment
+    } else {
+        TokenKind::Word
+    };
+    let value = if quoted_literal_tilde(raw, &value) {
+        // TODO(parse.y/subst.c): Preserve quote state as WORD_DESC flags.
+        // This prevents quoted literal `~` from undergoing tilde
+        // expansion before builtins like `printf %q` see it.
+        format!(
+            "{}{value}",
+            crate::executor::markers::QUOTED_WORD_PREFIX_STR
+        )
+    } else if kind == TokenKind::Assignment && assignment_value_is_quoted(raw) {
+        // TODO(parse.y/subst.c): Replace this narrow quoted-RHS marker
+        // with WORD_DESC quote flags. It lets assignment tilde expansion
+        // distinguish `a=~/x` from `a="~/x"` without leaking syntax to
+        // builtins.
+        mark_quoted_assignment_value(raw, &value)
+    } else if kind == TokenKind::Word && is_assignment(&value) && assignment_value_is_quoted(raw) {
+        // A fully quoted assignment-looking argument, such as
+        // `"SHELL=~/bash"`, remains a normal word but its RHS quote state
+        // still suppresses the assignment-word tilde pass.
+        mark_quoted_assignment_value(raw, &value)
+    } else if raw.starts_with('"')
+        && (raw.ends_with('"') || raw.ends_with('\''))
+        && raw.contains("${")
+        && !super::quotes::raw_word_has_unquoted_glob_char(raw)
+    {
+        // TODO(parse.y/subst.c): Preserve full quote state on WORD_DESC
+        // instead of a sentinel. This narrow marker lets expansion
+        // distinguish "${v:-~}" from ${v:-~} for upstream tilde2.tests.
+        // The trailing-' form covers mixed fully-quoted words such as
+        // `"${IFS+"'"x ~ x'}'x"}"x}" #'` (dq segment + sq segment):
+        // GNU treats the whole word as quoted (no field splitting,
+        // quoted alternate expansion, posixexp2 case 28).
+        // rubash#316: first/last-character checks do not make a word
+        // fully quoted — `"$DIR"/*"${empty}"` has an unquoted `*`
+        // between the quoted segments and MUST keep pathname expansion
+        // (GNU subst.c tracks per-character quote flags). Words with an
+        // unquoted glob metacharacter therefore never take the
+        // fully-quoted sentinel (raw_word_has_unquoted_glob_char).
+        format!("{STORAGE_WORD_PREFIX_STR}{value}")
+    } else {
+        value
+    };
+    (value, kind)
+}
+
+/// Whether a raw word contains a `$'...'` span with a `\u`/`\U` escape —
+/// the only lex product whose value is locale-dependent (lib/sh/strtrans.c
+/// ansicstr -> u32cconv). Words without one never need the rubash#353
+/// re-derivation. Inside a `$'...'` span every `\` starts an escape; the
+/// escaped-backslash `\\` form consumes its follower, so only a `\`
+/// directly followed by `u`/`U` counts.
+pub(crate) fn raw_has_ansi_u_escape(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut index = 0usize;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'$' && bytes[index + 1] == b'\'' {
+            // ANSI-C span: walk to the closing quote honoring `\\`.
+            let mut scan = index + 2;
+            while scan < bytes.len() {
+                match bytes[scan] {
+                    b'\\' => {
+                        if scan + 1 < bytes.len()
+                            && (bytes[scan + 1] == b'u' || bytes[scan + 1] == b'U')
+                        {
+                            return true;
+                        }
+                        scan += 2;
+                        continue;
+                    }
+                    b'\'' => break,
+                    _ => scan += 1,
+                }
+            }
+            index = scan + 1;
+            continue;
+        }
+        index += 1;
+    }
+    false
+}
+
+impl<'a> Lexer<'a> {
+    pub(super) fn finish_word_token(&mut self, start: usize, allow_keyword: bool) -> Token {
+        // rubash#131: GNU read_token_word (parse.y:5466) consumes the
+        // pattern group only under the extglob shopt (extended_glob).
+        if self.extended_glob
+            && self.word_so_far_ends_extglob_operator(start)
+            && self.peek() == Some('(')
+        {
+            self.skip_extglob_group();
+        } else if !self.extended_glob
+            && self.word_so_far_ends_extglob_operator(start)
+            && self.peek() == Some('(')
+        {
+            // The operator is this word's first character (scan_token
+            // consumed it before dispatch), so skip_word_inner below starts
+            // past it with no operator state: record the gated split here.
+            self.extglob_split_pending = true;
+        }
+        // Direct inner call: the public wrappers reset the pending flags for
+        // the raw-skip callers, but THIS caller is the flags' consumer.
+        self.skip_word_inner(start);
+        let extglob_split = std::mem::take(&mut self.extglob_split_pending);
+        let compound_unclosed = std::mem::take(&mut self.compound_unclosed_pending);
+        let raw = self.slice(start);
+        // perf21: is_assignment walks the word for `=` + name validation —
+        // compute it once for the consumers below instead of one walk each.
+        // Only real assignment words (`a=$(cmd)`) preserve quotes verbatim so
+        // the RHS quote state survives to assignment expansion. Ordinary words
+        // that merely contain `=` and `$(` (e.g. `echo "B: $(printf 'v=[%s]'
+        // "$(printf 'mid')")"`) must still go through quote removal, otherwise
+        // the trailing `"` leaks into the expanded argument.
+        let assignment = is_assignment(raw);
+        let value = if assignment && assignment_rhs_opens_compound(&raw) {
+            // GNU parse.y:5652-5671 read_token_word: a compound array
+            // assignment (`name=(...)` or `name[sub]=(...)`) preserves the
+            // raw parenthesized RHS text verbatim. parse_compound_assignment
+            // (parse.y:7104) clears PST_NOEXPAND (parse.y:7127), so the normal
+            // backslash branch (parse.y:5377-5397) keeps `\` in the token and
+            // sets pass_next_character to mark the next char literal. This
+            // means `\"`, `\'`, `\`` survive as literal `\"`, `\'`, `\`` in
+            // the token so assign_compound_array_list (arrayfunc.c) can
+            // tokenize the raw text with the original quoting intact.
+            // remove_shell_quotes_outside_backticks would convert `\"` to a
+            // data marker, corrupting the element tokenization.
+            //
+            // Compound detection is positional, not textual: parse.y:5648-5657
+            // peeks the character immediately after the assignment `=` and
+            // only an unquoted `(` begins parse_compound_assignment. An `=(`
+            // inside a quoted RHS (`a4='x=(1) y'`, `d1="a=(b)"`) is data —
+            // the raw text must still go through quote removal and store the
+            // scalar with the quotes stripped. The old `raw.contains("=(")`
+            // test matched those quoted spans and leaked the outer quotes
+            // into the stored value (BASH_REMATCH probes then carried them).
+            raw.to_string()
+        } else if assignment && assignment_rhs_is_fully_single_quoted(&raw) {
+            // GNU subst.c never scans a single-quoted span: a wholly
+            // single-quoted RHS is literal data, so `x='$(date)'` stores the
+            // text `$(date)` and `x='$(date)'` must not reach the expander's
+            // `$(`/backtick fast paths. Strip the quoting here and mark the
+            // dollars/backticks as literal (restored on the way out).
+            protect_fully_single_quoted_assignment(&raw)
+        } else if assignment && raw.contains("$(") {
+            // GNU subst.c preserves quotes inside `$(...)` command
+            // substitutions during assignment-word quote removal.
+            // `remove_shell_quotes_assignment` copies `$(...)` bodies
+            // verbatim via `copy_dollar_paren_substitution`, so quotes
+            // inside the substitution are preserved while backslash
+            // escapes outside it are converted to internal markers, and —
+            // unlike the plain word dequote — expansion triggers inside
+            // single-quoted spans travel as data carriers
+            // (`x='a'\''`b`'$(echo z)` must keep `` `b` `` literal,
+            // rubash#144; GNU parse.y:5366-5398 + subst.c:11882-11886).
+            // Without this, `eval c=\$\'\\$(printf %o $a)\'` kept literal
+            // backslashes that the expansion walker treated as escaping
+            // the `$`, suppressing the command substitution (iquote.tests
+            // line 69).
+            remove_shell_quotes_assignment(raw, self.posix)
+        } else if raw.starts_with("$((") {
+            // GNU keeps the text of a `$((...))` expansion verbatim at the
+            // word level; the arithmetic stage applies its own double-quote
+            // rules there (`\"` is a literal quote, `(( "1" ))` loses the
+            // quotes in the evaluator, not by word-level quote removal).
+            raw.to_string()
+        } else if assignment && raw.contains('`') {
+            // TODO(parse.y/subst.c): Assignment-word quote removal must not
+            // consume quotes inside command substitutions. Preserve the
+            // backquote body for the substitution stage.
+            remove_shell_quotes_outside_backticks(raw)
+        } else {
+            remove_shell_quotes_with_posix(raw, self.posix)
+        };
+        let value = tag_word_initial_raw_esc(value);
+        let kind = if allow_keyword && is_keyword(raw) {
+            TokenKind::Keyword
+        // GNU parse.y calls assignment() on the raw token (general.c:480):
+        // the name part may contain only [A-Za-z0-9_], so any quote or
+        // backslash in it disqualifies the word (a''=b is the command
+        // a=b, not an assignment). Validating the de-quoted value instead
+        // wrongly accepted a''=b because the empty quotes vanish.
+        } else if assignment {
+            TokenKind::Assignment
+        } else {
+            TokenKind::Word
+        };
+        let value = if quoted_literal_tilde(raw, &value) {
+            // TODO(parse.y/subst.c): Preserve quote state as WORD_DESC flags.
+            // This prevents quoted literal `~` from undergoing tilde
+            // expansion before builtins like `printf %q` see it.
+            format!(
+                "{}{value}",
+                crate::executor::markers::QUOTED_WORD_PREFIX_STR
+            )
+        } else if kind == TokenKind::Assignment && assignment_value_is_quoted(raw) {
+            // TODO(parse.y/subst.c): Replace this narrow quoted-RHS marker
+            // with WORD_DESC quote flags. It lets assignment tilde expansion
+            // distinguish `a=~/x` from `a="~/x"` without leaking syntax to
+            // builtins.
+            mark_quoted_assignment_value(raw, &value)
+        } else if kind == TokenKind::Word
+            && is_assignment(&value)
+            && assignment_value_is_quoted(raw)
+        {
+            // A fully quoted assignment-looking argument, such as
+            // `"SHELL=~/bash"`, remains a normal word but its RHS quote state
+            // still suppresses the assignment-word tilde pass.
+            mark_quoted_assignment_value(raw, &value)
+        } else if raw.starts_with('"')
+            && (raw.ends_with('"') || raw.ends_with('\''))
+            && raw.contains("${")
+            && !super::quotes::raw_word_has_unquoted_glob_char(raw)
+        {
+            // TODO(parse.y/subst.c): Preserve full quote state on WORD_DESC
+            // instead of a sentinel. This narrow marker lets expansion
+            // distinguish "${v:-~}" from ${v:-~} for upstream tilde2.tests.
+            // The trailing-' form covers mixed fully-quoted words such as
+            // `"${IFS+"'"x ~ x'}'x"}"x}" #'` (dq segment + sq segment):
+            // GNU treats the whole word as quoted (no field splitting,
+            // quoted alternate expansion, posixexp2 case 28).
+            // rubash#316: first/last-character checks do not make a word
+            // fully quoted — `"$DIR"/*"${empty}"` has an unquoted `*`
+            // between the quoted segments and MUST keep pathname expansion
+            // (GNU subst.c tracks per-character quote flags). Words with an
+            // unquoted glob metacharacter therefore never take the
+            // fully-quoted sentinel (raw_word_has_unquoted_glob_char).
+            format!("{STORAGE_WORD_PREFIX_STR}{value}")
+        } else {
+            value
+        };
+        // perf21: `Token::new_with_raw` copies both strings itself, so pass
+        // the borrowed slice through in the common case — the owned copy is
+        // needed only for the `=(` adjacency append.
+        let raw_glued;
+        let raw_ref: &str = if kind == TokenKind::Assignment && self.peek() == Some('(') {
+            // `name=(...)` is a compound array assignment word in Bash: the
+            // opening paren must be adjacent to the `=` with no space.
+            // Mark the raw so the parser only treats an adjacent `(` as the
+            // array-assignment form (`a= (1 2)` is a syntax error in Bash).
+            raw_glued = format!("{raw}(");
+            &raw_glued
+        } else {
+            raw
+        };
+        // quoterm22: move the owned value in (one of the three per-word
+        // String allocations was this exact copy).
+        let mut token = Token::new_with_raw_owned(kind, value, raw_ref, start);
+        token.extglob_split = extglob_split;
+        token.compound_unclosed = compound_unclosed;
+        // rubash#389/#131: stamp this pass's extglob gate so parse-side
+        // scanners answer with the state at READ time (parse.y:5466 gates
+        // on the live `extended_glob' as each word is lexed), not the
+        // post-tokenization global a later `shopt -u' may have flipped.
+        token.extglob_gate = self.extended_glob;
+        token
+    }
+
+    pub(super) fn skip_word_at(&mut self, token_start: usize) {
+        self.skip_word_inner(token_start);
+        // Only finish_word_token consumes the pending flags onto a token;
+        // the raw-skip callers (number/`!`/extglob arms in scanner.rs) build
+        // plain tokens, so the pending bit must not leak into the next word.
+        self.compound_unclosed_pending = false;
+    }
+
+    pub(super) fn skip_word(&mut self) {
+        self.skip_word_inner(self.position);
+        self.compound_unclosed_pending = false;
+    }
+
+    fn skip_word_inner(&mut self, token_start: usize) {
+        let mut extglob_operator = false;
+        let array_assignment = self.looks_like_array_element_assignment();
+        let mut array_subscript_depth = 0usize;
+        let mut array_value_paren_depth = 0usize;
+        // GNU parse.y read_token_word tracks the whole token: a `name=(...)`
+        // compound assignment is one atomic word regardless of the name's
+        // length, so compound_assignment_start must see the FULL name
+        // (`a2=(...)`), not the tail after next_token consumed the first
+        // character.
+        let word_start = token_start;
+        // GNU parse.y keeps a "name=(...)" compound assignment word atomic
+        // even when it appears as a builtin operand ("declare -ar
+        // b=([1]="" [2]="bdef")"); the word must not be split at the
+        // whitespace inside the parentheses.
+        let mut compound_paren_depth = 0usize;
+        // GNU parse.y:7104 parse_compound_assignment sets PST_COMPASSIGN and
+        // pulls every element through read_token; read_token_word's subscript
+        // arm (parse.y:5633-5651) then consumes a matched `[...]` span via
+        // parse_matched_pair('[', ']', P_ARRAYSUB) whenever the word is empty
+        // (token_index == 0, parse.y:5637). The span's interior — spaces and
+        // PARENS included — is word data: a `)` inside `[)]` can never close
+        // the compound list, and the word continues past the `]` up to the
+        // next real shellbreak (rubash#413: `(X=([)])` must leave the
+        // subshell unclosed, not silently balance). Element starts are token
+        // boundaries: right after the opening `(` and after in-list
+        // whitespace.
+        let mut compound_element_start = false;
+        while let Some(c) = self.peek() {
+            let in_array_value = array_assignment && array_value_paren_depth > 0;
+            // GNU syntax.h:29-30 shell_break_chars "()<>;&| \t\n": `{`/`}` are
+            // NOT word-break characters, so read_token_word (parse.y:5305)
+            // gathers them as ordinary word text mid-word (rubash#244: the
+            // function name `ble/x:{s}/d` must stay one word). A brace only
+            // becomes the reserved `{`/`}` token when it is the whole word in
+            // command position, which next_token's `{`/`}` dispatch decides
+            // before this scanner runs.
+            if " \t\n|&;<>()".contains(c)
+                // GNU parse.y:5494-5524 read_token_word shellexp()
+                // (syntax.h:84): a `<`/`>` immediately followed by `(` is a
+                // process substitution and part of the word — the `(...)`
+                // body is consumed as substitution text, so
+                // `index[7<(4+2)]` inside `[[ ]]` stays one word.
+                && !(matches!(c, '<' | '>') && self.peek_after(1) == Some('('))
+                && !(array_assignment && array_subscript_depth > 0 && c.is_ascii_whitespace())
+                && !(in_array_value && c.is_ascii_whitespace())
+                && !(in_array_value && matches!(c, '(' | ')'))
+                // GNU skip_to_delim/skipsubscript (subst.c:2186): the
+                // subscript scan only terminates at the matching `]`, so
+                // parens inside a subscript are ordinary word text --
+                // `A[x\$(echo uname)]=v` stays ONE assignment word and the
+                // escaped `\$` never opens a substitution (census-array2.sh
+                // V2 previously broke at the paren: syntax error).
+                && !(array_assignment && array_subscript_depth > 0 && matches!(c, '(' | ')'))
+                // GNU read_token_word: inside a name=(...) compound
+                // assignment value every metacharacter -- whitespace, |, &,
+                // ;, <, >, the parens themselves -- is part of the word
+                // until the matching close paren (array.tests
+                // "test=(first & second)" is a single failing assignment,
+                // not an async list).
+                && compound_paren_depth == 0
+                && !(compound_paren_depth == 0
+                    && array_value_paren_depth == 0
+                    && c == '('
+                    && (self.compound_assignment_start(word_start)
+                        // `d[7]=(list)`: an array-element assignment whose
+                        // value is a compound list parses as one word; GNU
+                        // rejects it at execution time, not parse time.
+                        || (array_assignment
+                            && array_subscript_depth == 0
+                            && self.input[..self.position].ends_with('='))))
+            {
+                if c == '(' && extglob_operator && self.extended_glob {
+                    self.skip_extglob_group();
+                    extglob_operator = false;
+                    continue;
+                }
+                if c == '(' && extglob_operator {
+                    // rubash#131: the gate is closed, so GNU read_token_word
+                    // would have ended the word here (parse.y:5466); remember
+                    // the split so the case-pattern reader later rejects (or,
+                    // with the gate open at read time, never sees) this shape.
+                    self.extglob_split_pending = true;
+                }
+                // `{` no longer reaches this arm at all: it is not in the
+                // break set above, so a mid-word brace falls through to the
+                // plain-character advance below — ordinary word text, the
+                // same class as the removed special case (rubash#244).
+                break;
+            }
+            match c {
+                '(' if compound_paren_depth == 0
+                    && array_value_paren_depth == 0
+                    && self.compound_assignment_start(word_start) =>
+                {
+                    self.advance();
+                    compound_paren_depth = 1;
+                    compound_element_start = true;
+                }
+                '[' if (compound_paren_depth > 0 || in_array_value) && compound_element_start => {
+                    // parse.y:5635-5651: an element-LEADING `[` under
+                    // PST_COMPASSIGN scans the matched `[...]` span
+                    // (P_ARRAYSUB: quotes, escapes and nested `[` pairs) into
+                    // the word — parens inside are data, so they can neither
+                    // close this compound list nor open a nested one.
+                    self.advance();
+                    self.skip_compound_element_subscript();
+                    compound_element_start = false;
+                    extglob_operator = false;
+                }
+                '(' if compound_paren_depth > 0 => {
+                    self.advance();
+                    compound_paren_depth += 1;
+                    compound_element_start = false;
+                }
+                ')' if compound_paren_depth > 0 => {
+                    self.advance();
+                    compound_paren_depth -= 1;
+                    compound_element_start = false;
+                }
+                '(' if array_assignment
+                    && array_subscript_depth == 0
+                    && array_value_paren_depth == 0
+                    && self.input[..self.position].ends_with('=') =>
+                {
+                    self.advance();
+                    array_value_paren_depth = 1;
+                    compound_element_start = true;
+                }
+                '(' if in_array_value => {
+                    self.advance();
+                    array_value_paren_depth += 1;
+                    compound_element_start = false;
+                }
+                ')' if in_array_value => {
+                    self.advance();
+                    array_value_paren_depth = array_value_paren_depth.saturating_sub(1);
+                    compound_element_start = false;
+                }
+                '`' => {
+                    // TODO(parse.y/subst.c): Command substitution is part of
+                    // the surrounding word. Keeping it atomic is required for
+                    // assignment words such as v=`echo x`.
+                    self.advance();
+                    self.skip_backtick();
+                    extglob_operator = false;
+                    compound_element_start = false;
+                }
+                '\'' => {
+                    self.advance();
+                    self.skip_single();
+                    extglob_operator = false;
+                    compound_element_start = false;
+                }
+                '"' => {
+                    self.advance();
+                    self.skip_double();
+                    extglob_operator = false;
+                    compound_element_start = false;
+                }
+                '\\' => {
+                    self.advance();
+                    self.advance();
+                    extglob_operator = false;
+                    compound_element_start = false;
+                }
+                '[' if array_assignment => {
+                    self.advance();
+                    array_subscript_depth += 1;
+                    extglob_operator = false;
+                    compound_element_start = false;
+                }
+                '#' if (compound_paren_depth > 0 || in_array_value)
+                    && self.compound_body_comment_starts() =>
+                {
+                    // GNU parse.y:3630-3644 read_token + parse.y:7140-7147
+                    // parse_compound_assignment: inside a compound-assignment
+                    // body each element token is pulled through read_token,
+                    // and a word-initial `#' discards through EOL and yields
+                    // '\n', which the compound loop allows (parse.y:7142).
+                    // The comment text is therefore never seen by the paren
+                    // matcher — a `)' inside `1 # c )' cannot close the
+                    // assignment early. Word-initial mirrors read_token's
+                    // token start: preceded by whitespace or the opening
+                    // `('; quoted `#'s never reach this arm (their skip_*
+                    // spans consume them).
+                    while self.advance().is_some_and(|ch| ch != '\n') {}
+                    compound_element_start = false;
+                }
+                '<' | '>' if self.peek_after(1) == Some('(') => {
+                    // GNU parse.y:5514-5524: `<(`/`>(` mid-word — parse_comsub
+                    // reads the `(list)` body into the same token.
+                    self.advance();
+                    self.advance();
+                    self.skip_cmd_subst();
+                    extglob_operator = false;
+                    compound_element_start = false;
+                }
+                ']' if array_assignment && array_subscript_depth > 0 => {
+                    self.advance();
+                    array_subscript_depth -= 1;
+                    extglob_operator = false;
+                    compound_element_start = false;
+                }
+                '$' => {
+                    self.advance();
+                    match self.peek() {
+                        Some('{') => {
+                            self.advance();
+                            self.skip_braced(false);
+                        }
+                        Some('(') => {
+                            self.advance();
+                            if self.peek() == Some('(') {
+                                self.advance();
+                                self.skip_arith_paren();
+                            } else {
+                                self.skip_cmd_subst();
+                            }
+                        }
+                        Some('[') => {
+                            self.advance();
+                            self.skip_arith_bracket();
+                        }
+                        Some('\'') => {
+                            self.advance();
+                            self.skip_ansi_c_single();
+                        }
+                        _ => {}
+                    }
+                    extglob_operator = false;
+                    compound_element_start = false;
+                }
+                _ => {
+                    self.advance();
+                    extglob_operator = matches!(c, '@' | '*' | '+' | '?' | '!');
+                    // Inside a compound-assignment list only whitespace is a
+                    // token boundary (parse_compound_assignment pulls whole
+                    // element words through read_token); the state feeds the
+                    // element-leading `[` arm above.
+                    if compound_paren_depth > 0 || in_array_value {
+                        compound_element_start = c.is_ascii_whitespace();
+                    } else {
+                        compound_element_start = false;
+                    }
+                }
+            }
+        }
+        // parse.y:7140-7152: end of input with the list still open is
+        // parse_compound_assignment's clean-EOF error — the word never got
+        // its closing `)`. Park the condition for finish_word_token.
+        self.compound_unclosed_pending = compound_paren_depth > 0 || array_value_paren_depth > 0;
+    }
+
+    /// GNU parse.y:3635-5651 read_token_word: the `[` subscript arm calls
+    /// `parse_matched_pair (cd, '[', ']', &ttoklen, P_ARRAYSUB)`
+    /// (parse.y:3906) for the element-leading bracket inside a compound
+    /// assignment. The scan counts `[`/`]` pairs only; quotes recurse as
+    /// units (parse.y:4040-4051), backslashes escape (parse.y:3997-3998),
+    /// and EVERY other character — spaces, `(` and `)` included — is span
+    /// data. An unterminated scan runs to end of input (its own `]' EOF
+    /// diagnostic family owns that case, skip::unclosed_array_subscript_*).
+    fn skip_compound_element_subscript(&mut self) {
+        let mut depth = 1usize;
+        while let Some(c) = self.advance() {
+            match c {
+                '\\' => {
+                    self.advance();
+                }
+                '\'' => self.skip_single(),
+                '"' => self.skip_double(),
+                '`' => self.skip_backtick(),
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// GNU parse.y:3630-3644 read_token: inside a compound-assignment body a
+    /// `#' starts a comment only at a token boundary — the byte before it is
+    /// whitespace or the opening `(`. A mid-word `#' (as in `1#c`) is literal
+    /// token text, matching read_token_word's word assembly.
+    fn compound_body_comment_starts(&self) -> bool {
+        matches!(
+            self.input.as_bytes().get(self.position.wrapping_sub(1)),
+            Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'(')
+        )
+    }
+
+    // True when the word begun at word_start is exactly "name=" or
+    // "name[subscript]=" with name a valid identifier and a balanced
+    // subscript: the adjacent "(" then opens a compound array assignment
+    // value that must stay one word. GNU parse.y accepts both spellings in
+    // command position; `d[7]=(list)` later fails at execution time with
+    // "cannot assign list to array member" instead of a parse error
+    // (array.tests line 131).
+    fn compound_assignment_start(&self, word_start: usize) -> bool {
+        let prefix = &self.input[word_start..self.position];
+        let Some(head) = prefix.strip_suffix('=') else {
+            return false;
+        };
+        // GNU general.c:519 assignment(): `name+=` is an assignment word
+        // (`+` is valid only immediately before the `=`), so `name+=(list)`
+        // opens a compound assignment exactly like `name=(list)`. Strip a
+        // single trailing `+` before validating the head — `a+b=(` still
+        // fails the identifier check because the `+` is not trailing.
+        let head = head.strip_suffix('+').unwrap_or(head);
+        // Optional trailing balanced [subscript] before the `=`.
+        let head = if head.ends_with(']') {
+            let Some(open_rel) = head.rfind('[') else {
+                return false;
+            };
+            // Reject nested-close imbalances: the subscript must balance.
+            let subscript = &head[open_rel + 1..head.len() - 1];
+            if subscript.contains('[') || subscript.contains(']') {
+                return false;
+            }
+            &head[..open_rel]
+        } else {
+            head
+        };
+        let bytes = head.as_bytes();
+        !bytes.is_empty()
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            && bytes.iter().any(|b| b.is_ascii_alphabetic() || *b == b'_')
+    }
+
+    fn looks_like_array_element_assignment(&self) -> bool {
+        let rest = &self.input[self.position..];
+        if self.position == 0
+            || self.input.as_bytes()[self.position - 1] != b'[' && !rest.starts_with('[')
+        {
+            return false;
+        }
+        let open = if rest.starts_with('[') {
+            self.position
+        } else {
+            return false;
+        };
+        let name_end = open;
+        let mut name_start = name_end;
+        while name_start > 0 {
+            let ch = self.input.as_bytes()[name_start - 1] as char;
+            if ch == '_' || ch.is_ascii_alphanumeric() {
+                name_start -= 1;
+            } else {
+                break;
+            }
+        }
+        let name = &self.input[name_start..name_end];
+        let mut name_chars = name.chars();
+        let Some(first) = name_chars.next() else {
+            return false;
+        };
+        if !(first == '_' || first.is_ascii_alphabetic()) {
+            return false;
+        }
+        if !name_chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+            return false;
+        }
+        let mut depth = 1usize;
+        let mut escaped = false;
+        let mut close = None;
+        let chars: Vec<(usize, char)> = rest.char_indices().collect();
+        let mut idx = 1;
+        let mut single = false;
+        let mut double = false;
+        while idx < chars.len() {
+            let (offset, ch) = chars[idx];
+            if escaped {
+                escaped = false;
+                idx += 1;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                idx += 1;
+                continue;
+            }
+            if !single && !double {
+                // GNU skip_matched_pair (subst.c:2086): `$(...)`, `${...}`
+                // and backquote spans are skipped as units — a `]` inside
+                // them is substitution text, never the subscript close
+                // (`A[$(echo ])]=v` keys on `]`).
+                if ch == '`' {
+                    idx += 1;
+                    while idx < chars.len() && chars[idx].1 != '`' {
+                        idx += 1;
+                    }
+                    idx += 1;
+                    continue;
+                }
+                if ch == '$' && idx + 1 < chars.len() && matches!(chars[idx + 1].1, '(' | '{') {
+                    let (open_ch, close_ch) = if chars[idx + 1].1 == '(' {
+                        ('(', ')')
+                    } else {
+                        ('{', '}')
+                    };
+                    idx += 2;
+                    let mut sub_depth = 1usize;
+                    while idx < chars.len() {
+                        let inner = chars[idx].1;
+                        idx += 1;
+                        if inner == open_ch {
+                            sub_depth += 1;
+                        } else if inner == close_ch {
+                            sub_depth -= 1;
+                            if sub_depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            match ch {
+                '\'' if !double => {
+                    single = !single;
+                    idx += 1;
+                }
+                '"' if !single => {
+                    double = !double;
+                    idx += 1;
+                }
+                '[' if !single && !double => {
+                    depth += 1;
+                    idx += 1;
+                }
+                ']' if !single && !double => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        close = Some(offset);
+                        break;
+                    }
+                    idx += 1;
+                }
+                _ => idx += 1,
+            }
+        }
+        close
+            .and_then(|offset| rest.get(offset + 1..))
+            .is_some_and(|tail| tail.starts_with('='))
+    }
+
+    fn word_so_far_ends_extglob_operator(&self, start: usize) -> bool {
+        let word = self.slice(start);
+        let mut chars = word.chars().rev();
+        let Some(op) = chars.next() else {
+            return false;
+        };
+        if !matches!(op, '@' | '*' | '+' | '?' | '!') {
+            return false;
+        }
+        // GNU parse.y:5366-5375 (read_token_word backslash branch): a `\c`
+        // pair is consumed as an escaped character BEFORE the EXTENDED_GLOB
+        // PATTERN_CHAR rule (parse.y:5466) can see `c', so an escaped
+        // operator (`\@(') never opens a pattern group — the `(' then ends
+        // the word and is a syntax error in redirect-target/argument
+        // position (verified vs WSL GNU 5.3.0: `echo e >\@(zz)esc' with
+        // extglob on is `syntax error near unexpected token `('). Count the
+        // backslashes immediately before the operator: odd = escaped.
+        let escaped = chars.take_while(|ch| *ch == '\\').count() % 2 == 1;
+        !escaped
+    }
+
+    fn skip_extglob_group(&mut self) {
+        if self.peek() != Some('(') {
+            return;
+        }
+
+        self.advance();
+        let mut depth = 1usize;
+        while let Some(c) = self.advance() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                '`' => self.skip_backtick(),
+                '\'' => self.skip_single(),
+                '"' => self.skip_double(),
+                '\\' => {
+                    self.advance();
+                }
+                _ => {}
+            }
+        }
+    }
+}

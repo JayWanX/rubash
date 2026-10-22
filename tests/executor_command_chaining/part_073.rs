@@ -1,0 +1,293 @@
+use super::super::*;
+use std::fs;
+
+#[test]
+fn test_if_true_executes_then_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-if-true-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("if true; then echo yes > {output_path}; fi");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "yes\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_elif_true_executes_after_false_if() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-elif-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("if false; then echo no > {output_path}; elif true; then echo yes > {output_path}; else echo bad > {output_path}; fi");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "yes\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_if_condition_command_runs_before_then() {
+    let _cwd_guard = CwdGuard::take();
+    let condition_path = "target/rubash-if-condition-side-effect.txt";
+    let output_path = "target/rubash-if-command-output.txt";
+    let _ = fs::remove_file(condition_path);
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "if printf cond > {condition_path}; then echo yes > {output_path}; else echo no > {output_path}; fi"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(condition_path).unwrap(), "cond");
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "yes\n");
+    let _ = fs::remove_file(condition_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_if_condition_command_status_selects_else() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-if-command-false-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("if false; then echo yes > {output_path}; else echo no > {output_path}; fi");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "no\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_if_flattened_arithmetic_comparison_selects_else() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-if-arith-false-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("if 0 == 1; then echo yes > {output_path}; else echo no > {output_path}; fi");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "no\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_if_command_redirects_then_body_stdout() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-if-command-redirect-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("if true; then echo yes; fi > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    assert!(ast.commands[0].if_command.is_some());
+    assert!(ast.commands[0].redirect_out.is_some());
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "yes\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_if_command_redirect_creates_file_without_matching_branch() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-if-command-redirect-empty-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("if false; then echo bad; fi > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_if_command_redirects_condition_stdout() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-if-command-redirect-condition-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("if printf cond; then echo yes; fi > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "condyes\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_if_command_redirects_body_stderr() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-if-command-redirect-error.txt";
+    let _ = fs::remove_file(error_path);
+    let input = format!("if true; then echo err >&2; fi 2> {error_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(error_path).unwrap(), "err\n");
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_if_command_input_redirect_feeds_condition_and_body() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-if-command-input.txt";
+    let output_path = "target/rubash-if-command-input-output.txt";
+    fs::write(input_path, "alpha\nbeta\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "if read first; then read second; echo $first/$second; fi < {input_path} > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha/beta\n");
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_if_command_here_string_feeds_condition() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-if-command-herestring-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("if read value; then echo got:$value; fi <<< alpha > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "got:alpha\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_introduced_if_executes_then_branch() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-if-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias i=if\ni true; then echo yes > {output_path}; else echo no > {output_path}; fi"
+    );
+    // wt33 (#374): run through the real CLI — this construct depends on the
+    // parse-execute cadence that an in-process execute_ast cannot model
+    // (subprocess behavior is byte-identical to WSL GNU 5.3.0; see
+    // run_cli_script's doc comment and the wt33-373 G/H probes).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "yes\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_introduced_if_executes_else_branch() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-if-else-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias i=if\ni false; then echo yes > {output_path}; else echo no > {output_path}; fi"
+    );
+    // wt33 (#374): run through the real CLI — this construct depends on the
+    // parse-execute cadence that an in-process execute_ast cannot model
+    // (subprocess behavior is byte-identical to WSL GNU 5.3.0; see
+    // run_cli_script's doc comment and the wt33-373 G/H probes).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "no\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_introduced_if_prefix_with_then_executes_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-if-prefix-then-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("shopt -s expand_aliases\nalias i='if true; then'\ni echo yes > {output_path}; fi");
+    // wt42 (2026-10-02 full-rebaseline): GNU 5.3.0 expands an alias only
+    // when its definition was EXECUTED before the use is READ — the `;`
+    // one-buffer form (`alias i='if true; then'; i …; fi`) is rejected by
+    // GNU as `syntax error near unexpected token fi' because the whole
+    // list is parsed before the alias command runs (parse.y:5761
+    // read_token_word -> 3249 alias_expand_token runs at READ time; 815802eb
+    // aligned rubash's rejection). Newline-separated definitions parse in a
+    // later input unit, so the use line sees the alias — verified
+    // byte-identical through run_cli_script vs WSL GNU 5.3.0.
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "yes\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_introduced_if_prefix_keeps_nested_if_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-if-prefix-nested-if-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias i='if true; then'\n\
+         i if false; then echo bad >> {output_path}; else echo inner >> {output_path}; fi; \
+         echo outer >> {output_path}; fi"
+    );
+    // wt33 (#374): run through the real CLI — this construct depends on the
+    // parse-execute cadence that an in-process execute_ast cannot model
+    // (subprocess behavior is byte-identical to WSL GNU 5.3.0; see
+    // run_cli_script's doc comment and the wt33-373 G/H probes).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "inner\nouter\n");
+    let _ = fs::remove_file(output_path);
+}

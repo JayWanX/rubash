@@ -1,0 +1,1255 @@
+//! GNU parse.y alias expansion ported to the input-text layer.
+//!
+//! GNU expands aliases while reading tokens: `alias_expand_token`
+//! (parse.y:3249 / y.tab.c:5620) pushes the replacement text back onto the
+//! parser input through `push_string` (parse.y:2055 / y.tab.c:4433), so the
+//! alias value and the remaining source share one character stream. An
+//! unclosed quote inside the alias value continues into the following
+//! input (alias4.sub: `alias foo="echo 'Error:"` + `foo bar'` prints
+//! `Error: bar`, and `foo x` is an unexpected-EOF syntax error), and
+//! alias-introduced `;`, newlines, or redirections are real syntax.
+//!
+//! Word-level expansion after parsing cannot reproduce any of that — the
+//! tokenizer has already consumed the unclosed quote before the executor
+//! sees a word list. The script driver therefore expands each command
+//! group's text before the tokenizer's quote-balance decisions, using the
+//! alias table live at that moment — the same instant GNU sees it.
+
+/// Alias lookup: name -> (replacement text, expand_next). `expand_next` is
+/// alias.c's AL_EXPANDNEXT (value ends in blank → the next token is also
+/// alias-expanded; parse.y:2098 sets PST_ALEXPNEXT when the pushed string
+/// pops).
+pub(crate) type AliasLookup<'a> = dyn Fn(&str) -> Option<(String, bool)> + 'a;
+
+/// Last-token kinds needed by GNU's command-position predicates:
+/// `command_token_position` (parse.y:3157), `assignment_acceptable`
+/// (parse.y:3164), `reserved_word_acceptable` (y.tab.c:8258), and the
+/// special-case token rules (y.tab.c:5725 special_case_tokens).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tok {
+    Start,
+    Newline,
+    Semi,
+    SemiSemi,
+    SemiAnd,
+    SemiSemiAnd,
+    And,
+    AndAnd,
+    OrOr,
+    Pipe,
+    BarAnd,
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    Bang,
+    Word,
+    Assign,
+    RedirOp,
+    RedirTarget,
+    If,
+    Then,
+    Elif,
+    Else,
+    Fi,
+    While,
+    Until,
+    Do,
+    Done,
+    For,
+    Select,
+    Case,
+    In,
+    Esac,
+    Function,
+    Time,
+    TimeOpt,
+    TimeIgn,
+    Coproc,
+    CondStart,
+    CondEnd,
+    ArithCmd,
+}
+
+/// y.tab.c:8258 reserved_word_acceptable — last tokens that allow the next
+/// word to be a reserved word (and, through command_token_position, an
+/// alias candidate). `case`, `for`, `select`, `in`, `function`, and `[[`
+/// are deliberately absent: the word following them is an operand, not a
+/// command.
+fn reserved_ok(t: Tok) -> bool {
+    matches!(
+        t,
+        Tok::Start
+            | Tok::Newline
+            | Tok::Semi
+            | Tok::SemiSemi
+            | Tok::SemiAnd
+            | Tok::SemiSemiAnd
+            | Tok::LParen
+            | Tok::RParen
+            | Tok::Pipe
+            | Tok::And
+            | Tok::LBrace
+            | Tok::RBrace
+            | Tok::AndAnd
+            | Tok::ArithCmd
+            | Tok::Bang
+            | Tok::BarAnd
+            | Tok::CondEnd
+            | Tok::Do
+            | Tok::Done
+            | Tok::Elif
+            | Tok::Else
+            | Tok::Esac
+            | Tok::Fi
+            | Tok::If
+            | Tok::OrOr
+            | Tok::Then
+            | Tok::Time
+            | Tok::TimeOpt
+            | Tok::TimeIgn
+            | Tok::Coproc
+            | Tok::Until
+            | Tok::While
+    )
+}
+
+/// parse.y:3157 command_token_position: the next word may be a command
+/// name (alias candidate). ASSIGNMENT_WORD, a non-redirection token inside
+/// a redirection list, and anything reserved_word_acceptable — except the
+/// case-pattern separators `;;` `;&` `;;&`, which introduce a pattern.
+fn command_pos(last: Tok, last2: Tok) -> bool {
+    if last == Tok::Assign || last == Tok::RedirTarget {
+        return true;
+    }
+    // y.tab.c:8301: `coproc NAME cmd` — a WORD right after COPROC leaves
+    // the following word in command position too.
+    if last == Tok::Word && last2 == Tok::Coproc {
+        return true;
+    }
+    !matches!(last, Tok::SemiSemi | Tok::SemiAnd | Tok::SemiSemiAnd) && reserved_ok(last)
+}
+
+/// CHECK_FOR_RESERVED_WORD (parse.y:3168-3199, from read_token_word):
+/// `word` is the grammar keyword when it is unquoted, the previous token
+/// allows a reserved word (reserved_word_acceptable, parse.y:5899), and
+/// the case-pattern state does not suppress it (every reserved word but a
+/// pattern-position `esac'; Posix grammar rule 4 after `|'/`(',
+/// y.tab.c:5536-5545). Applies the macro's parser-state side effects
+/// (expecting_in_command, esacs_needed_count, PST_CASEPAT clear,
+/// open_brace_count, PST_CONDEXPR) and returns the token; None leaves the
+/// word a plain word. Shared by the posix PRE-alias check and the default
+/// POST-alias check (parse.y:5751-5769, rubash#414).
+fn check_reserved_word(
+    word: &str,
+    quoted: bool,
+    last: Tok,
+    casepat: &mut bool,
+    case_needed: &mut usize,
+    expect_in: &mut usize,
+    expect_in_cmd: &mut Tok,
+    open_brace: &mut usize,
+    cond: &mut usize,
+) -> Option<Tok> {
+    let esac_suppressed = *casepat && matches!(last, Tok::Pipe | Tok::LParen);
+    if quoted || !reserved_ok(last) || (*casepat && word != "esac") || esac_suppressed {
+        return None;
+    }
+    let tok = match word {
+        "if" => Some(Tok::If),
+        "then" => Some(Tok::Then),
+        "elif" => Some(Tok::Elif),
+        "else" => Some(Tok::Else),
+        "fi" => Some(Tok::Fi),
+        "while" => Some(Tok::While),
+        "until" => Some(Tok::Until),
+        "do" => Some(Tok::Do),
+        "done" => Some(Tok::Done),
+        "for" => Some(Tok::For),
+        "select" => Some(Tok::Select),
+        "case" => Some(Tok::Case),
+        "esac" => Some(Tok::Esac),
+        "function" => Some(Tok::Function),
+        "coproc" => Some(Tok::Coproc),
+        "time" => Some(Tok::Time),
+        "!" => Some(Tok::Bang),
+        "{" => Some(Tok::LBrace),
+        "}" if *open_brace > 0 => Some(Tok::RBrace),
+        "[[" => Some(Tok::CondStart),
+        // `]]' is NOT here: parse.y:3481-3484 intercepts it in
+        // special_case_tokens before this function (and before alias
+        // expansion) on PST_CONDEXPR alone; see the intercept in
+        // expand_aliases_in_source.
+        _ => None,
+    }?;
+    match tok {
+        Tok::Case | Tok::For | Tok::Select => {
+            *expect_in_cmd = tok;
+            *expect_in += 1;
+        }
+        Tok::Esac => {
+            *case_needed = case_needed.saturating_sub(1);
+            *casepat = false;
+        }
+        Tok::LBrace => *open_brace += 1,
+        Tok::RBrace => *open_brace = open_brace.saturating_sub(1),
+        Tok::CondStart => *cond += 1,
+        _ => {}
+    }
+    Some(tok)
+}
+
+/// One pushed expansion being consumed: GNU's pushed_string_list entry.
+/// `end` is the buffer index where the pushed text ends; when the scan
+/// position reaches it the alias leaves AL_BEINGEXPANDED and, when the
+/// alias value ended in a blank, PST_ALEXPNEXT is set (parse.y:2098-2107).
+struct Boundary {
+    end: usize,
+    expander: String,
+    expand_next: bool,
+}
+
+/// Expand every alias that GNU's reader would expand while scanning
+/// `source`, given the alias table in `lookup`. Returns the rewritten
+/// source; everything outside the replaced words is byte-identical.
+///
+/// `posix` is `posixly_correct`: it selects the reserved-word/alias ORDER
+/// of read_token_word's tail (parse.y:5751-5769) — posix checks reserved
+/// words BEFORE alias expansion (a reserved word at an acceptable position
+/// is the keyword and never alias text), default mode expands the alias
+/// first and checks reserved words after (rubash#414).
+pub(crate) fn expand_aliases_in_source(
+    source: &str,
+    lookup: &AliasLookup<'_>,
+    posix: bool,
+) -> String {
+    let source = expand_comsub_alias_bodies(source, lookup, posix);
+    let source = source.as_str();
+    let mut buf: Vec<char> = source.chars().collect();
+    let mut pos = 0usize;
+    // Live parse-time extglob gate (shopt.def:640 `extglob_flag' ->
+    // reset_parser parse.y:3502 `extended_glob'). Sampled once per pass:
+    // the grouped driver runs the pre-pass per command group, after the
+    // previous groups' `shopt' calls have executed — the same instant
+    // GNU's reader would see the flag.
+    let extglob = super::parse_extended_glob();
+    // AL_BEINGEXPANDED stack (parse.y:3259) — an alias does not expand
+    // while its own pushed text is still being consumed.
+    let mut expanding: Vec<String> = Vec::new();
+    // Pending pushed-text boundaries, innermost last (LIFO like GNU's
+    // pushed_string_list).
+    let mut bounds: Vec<Boundary> = Vec::new();
+    let mut alexpnext = false; // PST_ALEXPNEXT
+    let mut last = Tok::Start;
+    let mut last2 = Tok::Start;
+    let mut casepat = false; // PST_CASEPAT
+    let mut case_needed = 0usize; // esacs_needed_count
+    let mut expect_in = 0usize; // expecting_in_token
+    let mut expect_in_cmd = Tok::Start; // expecting_in_command
+    let mut cond = 0usize; // inside [[ ]]
+    let mut open_brace = 0usize; // open_brace_count for `}` recognition
+                                 // Heredoc state: `<<`/<<- record their delimiter word; after the next
+                                 // newline the body lines are raw data — GNU reads them with
+                                 // here_document_to_fd, outside the token stream, so no alias expansion
+                                 // ever applies inside a heredoc body.
+    let mut expect_heredoc: Option<bool> = None; // strip_tabs for <<-
+    let mut pending_heredocs: Vec<(String, bool)> = Vec::new();
+    // >0 while scanning the element words of a compound array assignment
+    // `NAME=( w1 w2 ... )` (the value is the nesting depth of raw `(`).
+    // parse.y:5652-5673 read_token_word consumes the whole `( ... )` into
+    // the SAME word via parse_compound_assignment (parse.y:7104), which
+    // reads the element words with `last_read_token = WORD` — "so it means
+    // we won't be in a command position and so alias expansion won't
+    // happen" (parse.y:7113-7117). Element words are alias candidates only
+    // through PST_ALEXPNEXT (parse.y:3254) and are never reserved words.
+    // Newlines are plain whitespace here (parse.y:7142); operator
+    // characters are a syntax error GNU raises after the alias pass, so
+    // they pass through unrewritten.
+    let mut compassign = 0usize;
+
+    macro_rules! emit {
+        ($tok:expr) => {{
+            last2 = last;
+            last = $tok;
+            alexpnext = false;
+        }};
+    }
+
+    while pos < buf.len() {
+        // shell_getc boundary pops (parse.y:2081 pop_string).
+        while bounds.last().is_some_and(|b| pos >= b.end) {
+            let b = bounds.pop().expect("checked");
+            expanding.retain(|name| name != &b.expander);
+            if b.expand_next {
+                alexpnext = true;
+            }
+        }
+        if pos >= buf.len() {
+            break;
+        }
+        let c = buf[pos];
+        if compassign > 0 {
+            // Inside `NAME=( ... )` — parse.y:7104 parse_compound_assignment
+            // reads element words with last_read_token = WORD: no command
+            // position, so no alias candidates and no reserved words; only
+            // PST_ALEXPNEXT (parse.y:3254) can still expand an element.
+            match c {
+                ' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' => pos += 1,
+                '#' => {
+                    // Comments are skipped by the reader, never token input.
+                    while pos < buf.len() && buf[pos] != '\n' {
+                        pos += 1;
+                    }
+                }
+                '(' => {
+                    // A raw nested `(` is a syntax error GNU raises after
+                    // the alias pass; depth-count through it so the real
+                    // closer still lands.
+                    compassign += 1;
+                    pos += 1;
+                }
+                ')' => {
+                    compassign -= 1;
+                    pos += 1;
+                    if compassign == 0 {
+                        // The whole `NAME=( ... )` is one ASSIGNMENT_WORD
+                        // (parse.y:5652-5673, `goto next_character`), so a
+                        // word glued to the closer (`A=(1)B`) continues the
+                        // same token and is never an alias candidate.
+                        let (cont, _) = scan_word(&buf, pos, extglob);
+                        pos = cont;
+                        emit!(Tok::Assign);
+                    }
+                }
+                _ => {
+                    let ws = pos;
+                    let (end, quoted) = scan_word(&buf, pos, extglob);
+                    pos = end;
+                    let word: String = buf[ws..end].iter().collect();
+                    if alexpnext && !quoted && !expanding.iter().any(|name| name == &word) {
+                        if let Some((value, expand_next)) = lookup(&word) {
+                            splice_alias_value(
+                                &mut buf,
+                                &mut bounds,
+                                &mut expanding,
+                                ws,
+                                end,
+                                &word,
+                                &value,
+                                expand_next,
+                                false,
+                            );
+                            pos = ws;
+                            continue;
+                        }
+                    }
+                    // parse.y:5766: an eligible token with no expansion
+                    // clears PST_ALEXPNEXT; every element word is a plain
+                    // WORD for the token stream.
+                    emit!(Tok::Word);
+                }
+            }
+            continue;
+        }
+        match c {
+            ' ' | '\t' => pos += 1,
+            '\n' => {
+                emit!(Tok::Newline);
+                pos += 1;
+                // After the line carrying a `<<` operator ends, consume the
+                // heredoc body lines verbatim until each delimiter
+                // (parse.y here_document_to_fd): body text is never token
+                // input, so it must not be scanned for aliases.
+                while let Some((delimiter, strip_tabs)) = pending_heredocs.first().cloned() {
+                    let line_start = pos;
+                    let mut line_end = pos;
+                    while line_end < buf.len() && buf[line_end] != '\n' {
+                        line_end += 1;
+                    }
+                    let line: String = buf[line_start..line_end].iter().collect();
+                    let candidate = if strip_tabs {
+                        line.trim_start_matches('\t')
+                    } else {
+                        line.as_str()
+                    };
+                    pos = (line_end + 1).min(buf.len());
+                    if candidate == delimiter {
+                        pending_heredocs.remove(0);
+                    }
+                    if line_end >= buf.len() {
+                        pending_heredocs.clear();
+                        break;
+                    }
+                }
+            }
+            '#' => {
+                // PST_COMMENT: to end of line (the newline itself emits a
+                // token on the next iteration).
+                while pos < buf.len() && buf[pos] != '\n' {
+                    pos += 1;
+                }
+            }
+            ';' => {
+                if pos + 1 < buf.len() && buf[pos + 1] == ';' {
+                    if pos + 2 < buf.len() && buf[pos + 2] == '&' {
+                        emit!(Tok::SemiSemiAnd);
+                        casepat = true; // y.tab.c:6118
+                        pos += 3;
+                    } else {
+                        emit!(Tok::SemiSemi);
+                        casepat = true; // y.tab.c:6069
+                        pos += 2;
+                    }
+                } else if pos + 1 < buf.len() && buf[pos + 1] == '&' {
+                    emit!(Tok::SemiAnd);
+                    casepat = true; // y.tab.c:6118
+                    pos += 2;
+                } else {
+                    emit!(Tok::Semi);
+                    pos += 1;
+                }
+            }
+            '&' => {
+                if pos + 1 < buf.len() && buf[pos + 1] == '&' {
+                    emit!(Tok::AndAnd);
+                    pos += 2;
+                } else if pos + 1 < buf.len() && buf[pos + 1] == '>' {
+                    emit!(Tok::RedirOp);
+                    pos += if pos + 2 < buf.len() && buf[pos + 2] == '>' {
+                        3
+                    } else {
+                        2
+                    };
+                } else {
+                    emit!(Tok::And);
+                    pos += 1;
+                }
+            }
+            '|' => {
+                if pos + 1 < buf.len() && buf[pos + 1] == '|' {
+                    emit!(Tok::OrOr);
+                    pos += 2;
+                } else if pos + 1 < buf.len() && buf[pos + 1] == '&' {
+                    emit!(Tok::BarAnd);
+                    pos += 2;
+                } else {
+                    emit!(Tok::Pipe);
+                    pos += 1;
+                }
+            }
+            '(' => {
+                // parse_dparen (y.tab.c:7218): `((` is an arithmetic command
+                // when a matching `))` exists, else a nested subshell.
+                if pos + 1 < buf.len() && buf[pos + 1] == '(' {
+                    if let Some(end) = match_dparen(&buf, pos) {
+                        emit!(Tok::ArithCmd);
+                        pos = end;
+                    } else {
+                        emit!(Tok::LParen);
+                        pos += 1;
+                    }
+                } else {
+                    emit!(Tok::LParen);
+                    pos += 1;
+                }
+            }
+            ')' => {
+                if casepat {
+                    casepat = false; // y.tab.c:6146
+                }
+                emit!(Tok::RParen);
+                pos += 1;
+            }
+            '<' | '>' => {
+                // `<<` / `<<-` declare a heredoc whose next word is the
+                // delimiter; `<<<` is a herestring (no body to skip).
+                if c == '<' && buf.get(pos + 1) == Some(&'<') && buf.get(pos + 2) != Some(&'<') {
+                    expect_heredoc = Some(buf.get(pos + 2) == Some(&'-'));
+                }
+                emit!(Tok::RedirOp);
+                pos += redir_op_len(&buf, pos);
+            }
+            _ => {
+                // Word token: quoted regions and substitutions stay opaque.
+                let ws = pos;
+                let (end, quoted) = scan_word(&buf, pos, extglob);
+                pos = end;
+                let word: String = buf[ws..end].iter().collect();
+
+                // `NAME=` immediately followed by `(` opens a compound array
+                // assignment (parse.y:5652-5673 read_token_word): the whole
+                // `( ... )` is consumed into this one word by
+                // parse_compound_assignment (parse.y:7104), whose element
+                // words are read with last_read_token = WORD — outside
+                // command position, so "alias expansion won't happen"
+                // (parse.y:7113-7117). Not after a redirection operator:
+                // there the word is the target/delimiter and GNU never
+                // starts a compound assignment (it is a syntax error).
+                if compassign == 0
+                    && last != Tok::RedirOp
+                    && buf.get(pos) == Some(&'(')
+                    && word.ends_with('=')
+                    && is_assignment_syntax(&word)
+                {
+                    compassign = 1;
+                    pos += 1;
+                    last2 = Tok::Word;
+                    last = Tok::Word;
+                    continue;
+                }
+
+                // A word right after a redirection operator is its target
+                // (file, fd, or heredoc delimiter): not command position,
+                // but PST_ALEXPNEXT still expands it (alias `c='< '` makes
+                // `a2 foo c file` read `file` as the expanded target,
+                // alias7.sub). A `<<`/`<<-` target also declares the body
+                // delimiter, dequoted for the line comparison.
+                if last == Tok::RedirOp && !alexpnext {
+                    if let Some(strip_tabs) = expect_heredoc.take() {
+                        pending_heredocs.push((dequote_heredoc_delimiter(&word), strip_tabs));
+                    }
+                    emit!(Tok::RedirTarget);
+                    continue;
+                }
+
+                // y.tab.c:8085: an all-digit word before < or > is the fd
+                // of a redirection, as is the {varname} form — but only
+                // when they share one input read: a digit word ending at a
+                // pushed-alias boundary does not merge with a < or > in the
+                // outer text (`alias foo='echo 0'` + `foo>&2` prints `0` to
+                // stderr; GNU read the `0` as an argument, not fd 0).
+                if (word.chars().all(|d| d.is_ascii_digit()) && !word.is_empty()
+                    || is_var_redir_name(&word))
+                    && pos < buf.len()
+                    && (buf[pos] == '<' || buf[pos] == '>')
+                    && !bounds.iter().any(|b| b.end == end)
+                {
+                    emit!(Tok::RedirOp);
+                    pos += redir_op_len(&buf, pos);
+                    continue;
+                }
+
+                // special_case_tokens (parse.y:3481-3484): `]]' returns
+                // COND_END while a conditional is being parsed
+                // (PST_CONDEXPR), with NO last-token condition — the cond
+                // reader freezes last_read_token at COND_START, so the
+                // normal reserved-word gate could never fire for the
+                // everyday `[[ a == b ]]` shape. special_case_tokens runs
+                // BEFORE alias expansion (parse.y:5743-5750), so `]]' is
+                // never alias text even after `(' `)' `&&' `||' where the
+                // frozen-token rule alone would leave it eligible.
+                if cond > 0 && word == "]]" {
+                    cond = cond.saturating_sub(1);
+                    emit!(Tok::CondEnd);
+                    continue;
+                }
+
+                // special_case_tokens (y.tab.c:5725) run BEFORE alias
+                // expansion: `in`, `do`, and `esac` in their grammar slots
+                // can never be alias text.
+                if word == "in"
+                    && ((last == Tok::Word && matches!(last2, Tok::For | Tok::Case | Tok::Select))
+                        || (expect_in > 0 && matches!(last, Tok::Word | Tok::Newline)))
+                {
+                    if expect_in_cmd == Tok::Case {
+                        casepat = true; // y.tab.c:5736
+                        case_needed += 1;
+                    }
+                    expect_in = expect_in.saturating_sub(1);
+                    expect_in_cmd = Tok::Start;
+                    emit!(Tok::In);
+                    continue;
+                }
+                if word == "do" && last == Tok::Word && matches!(last2, Tok::For | Tok::Select) {
+                    expect_in = expect_in.saturating_sub(1);
+                    expect_in_cmd = Tok::Start;
+                    emit!(Tok::Do);
+                    continue;
+                }
+                if word == "esac" && case_needed > 0 && last == Tok::In {
+                    case_needed -= 1;
+                    casepat = false;
+                    emit!(Tok::Esac);
+                    continue;
+                }
+                // `time` is a reserved word only immediately after
+                // ; \n || && & (y.tab.c:5695 comment + TIMEOPT/TIMEIGN).
+                if word == "-p" && last == Tok::Time {
+                    emit!(Tok::TimeOpt);
+                    continue;
+                }
+                if word == "--" && matches!(last, Tok::Time | Tok::TimeOpt) {
+                    emit!(Tok::TimeIgn);
+                    continue;
+                }
+
+                // parse.y:5751-5755 (read_token_word): "Posix.2 does not
+                // allow reserved words to be aliased, so check for all of
+                // them ... before expanding the current token as an alias."
+                // In posix mode a reserved word at an acceptable position
+                // returns as the keyword and alias expansion never sees it
+                // (rubash#414: `alias for=echo` + `al for foo in v` under
+                // -o posix keeps the loop keyword, unlike default mode).
+                if posix {
+                    if let Some(tok) = check_reserved_word(
+                        &word,
+                        quoted,
+                        last,
+                        &mut casepat,
+                        &mut case_needed,
+                        &mut expect_in,
+                        &mut expect_in_cmd,
+                        &mut open_brace,
+                        &mut cond,
+                    ) {
+                        emit!(tok);
+                        continue;
+                    }
+                }
+
+                // alias_expand_token (parse.y:3249): unquoted word in a
+                // command position (PST_ALEXPNEXT or
+                // assignment_acceptable) with a live alias that is not
+                // currently being expanded. Inside `[[ ]]` (cond > 0) NO
+                // word is command-position eligible: the cond interior is
+                // read by parse_cond_command's recursive descent
+                // (parse.y:3586-3604 read_token cond branch → parse.y:5254),
+                // whose read_token calls bypass yylex — the ONLY
+                // `last_read_token' bookkeeper (parse.y:3076-3078) — so the
+                // token stays frozen at COND_START, which
+                // reserved_word_acceptable never accepts (parse.y:3157
+                // command_token_position). Verified against GNU 5.3.0:
+                // `[[ ( zz == zz ) ]]`, `[[ a || zz == zz ]]`,
+                // `[[ $cur != ?(*/).. ]]` never expand (2026-10-02
+                // wt56-aliascond matrix). PST_ALEXPNEXT (parse.y:3254)
+                // still applies — but it is always clear at the interior's
+                // first word: the `[[` word itself read it off
+                // (parse.y:5763 NO_EXPANSION clears it), and no interior
+                // expansion can set it again.
+                let eligible = alexpnext || (cond == 0 && !casepat && command_pos(last, last2));
+                if eligible && !quoted && !expanding.iter().any(|name| name == &word) {
+                    if let Some((value, expand_next)) = lookup(&word) {
+                        // push_string: splice the replacement text in place
+                        // and re-read it under the same parser state.
+                        splice_alias_value(
+                            &mut buf,
+                            &mut bounds,
+                            &mut expanding,
+                            ws,
+                            end,
+                            &word,
+                            &value,
+                            expand_next,
+                            true,
+                        );
+                        pos = ws;
+                        continue;
+                    }
+                }
+
+                // alexpnext made the word alias-eligible but no alias was
+                // defined: it is still the redirection's target.
+                if last == Tok::RedirOp {
+                    if let Some(strip_tabs) = expect_heredoc.take() {
+                        pending_heredocs.push((dequote_heredoc_delimiter(&word), strip_tabs));
+                    }
+                    emit!(Tok::RedirTarget);
+                    continue;
+                }
+
+                // parse.y:5767-5769 (read_token_word): "If not in Posix.2
+                // mode, check for reserved words after alias expansion" —
+                // the default-mode POST check (posix ran its check before
+                // the alias block above, so the keyword decision there is
+                // already final).
+                if !posix {
+                    if let Some(tok) = check_reserved_word(
+                        &word,
+                        quoted,
+                        last,
+                        &mut casepat,
+                        &mut case_needed,
+                        &mut expect_in,
+                        &mut expect_in_cmd,
+                        &mut open_brace,
+                        &mut cond,
+                    ) {
+                        emit!(tok);
+                        continue;
+                    }
+                }
+                if cond > 0 {
+                    // Inside [[ ]] words are expression operands.
+                    emit!(Tok::Word);
+                    continue;
+                }
+                if is_assignment_syntax(&word) && command_pos(last, last2) && !casepat {
+                    emit!(Tok::Assign);
+                } else {
+                    emit!(Tok::Word);
+                }
+            }
+        }
+    }
+    buf.iter().collect()
+}
+
+/// push_string (parse.y:2055): replace the just-scanned word at `ws..end`
+/// with the alias value; the caller re-reads from `ws` under the same
+/// parser state. Pushed-string boundaries after the splice shift by the
+/// length delta. `fd_boundary` appends the literal blank that keeps a
+/// value-final digit from merging with a `<`/`>` of the outer input
+/// (y.tab.c:8085): `alias foo='echo 0'` + `foo>&2` is `echo 0 >&2`,
+/// printing `0` on stderr.
+fn splice_alias_value(
+    buf: &mut Vec<char>,
+    bounds: &mut Vec<Boundary>,
+    expanding: &mut Vec<String>,
+    ws: usize,
+    end: usize,
+    word: &str,
+    value: &str,
+    expand_next: bool,
+    fd_boundary: bool,
+) {
+    let mut value_chars: Vec<char> = value.chars().collect();
+    if fd_boundary
+        && value_chars.last().is_some_and(|ch| ch.is_ascii_digit())
+        && matches!(buf.get(end), Some('<') | Some('>'))
+    {
+        value_chars.push(' ');
+    }
+    let vlen = value_chars.len();
+    let removed = end - ws;
+    buf.splice(ws..end, value_chars);
+    let delta = vlen as isize - removed as isize;
+    for b in bounds.iter_mut() {
+        b.end = (b.end as isize + delta) as usize;
+    }
+    bounds.push(Boundary {
+        end: ws + vlen,
+        expander: word.to_string(),
+        expand_next,
+    });
+    expanding.push(word.to_string());
+}
+
+/// Scan one word starting at `pos`: returns (end, quoted). Quoting and
+/// substitution constructs are consumed opaquely; the word ends at an
+/// unquoted shell break (blank, newline, or metachar). With `extglob` on,
+/// a ksh extended-pattern opener `X(` (X a PATTERN_CHAR, syntax.h:90-91:
+/// `@ * + ? !`) consumes its matched `(...)` into the SAME word
+/// (read_token_word parse.y:5464-5477: parse_matched_pair + `goto
+/// next_character`), so the pattern's interior and the text glued after
+/// its `)` are never separate alias candidates.
+fn scan_word(buf: &[char], mut pos: usize, extglob: bool) -> (usize, bool) {
+    let mut quoted = false;
+    while pos < buf.len() {
+        match buf[pos] {
+            ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>' => break,
+            '\\' => {
+                quoted = true;
+                pos += if pos + 1 < buf.len() { 2 } else { 1 };
+            }
+            '\'' => {
+                quoted = true;
+                pos = skip_single_quote(buf, pos);
+            }
+            '"' => {
+                quoted = true;
+                pos = skip_double_quote(buf, pos);
+            }
+            '`' => {
+                pos = skip_backtick(buf, pos);
+            }
+            '$' if pos + 1 < buf.len() => match buf[pos + 1] {
+                '\'' => {
+                    quoted = true;
+                    pos = skip_ansi_quote(buf, pos + 2);
+                }
+                '"' => {
+                    quoted = true;
+                    pos = skip_double_quote(buf, pos + 1);
+                }
+                '(' => pos = skip_dollar_paren(buf, pos),
+                '{' => pos = skip_dollar_brace(buf, pos),
+                _ => pos += 1,
+            },
+            // parse.y:5464-5477: `extended_glob && PATTERN_CHAR (character)'
+            // with a peeked `(' — parse_matched_pair splices the whole
+            // `(...)' into the token and the word continues after it.
+            '@' | '*' | '+' | '?' | '!' if extglob && matches!(buf.get(pos + 1), Some('(')) => {
+                pos = skip_matched_paren(buf, pos + 1);
+            }
+            _ => pos += 1,
+        }
+    }
+    (pos, quoted)
+}
+
+/// parse_matched_pair (parse.y:3877) over one `(...)` unit: `buf[pos]` is
+/// the `('; skips quotes, escapes, and nested pairs; returns the index
+/// just past the matching `)'. An unbalanced opener swallows the rest of
+/// the input — the downstream parser reports the syntax error GNU raises
+/// as matched_pair_error.
+fn skip_matched_paren(buf: &[char], mut pos: usize) -> usize {
+    let mut depth = 1usize;
+    while pos < buf.len() {
+        match buf[pos] {
+            '\\' => pos = (pos + 2).min(buf.len()),
+            '\'' => pos = skip_single_quote(buf, pos),
+            '"' => pos = skip_double_quote(buf, pos),
+            '`' => pos = skip_backtick(buf, pos),
+            '(' => {
+                depth += 1;
+                pos += 1;
+            }
+            ')' => {
+                depth -= 1;
+                pos += 1;
+                if depth == 0 {
+                    return pos;
+                }
+            }
+            _ => pos += 1,
+        }
+    }
+    pos
+}
+
+fn skip_single_quote(buf: &[char], mut pos: usize) -> usize {
+    pos += 1;
+    while pos < buf.len() && buf[pos] != '\'' {
+        pos += 1;
+    }
+    (pos + 1).min(buf.len())
+}
+
+fn skip_ansi_quote(buf: &[char], mut pos: usize) -> usize {
+    while pos < buf.len() {
+        match buf[pos] {
+            '\\' => pos = (pos + 2).min(buf.len()),
+            '\'' => return pos + 1,
+            _ => pos += 1,
+        }
+    }
+    pos
+}
+
+fn skip_double_quote(buf: &[char], mut pos: usize) -> usize {
+    pos += 1;
+    while pos < buf.len() {
+        match buf[pos] {
+            '\\' => pos = (pos + 2).min(buf.len()),
+            '"' => return pos + 1,
+            '`' => pos = skip_backtick(buf, pos),
+            '$' if pos + 1 < buf.len() && buf[pos + 1] == '(' => {
+                pos = skip_dollar_paren(buf, pos);
+            }
+            '$' if pos + 1 < buf.len() && buf[pos + 1] == '{' => {
+                pos = skip_dollar_brace(buf, pos);
+            }
+            _ => pos += 1,
+        }
+    }
+    pos
+}
+
+fn skip_backtick(buf: &[char], mut pos: usize) -> usize {
+    pos += 1;
+    while pos < buf.len() {
+        match buf[pos] {
+            '\\' => pos = (pos + 2).min(buf.len()),
+            '`' => return pos + 1,
+            _ => pos += 1,
+        }
+    }
+    pos
+}
+
+/// GNU expands aliases while reading a `$(...)` body — parse_comsub feeds
+/// the same token reader, so alias_expand_token applies inside the
+/// substitution (comsub5.sub: `alias switch=case` + `$( switch foo in foo)
+/// ...)` runs to the `)` after `esac`, not `foo)`). The substitution's
+/// extent is therefore decided on post-alias text; iterate because a splice
+/// can move the close paren (`case` protects a mid-body `)`, and an alias
+/// can contribute the closing `)` itself: `short='echo ok 8 )'`).
+/// `'` bodies and `\` escapes hide `$(`; `"` and `` ` `` interiors do not.
+fn expand_comsub_alias_bodies(source: &str, lookup: &AliasLookup<'_>, posix: bool) -> String {
+    if !source.contains("$(")
+        && !source.contains("${ ")
+        && !source.contains("${\t")
+        && !source.contains("${\n")
+        && !source.contains("${|")
+    {
+        return source.to_string();
+    }
+    let mut chars: Vec<char> = source.chars().collect();
+    let mut pos = 0usize;
+    let mut in_double = false;
+    let mut changed = false;
+    while pos < chars.len() {
+        match chars[pos] {
+            '\\' => pos = (pos + 2).min(chars.len()),
+            '\'' if !in_double => pos = skip_single_quote(&chars, pos),
+            '"' => {
+                in_double = !in_double;
+                pos += 1;
+            }
+            '`' if !in_double => pos = skip_backtick(&chars, pos),
+            '$' if chars.get(pos + 1) == Some(&'(') => {
+                pos = splice_substitution_body(
+                    &mut chars,
+                    pos,
+                    lookup,
+                    posix,
+                    &mut changed,
+                    |chars, open| crate::lexer::skip_parenthesized_unit_corrected(chars, open),
+                );
+            }
+            // Bash 5.3 funsub (parser.h:85, the live `#else' arm of
+            // FUNSUB_CHAR, parse.y:5506): `${ ' followed by blank, newline
+            // or `|' parses a command list like `$(` — its body gets the
+            // same one-pass expansion. A `(' right after `${' is NOT a
+            // funsub opener (the parser.h:83 spelling listing `(' is `#if 0'
+            // dead code): `${(M)x}' stays parameter text for
+            // parse_matched_pair (parse.y:5513) and fails at expansion time.
+            '$' if chars.get(pos + 1) == Some(&'{')
+                && chars
+                    .get(pos + 2)
+                    .is_some_and(|c| matches!(c, ' ' | '\t' | '\n' | '|')) =>
+            {
+                pos = splice_substitution_body(
+                    &mut chars,
+                    pos,
+                    lookup,
+                    posix,
+                    &mut changed,
+                    skip_funsub_body,
+                );
+            }
+            _ => pos += 1,
+        }
+    }
+    if changed {
+        chars.into_iter().collect()
+    } else {
+        source.to_string()
+    }
+}
+
+/// Shared body expansion for `$(` and `${ `: expand the body in ONE pass —
+/// alias chains already resolve inside expand_aliases_in_source via
+/// pushed-text boundaries. Expansion can move the closer's extent (e.g.
+/// `switch`→`case` makes a following `foo)` case syntax, not the closer);
+/// the freshly included tail is then new input and gets its own pass.
+/// Already-spliced text is never rescanned — a self-referential alias must
+/// not fire twice (AL_BEINGEXPANDED, parse.y:3259): `let` → `let --`
+/// stays. The loop is bounded so an unclosed body cannot spin.
+/// `extent(chars, open)` returns the index just past the closer, like
+/// skip_parenthesized_unit_corrected.
+fn splice_substitution_body(
+    chars: &mut Vec<char>,
+    pos: usize,
+    lookup: &AliasLookup<'_>,
+    posix: bool,
+    changed: &mut bool,
+    extent: fn(&[char], usize) -> Option<usize>,
+) -> usize {
+    let open = pos + 1;
+    let body_end = extent(chars, open)
+        .unwrap_or(chars.len() + 1)
+        .saturating_sub(1)
+        .min(chars.len());
+    let body: String = chars[open + 1..body_end].iter().collect();
+    let expanded = expand_aliases_in_source(&body, lookup, posix);
+    if expanded != body {
+        chars.splice(open + 1..body_end, expanded.chars());
+        *changed = true;
+    }
+    let mut consumed = expanded.chars().count();
+    for _ in 0..8 {
+        let new_end = extent(chars, open)
+            .unwrap_or(chars.len() + 1)
+            .saturating_sub(1)
+            .min(chars.len());
+        let tail_start = open + 1 + consumed;
+        if new_end <= tail_start || tail_start >= chars.len() {
+            break;
+        }
+        let tail: String = chars[tail_start..new_end].iter().collect();
+        let tail_expanded = expand_aliases_in_source(&tail, lookup, posix);
+        if tail_expanded == tail {
+            break;
+        }
+        chars.splice(tail_start..new_end, tail_expanded.chars());
+        *changed = true;
+        consumed += tail_expanded.chars().count();
+    }
+    let end = extent(chars, open).unwrap_or(chars.len() + 1);
+    end.max(pos + 2).min(chars.len())
+}
+
+/// Extent of a `${ command; }' funsub body: `open` is the index of `{` —
+/// scan to the `}` that returns depth to 0, skipping quoted spans and
+/// escape pairs (mirrors Lexer::skip_braced's funsub branch, skip.rs).
+/// GNU parse.y:4451 parse_comsub parses the body with the real parser, so
+/// the closing `}` must be a LONE WORD in command position
+/// (parse.y:3465-3468 special_case_tokens +
+/// reserved_word_acceptable): after `;', `&', `|', a newline, or a closed
+/// `{ }'/`( )' command construct, and with a word-breaking char (or end
+/// of input) following. Returns the index just past the closing `}`.
+fn skip_funsub_body(chars: &[char], open: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut index = open + 1;
+    let mut single = false;
+    let mut double = false;
+    // Command position: true at body start and after a command terminator
+    // (`;` `&` `|` newline) or a closed `{ }` group / `( )` subshell.
+    let mut term = true;
+    let mut paren_depth = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' && !single {
+            if !double {
+                term = false;
+            }
+            index += 2;
+            continue;
+        }
+        if single {
+            if ch == '\'' {
+                single = false;
+            }
+            index += 1;
+            continue;
+        }
+        if double {
+            if ch == '"' {
+                double = false;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            '$' => {
+                // parse.y:5494 read_token_word (shellexp branch): `$'
+                // followed by `{', `(' or `'' is consumed as ONE unit at
+                // ANY word position — no command-position gate, unlike the
+                // bare `{' group opener below. A nested `${ ... }' inside
+                // the funsub body therefore never opens a bare brace group
+                // and its matching `}' never terminates the body; only a
+                // word BEGINNING with `}' does (parse.y:5400-5416).
+                // Without this arm `${ echo X${ echo nested; }Y; }' ended
+                // the outer body at the inner funsub's `}' (341bf41b
+                // follow-up; the same rule lives in skip.rs,
+                // command_substitution.rs and embedded_mutations.rs).
+                index = match chars.get(index + 1) {
+                    Some('{')
+                        if chars
+                            .get(index + 2)
+                            .is_some_and(|c| *c == '|' || c.is_whitespace()) =>
+                    {
+                        skip_funsub_body(chars, index + 1).unwrap_or(chars.len())
+                    }
+                    Some('{') => skip_dollar_brace(chars, index),
+                    Some('(') => skip_dollar_paren(chars, index),
+                    Some('\'') => skip_ansi_quote(chars, index),
+                    _ => {
+                        term = false;
+                        index + 1
+                    }
+                };
+                term = false;
+                continue;
+            }
+            '\'' => {
+                single = true;
+                term = false;
+            }
+            '"' => {
+                double = true;
+                term = false;
+            }
+            '(' => {
+                paren_depth += 1;
+                term = false;
+            }
+            ')' if paren_depth > 0 => {
+                paren_depth -= 1;
+                term = paren_depth == 0;
+            }
+            '{' if term && paren_depth == 0 => {
+                depth += 1;
+                term = true;
+            }
+            '}' if term && paren_depth == 0 => {
+                // parse.y:5407-5416: a word beginning with `}` in command
+                // position terminates the substitution; term==false covers
+                // mid-word `}` (`a}b`, `\"}`) as word text.
+                if depth > 1 {
+                    depth -= 1;
+                    term = true;
+                    index += 1;
+                    continue;
+                }
+                return Some(index + 1);
+            }
+            ';' | '&' | '|' | '\n' if paren_depth == 0 => term = true,
+            ' ' | '\t' | '\r' => {}
+            _ => term = false,
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Skip `$( ... )` honoring nested parens and quoting. Case patterns with
+/// unbalanced `)` inside the substitution are approximated by depth only.
+fn skip_dollar_paren(buf: &[char], mut pos: usize) -> usize {
+    pos += 2;
+    let mut depth = 1usize;
+    while pos < buf.len() && depth > 0 {
+        match buf[pos] {
+            '\\' => pos = (pos + 2).min(buf.len()),
+            '\'' => pos = skip_single_quote(buf, pos),
+            '"' => pos = skip_double_quote(buf, pos),
+            '`' => pos = skip_backtick(buf, pos),
+            '(' => {
+                depth += 1;
+                pos += 1;
+            }
+            ')' => {
+                depth -= 1;
+                pos += 1;
+            }
+            _ => pos += 1,
+        }
+    }
+    pos
+}
+
+fn skip_dollar_brace(buf: &[char], mut pos: usize) -> usize {
+    pos += 2;
+    let mut depth = 1usize;
+    while pos < buf.len() && depth > 0 {
+        match buf[pos] {
+            '\\' => pos = (pos + 2).min(buf.len()),
+            '\'' => pos = skip_single_quote(buf, pos),
+            '"' => pos = skip_double_quote(buf, pos),
+            '{' => {
+                depth += 1;
+                pos += 1;
+            }
+            '}' => {
+                depth -= 1;
+                pos += 1;
+            }
+            _ => pos += 1,
+        }
+    }
+    pos
+}
+
+/// Match `(( ... ))` from `pos` (which points at the first `(`). Returns
+/// the index just past the closing `))`, or None for a nested subshell.
+fn match_dparen(buf: &[char], mut pos: usize) -> Option<usize> {
+    pos += 2;
+    let mut depth = 2usize;
+    while pos < buf.len() {
+        match buf[pos] {
+            '\\' => pos = (pos + 2).min(buf.len()),
+            '\'' => pos = skip_single_quote(buf, pos),
+            '"' => pos = skip_double_quote(buf, pos),
+            '`' => pos = skip_backtick(buf, pos),
+            '(' => {
+                depth += 1;
+                pos += 1;
+            }
+            ')' => {
+                depth -= 1;
+                pos += 1;
+                if depth == 0 {
+                    return Some(pos);
+                }
+            }
+            _ => pos += 1,
+        }
+    }
+    None
+}
+
+/// Length of a redirection operator at `pos` (`buf[pos]` is `<` or `>`).
+fn redir_op_len(buf: &[char], pos: usize) -> usize {
+    let c = buf[pos];
+    let next = buf.get(pos + 1).copied();
+    let third = buf.get(pos + 2).copied();
+    match (c, next, third) {
+        ('<', Some('<'), Some('<')) => 3, // <<<
+        ('<', Some('<'), Some('-')) => 3, // <<-
+        ('<', Some('<'), _) => 2,         // <<
+        ('>', Some('>'), _) => 2,         // >>
+        ('<', Some('&'), _) => 2,         // <&
+        ('>', Some('&'), _) => 2,         // >&
+        ('<', Some('>'), _) => 2,         // <>
+        ('>', Some('|'), _) => 2,         // >|
+        _ => 1,
+    }
+}
+
+/// Strip quote syntax from a heredoc delimiter word for the body-line
+/// comparison (parse.y: the delimiter is remembered dequoted; a quoted
+/// delimiter only suppresses body expansion, not matching).
+///
+/// rubash#738: this used to drop every `\` along with the quote characters,
+/// so `<<E\'OF` compared against `EOF` and the heredoc ran to EOF. The
+/// shared helper performs GNU quote removal instead (an escaped character
+/// stays literal).
+fn dequote_heredoc_delimiter(word: &str) -> String {
+    super::dequote_heredoc_delimiter(word)
+}
+
+/// `{name}` redirection target prefix (exec {fd}>file).
+fn is_var_redir_name(word: &str) -> bool {
+    word.len() > 2
+        && word.starts_with('{')
+        && word.ends_with('}')
+        && word[1..word.len() - 1]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// GNU general.c assignment(): NAME=, NAME+=, NAME[subscript]= — the
+/// value may be empty and the subscript may contain anything balanced.
+fn is_assignment_syntax(word: &str) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    let mut i = 0usize;
+    if i >= chars.len() || !(chars[i].is_ascii_alphabetic() || chars[i] == '_') {
+        return false;
+    }
+    while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+        i += 1;
+    }
+    if i < chars.len() && chars[i] == '[' {
+        // Skip a bracketed subscript (may itself contain quotes/brackets).
+        let mut depth = 0usize;
+        while i < chars.len() {
+            match chars[i] {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    if i < chars.len() && chars[i] == '+' {
+        i += 1;
+    }
+    i < chars.len() && chars[i] == '='
+}

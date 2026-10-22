@@ -1,0 +1,3798 @@
+use super::*;
+use crate::executor::markers::STORAGE_WORD_PREFIX;
+
+impl Executor {
+    pub(in crate::executor) fn set_fd_input_text(&mut self, fd: u32, input: String, dynamic: bool) {
+        // input is shell text: decode marker pairs back to the raw bytes
+        // the fd byte channel carries (set_fd_input_bytes re-encodes for
+        // the text env mirror, so into_bytes() here would double-encode).
+        self.set_fd_input_bytes(
+            fd,
+            crate::executor::substitution_metadata::shell_text_to_raw_bytes(&input),
+            dynamic,
+        );
+    }
+
+    pub(in crate::executor) fn set_fd_input_bytes(
+        &mut self,
+        fd: u32,
+        input: Vec<u8>,
+        dynamic: bool,
+    ) {
+        self.fd_table
+            .open_input(fd, FdReadEndpoint::bytes(input.clone()), dynamic);
+        self.shell_state.env_vars.insert(
+            fd_stdin_key(fd),
+            crate::executor::substitution_metadata::bytes_to_shell_text(&input),
+        );
+        self.shell_state
+            .env_vars
+            .insert(fd_stdin_offset_key(fd), "0".to_string());
+        if dynamic {
+            self.shell_state
+                .env_vars
+                .insert(fd_dynamic_input_key(fd), "1".to_string());
+        } else {
+            self.shell_state.env_vars.remove(&fd_dynamic_input_key(fd));
+        }
+        self.shell_state.env_vars.remove(&fd_closed_key(fd));
+    }
+
+    /// `exec N<file` — install a real kernel handle in the slot instead of
+    /// snapshotting file contents. The endpoint's Rc is shared by every
+    /// `N<&M` duplicate and by subshell table clones, so the file offset is
+    /// shared exactly like GNU's open file description (redir.c dup2 /
+    /// execute_cmd.c execute_in_subshell fd inheritance).
+    pub(in crate::executor) fn set_fd_input_file(
+        &mut self,
+        fd: u32,
+        file: Rc<FileFd>,
+        dynamic: bool,
+    ) {
+        self.fd_table
+            .open_input(fd, FdReadEndpoint::File(file), dynamic);
+        self.shell_state.env_vars.remove(&fd_closed_key(fd));
+        self.shell_state.env_vars.remove(&fd_stdin_key(fd));
+        self.shell_state.env_vars.remove(&fd_stdin_offset_key(fd));
+        if dynamic {
+            self.shell_state
+                .env_vars
+                .insert(fd_dynamic_input_key(fd), "1".to_string());
+        } else {
+            self.shell_state.env_vars.remove(&fd_dynamic_input_key(fd));
+        }
+    }
+
+    /// `[N]<>file` — one O_RDWR handle feeding both directions of the slot
+    /// (GNU redir.c r_input_output opens a single descriptor).
+    pub(in crate::executor) fn set_fd_readwrite_file(
+        &mut self,
+        fd: u32,
+        target: &str,
+        dynamic: bool,
+    ) -> std::io::Result<()> {
+        let path = shell_path_to_windows(target, &self.shell_state.env_vars);
+        let file = FileFd::open_readwrite(path)?;
+        self.set_fd_input_file(fd, file.clone(), dynamic);
+        self.fd_table
+            .open_output(fd, FdWriteEndpoint::File(file), dynamic);
+        self.shell_state.env_vars.remove(&fd_closed_key(fd));
+        self.shell_state
+            .env_vars
+            .remove(&fd_output_process_substitution_key(fd));
+        self.shell_state
+            .env_vars
+            .insert(fd_output_key(fd), target.to_string());
+        Ok(())
+    }
+
+    /// `exec N>file` / `N>>file` — hold the real write handle on the slot.
+    /// `append` selects FILE_APPEND_DATA (GNU O_APPEND); truncation /
+    /// noclobber checks must have run already (create_redirect_output).
+    pub(in crate::executor) fn set_fd_output_file(
+        &mut self,
+        fd: u32,
+        target: String,
+        dynamic: bool,
+        append: bool,
+    ) -> std::io::Result<()> {
+        let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+        let file = FileFd::open_write(path, append, false)
+            .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+        self.fd_table
+            .open_output(fd, FdWriteEndpoint::File(file), dynamic);
+        self.shell_state.env_vars.remove(&fd_closed_key(fd));
+        self.shell_state
+            .env_vars
+            .remove(&fd_output_process_substitution_key(fd));
+        self.shell_state.env_vars.insert(fd_output_key(fd), target);
+        Ok(())
+    }
+
+    /// GNU `r_err_and_out`/`r_append_err_and_out` (redir.c:832-838,
+    /// do_redirection_internal): `>&word`/`&>word` open the file once and
+    /// dup2 it onto fd 2 — both descriptors refer to the same open file
+    /// description and share one file offset. Opening the path twice
+    /// gives two offsets, so the second write overwrites the first at
+    /// offset 0 (redir4.sub: `exec >&file; echo to stdout; echo to
+    /// stderr >&2` must produce both lines, not just stderr's).
+    pub(in crate::executor) fn share_fd_output_file(
+        &mut self,
+        source_fd: u32,
+        fd: u32,
+        target: &str,
+        dynamic: bool,
+    ) {
+        if let Some(endpoint) = self.fd_table.write_endpoint(source_fd) {
+            self.fd_table.open_output(fd, endpoint, dynamic);
+        }
+        self.shell_state.env_vars.remove(&fd_closed_key(fd));
+        self.shell_state
+            .env_vars
+            .remove(&fd_output_process_substitution_key(fd));
+        self.shell_state
+            .env_vars
+            .insert(fd_output_key(fd), target.to_string());
+    }
+
+    pub(in crate::executor) fn execute_eval(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<(), ExecuteError> {
+        let mut stderr = Vec::new();
+        let args = cmd.words[1..].to_vec();
+        match crate::builtins::eval::execute_with_io(
+            args.iter().map(String::as_str),
+            &self.diagnostic_prefix(),
+            &mut stderr,
+        )? {
+            crate::builtins::eval::EvalAction::Complete(status) => {
+                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                self.exit_code = status;
+                Ok(())
+            }
+            crate::builtins::eval::EvalAction::Execute(source) => {
+                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                let source = eval_source_for_reparse(&source);
+                // GNU parse.y: EOF inside a matched-pair construct of the
+                // eval string reports "unexpected EOF while looking for
+                // matching `X'" naming the innermost close delimiter
+                // (eval3.sub: `eval 'x() { _;}>_[${' -> "eval: line N:
+                // unexpected EOF while looking for matching `}'"). The
+                // probe runs on the raw eval text: GNU's parser sees the
+                // string as written, before alias expansion splices bodies
+                // (which can consume `${ $() }' text and hide the error).
+                // Heredoc bodies are raw text, so inputs carrying `<<` skip
+                // this probe like the script driver does.
+                if !source.contains("<<") {
+                    // rubash#318/#333: an unclosed `(' in the eval string is
+                    // NOT the generic close-char shape. GNU re-parses the
+                    // string as fresh parser input continuing the caller's
+                    // line counter (evalstring.c:345-357), and the failure
+                    // class decides both the diagnostic and the abort:
+                    //
+                    // 1. A token error inside a comsub body (`$(echo (`)
+                    //    fails the comsub's own yyparse and parse.y:4588-
+                    //    4596 jumps FORCE_EOF — exit 1, nothing after the
+                    //    eval, no `command' gate.
+                    // 2. A token error inside a compound-assignment list
+                    //    (`x=((`) dies the same way in posix mode
+                    //    (parse.y:7173-7179, exit 1) and is otherwise
+                    //    contained with eval status 1 (DISCARD arm).
+                    // 3. Everything else — an unclosed comsub at EOF
+                    //    (parse.y:4576-4587 returns matched_pair_error
+                    //    without jumping), a plain subshell at the main
+                    //    level, or a main-level token error — fails the
+                    //    MAIN yyparse into evalstring.c:584-600. That arm
+                    //    only exits when posixly_correct AND the builtin is
+                    //    eval/source AND NOT under `command'
+                    //    (executing_command_builtin, execute_cmd.c:4735):
+                    //    ERREXIT exit 2 before the || branch runs. In every
+                    //    other case the error is CONTAINED to the eval
+                    //    string — push_stream/pop_stream clear EOF_Reached
+                    //    per stream (parse.y:1908/1915), so it can never
+                    //    stop the outer script's reader by itself.
+                    if let Some((shape, open_line)) =
+                        crate::lexer::unclosed_comsub_eof_shape(&source)
+                    {
+                        let caller_line: usize = self
+                            .shell_state
+                            .env_vars
+                            .get("__RUBASH_CURRENT_LINE")
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1);
+                        // evalstring.c:359-451: complete commands before the
+                        // failing construct's line already ran.
+                        if open_line > 1 {
+                            let prefix = source
+                                .lines()
+                                .take(open_line - 1)
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !prefix.trim().is_empty() {
+                                self.execute_eval_source(&prefix, caller_line, cmd)?;
+                            }
+                        }
+                        let saved_eval_context = self
+                            .shell_state
+                            .env_vars
+                            .insert("__RUBASH_EVAL_CONTEXT".to_string(), "1".to_string());
+                        let diagnostic = match &shape {
+                            crate::lexer::UnclosedComsubShape::ComsubBodyTokenError {
+                                line,
+                                token,
+                            } => {
+                                // parse.y:6858-6865 with shell_eof_token==')'
+                                // (parse.y:4519): the paren shifted as a
+                                // function-definition candidate, the NEXT
+                                // token named, plus the offending source
+                                // line, all at the paren's line.
+                                let report = caller_line + line - 1;
+                                let prefix = self.parser_diagnostic_prefix_for_line(report);
+                                let offending =
+                                    source.lines().nth(line - 1).unwrap_or_default().to_string();
+                                format!(
+                                    "{prefix}syntax error near unexpected token `{token}' while looking for matching `)'\n{prefix}`{offending}'\n"
+                                )
+                            }
+                            crate::lexer::UnclosedComsubShape::ComsubEof { line } => format!(
+                                "{}unexpected EOF while looking for matching `)'\n",
+                                self.parser_diagnostic_prefix_for_line(caller_line + line)
+                            ),
+                            crate::lexer::UnclosedComsubShape::PlainSubshellEof {
+                                line,
+                                open_line,
+                            } => {
+                                // y.tab.c:9258-9260: the bash-5.3 compoundcmd
+                                // EOF report — a plain `(` leaves
+                                // shell_eof_token == 0, so yyerror's EOF
+                                // branch names the construct instead of a
+                                // close delimiter. Reported at one past the
+                                // last input line; the `('s line is in the
+                                // message text.
+                                format!(
+                                    "{}syntax error: unexpected end of file from `(' command on line {}\n",
+                                    self.parser_diagnostic_prefix_for_line(caller_line + line),
+                                    caller_line + open_line - 1
+                                )
+                            }
+                            crate::lexer::UnclosedComsubShape::MainLevelTokenError {
+                                line,
+                                token,
+                            } => {
+                                // y.tab.c:9208-9215 yyerror branch 1 with
+                                // shell_eof_token == 0: same token naming as
+                                // the comsub class but WITHOUT the
+                                // "while looking for matching" suffix.
+                                let report = caller_line + line - 1;
+                                let prefix = self.parser_diagnostic_prefix_for_line(report);
+                                let offending =
+                                    source.lines().nth(line - 1).unwrap_or_default().to_string();
+                                format!(
+                                    "{prefix}syntax error near unexpected token `{token}'\n{prefix}`{offending}'\n"
+                                )
+                            }
+                            crate::lexer::UnclosedComsubShape::CompassignTokenError { line } => {
+                                // parse.y:7141-7151: the compound-assignment
+                                // word list rejects the `(' itself.
+                                let report = caller_line + line - 1;
+                                let prefix = self.parser_diagnostic_prefix_for_line(report);
+                                let offending =
+                                    source.lines().nth(line - 1).unwrap_or_default().to_string();
+                                format!(
+                                    "{prefix}syntax error near unexpected token `('\n{prefix}`{offending}'\n"
+                                )
+                            }
+                        };
+                        let write_result =
+                            self.write_buffered_builtin_output(cmd, &[], diagnostic.as_bytes());
+                        match saved_eval_context {
+                            Some(previous) => {
+                                self.shell_state
+                                    .env_vars
+                                    .insert("__RUBASH_EVAL_CONTEXT".to_string(), previous);
+                            }
+                            None => {
+                                self.shell_state.env_vars.remove("__RUBASH_EVAL_CONTEXT");
+                            }
+                        }
+                        write_result?;
+                        let posix_mode =
+                            self.get_env("__RUBASH_POSIX_MODE").as_deref() == Some("1");
+                        let interactive = self
+                            .shell_state
+                            .env_vars
+                            .get("__RUBASH_INTERACTIVE")
+                            .map(String::as_str)
+                            == Some("1");
+                        // evalstring.c:588-595: the ONLY exit for a
+                        // main-grammar parse error in the eval'd string —
+                        // non-interactive + posix + bare eval/source (not
+                        // under `command`). ERREXIT unwinds before the ||
+                        // branch runs (GNU probes p3/p5a/p8a/p17/p18: rc 2,
+                        // empty stdout).
+                        let posix_errexit =
+                            posix_mode && !interactive && self.command_builtin_depth == 0;
+                        match shape {
+                            // parse.y:4588-4596: the comsub body's own
+                            // yyparse failed (r != 0) — FORCE_EOF exits 1
+                            // with no `command' gate (GNU probes p12a-c:
+                            // `command eval '$(echo ('` dies rc 1 too). The
+                            // status is stored like exit.def does so the
+                            // grouped reader's break keeps it as the shell's
+                            // exit status.
+                            crate::lexer::UnclosedComsubShape::ComsubBodyTokenError { .. } => {
+                                self.exit_code = 1;
+                                return Err(ExecuteError::ExitCode(1));
+                            }
+                            // parse.y:7173-7179: a token error inside a
+                            // compound assignment — posix dies rc 1 with no
+                            // `command' gate (GNU probe p24), otherwise the
+                            // DISCARD arm contains it with status 1.
+                            crate::lexer::UnclosedComsubShape::CompassignTokenError { .. } => {
+                                // error.c:324-327: a parser_error printed
+                                // while errexit is live exits 2 before the
+                                // FORCE_EOF/DISCARD decision.
+                                if self.errexit_enabled() && self.errexit_is_active() {
+                                    self.exit_code = 2;
+                                    return Err(ExecuteError::ExitCode(2));
+                                }
+                                if posix_mode && !interactive {
+                                    self.exit_code = 1;
+                                    return Err(ExecuteError::ExitCode(1));
+                                }
+                                self.exit_code = 1;
+                                return Ok(());
+                            }
+                            // Main-grammar parse errors: contained to the
+                            // eval string (never a reader abort — pop_stream
+                            // clears EOF_Reached, parse.y:1915), except the
+                            // posix ERREXIT gate above. eval returns 2
+                            // (EX_BADUSAGE, evalstring.c:586).
+                            _ => {
+                                if self.errexit_enabled() && self.errexit_is_active() {
+                                    self.exit_code = 2;
+                                    return Err(ExecuteError::ExitCode(2));
+                                }
+                                if posix_errexit {
+                                    self.exit_code = 2;
+                                    return Err(ExecuteError::ExitCode(2));
+                                }
+                                self.exit_code = 2;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    let eval_posix = self.get_env("__RUBASH_POSIX_MODE").as_deref() == Some("1");
+                    if let Some(unclosed) =
+                        crate::lexer::unclosed_input_close_char_posix(&source, eval_posix)
+                    {
+                        let (close, open_line, eof_line, report_open, array_list) = (
+                            unclosed.close,
+                            unclosed.open_line,
+                            unclosed.eof_line,
+                            unclosed.report_open,
+                            unclosed.array_list,
+                        );
+                        // GNU eval continues the caller's line numbering:
+                        // eval-input line i sits at caller_line+i-1;
+                        // quote/arithmetic constructs report their open line,
+                        // while `}'/`)' report the end-of-input line
+                        // (parse.y:3912 start_lineno vs 6891 line_number).
+                        let caller_line: usize = self
+                            .shell_state
+                            .env_vars
+                            .get("__RUBASH_CURRENT_LINE")
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1);
+                        // GNU's eval reader executes the complete input lines
+                        // before the line where the unclosed construct
+                        // opened; that line itself is part of the failed
+                        // parse and runs nothing.
+                        if open_line > 1 {
+                            let prefix = source
+                                .lines()
+                                .take(open_line - 1)
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !prefix.trim().is_empty() {
+                                self.execute_eval_source(&prefix, caller_line, cmd)?;
+                            }
+                        }
+                        let internal = if report_open {
+                            open_line.saturating_sub(1)
+                        } else {
+                            eof_line
+                        };
+                        let saved_eval_context = self
+                            .shell_state
+                            .env_vars
+                            .insert("__RUBASH_EVAL_CONTEXT".to_string(), "1".to_string());
+                        // GNU eval_builtin binds the builtin's redirections
+                        // before parse_and_execute reads the string
+                        // (redir.c do_redirection_internal), so the EOF
+                        // diagnostic honors eval's own `2>/dev/null` — route
+                        // it through the command's fd-2 endpoint instead of a
+                        // raw eprintln that bypasses every redirect
+                        // (rubash#167 family, seen from rubash#190).
+                        let diagnostic = format!(
+                            "{}unexpected EOF while looking for matching `{close}'\n",
+                            self.parser_diagnostic_prefix_for_line(caller_line + internal)
+                        );
+                        self.write_buffered_builtin_output(cmd, &[], diagnostic.as_bytes())?;
+                        match saved_eval_context {
+                            Some(previous) => {
+                                self.shell_state
+                                    .env_vars
+                                    .insert("__RUBASH_EVAL_CONTEXT".to_string(), previous);
+                            }
+                            None => {
+                                self.shell_state.env_vars.remove("__RUBASH_EVAL_CONTEXT");
+                            }
+                        }
+                        // GNU error.c:324-327: this single-line diagnostic is
+                        // also a parser_error, so with live errexit the shell
+                        // exit_shell(2)s right after it — even inside a
+                        // function body — instead of returning eval's rc=2.
+                        if self.errexit_enabled() && self.errexit_is_active() {
+                            self.exit_code = 2;
+                            return Err(ExecuteError::ExitCode(2));
+                        }
+                        // rubash#318: an unclosed `name=(` compound list is
+                        // the parse_compound_assignment EOF family — eval
+                        // returns its exit 1 (verified vs WSL GNU 5.3.0:
+                        // `eval "x=("` -> rc 1), like the script-level path
+                        // (parse.y:7140-7152). In posix mode the failure is
+                        // fatal instead: parse.y:7173-7179 jumps FORCE_EOF
+                        // with status 1 and NO `command'-builtin gate (GNU
+                        // probe p13/p24: `command eval 'x=('` posix dies
+                        // rc 1, nothing after the eval runs), while
+                        // non-posix keeps the DISCARD containment (p6b).
+                        if array_list && eval_posix {
+                            self.exit_code = 1;
+                            return Err(ExecuteError::ExitCode(1));
+                        }
+                        self.exit_code = if array_list { 1 } else { 2 };
+                        return Ok(());
+                    }
+                }
+                // GNU parse.y re-reads the eval string as parser input, so
+                // alias expansion applies at command position
+                // (parse.y alias_expand_token / push_string; comsub21.sub
+                // `eval my_alias` inside a substitution body expands here).
+                let source = self.comsub_body_alias_splice(&source);
+                // GNU eval continues the caller's line numbering: eval-input
+                // line i sits at script line caller_line+i-1, and EOF inside
+                // the input reports at one past the last input line.
+                let caller_line: usize = self
+                    .shell_state
+                    .env_vars
+                    .get("__RUBASH_CURRENT_LINE")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1);
+                self.execute_eval_source(&source, caller_line, cmd)
+            }
+        }
+    }
+
+    /// Reparse and execute one eval-source string with the caller's line
+    /// numbering (GNU variables.c:parse_and_execute SEVAL flags; eval-input
+    /// line i sits at script line caller_line+i-1).
+    ///
+    /// rubash#817: the string is its own read unit — evalstring.c
+    /// parse_and_execute pushes it as fresh parser input — so alias
+    /// definitions inside record a fresh read-generation (enter_read_unit)
+    /// and an eval-body line that renumbers onto the caller's physical
+    /// line N must not collide with a use at the caller's line N (GNU
+    /// expands there: the definition was read in the eval string's stream,
+    /// earlier than the caller's token). The generation drops when the
+    /// string's execution returns, on every path.
+    fn execute_eval_source(
+        &mut self,
+        source: &str,
+        caller_line: usize,
+        cmd: &CommandNode,
+    ) -> Result<(), ExecuteError> {
+        let saved_read_generation = self.enter_read_unit();
+        let result = self.execute_eval_source_inner(source, caller_line, cmd);
+        self.exit_read_unit(saved_read_generation);
+        // rubash#846: eval runs its string as a fresh frame (GNU evalstring
+        // parse_and_execute) — an inner compound's own redirect failure
+        // arrives here as plain status, never flipped. Discard the mark;
+        // the caller judges by status only.
+        self.compound_redirect_failed.set(false);
+        result
+    }
+
+    fn execute_eval_source_inner(
+        &mut self,
+        source: &str,
+        caller_line: usize,
+        cmd: &CommandNode,
+    ) -> Result<(), ExecuteError> {
+        let mut tokens = crate::lexer::tokenize(source);
+        // GNU eval reports errors with the caller line numbering:
+        // the string lines continue the script line counter
+        // (posix2.tests: "eval: line 199: syntax error ...").
+        if caller_line > 1 {
+            for token in tokens.iter_mut() {
+                token.position += caller_line - 1;
+            }
+        }
+        let mut ast = crate::parser::parse_with_options(
+            &tokens,
+            crate::parser::ParseLoopOptions {
+                stray_close_is_error: true,
+                diagnostic_text: None,
+                source_text: Some(source.into()),
+                source_line_offset: caller_line.saturating_sub(1),
+            },
+        );
+        self.apply_command_output_redirects(cmd, &mut ast)?;
+        // A syntax error inside the eval string makes eval return 2;
+        // it does not abort the calling script the way a top-level
+        // parse error does. An inner exit still exits the shell, so
+        // only the parse-error marker (status 2) becomes a status.
+        let has_parse_error = ast
+            .commands
+            .iter()
+            .any(|command| command.has_assignment("__RUBASH_PARSE_ERROR__"));
+        let saved_eval_context = self
+            .shell_state
+            .env_vars
+            .insert("__RUBASH_EVAL_CONTEXT".to_string(), "1".to_string());
+        // eval re-reads its string as fresh parser input; the alias
+        // expansion GNU applies there (parse.y alias_expand_token)
+        // already ran on `source` above via comsub_body_alias_splice,
+        // so executor-level expansion must not fire a second time.
+        let saved_alias_streamed = self.mark_alias_streamed();
+        // GNU eval_builtin runs the reparsed body with eval's own
+        // redirections still bound (redir.c do_redirection_internal for the
+        // builtin's duration), so a body's `1>&3` resolves fd 3 to eval's
+        // `3>&1`, not the leaf's own fd 1.
+        let saved_eval_list_depth = self
+            .eval_list_depth
+            .replace(Some(self.evalerror_exec_depth.get() + 1));
+        let result =
+            self.with_compound_output_redirects(cmd, |executor| executor.execute_ast(&ast));
+        self.eval_list_depth.set(saved_eval_list_depth);
+
+        self.resume_alias_streamed(saved_alias_streamed);
+        match saved_eval_context {
+            Some(previous) => {
+                self.shell_state
+                    .env_vars
+                    .insert("__RUBASH_EVAL_CONTEXT".to_string(), previous);
+            }
+            None => {
+                self.shell_state.env_vars.remove("__RUBASH_EVAL_CONTEXT");
+            }
+        }
+        // GNU evalstring.c:579-599 (parse_and_execute parse-failure arm):
+        // a syntax error in the string being evaluated only `break`s the
+        // parse_and_execute loop and RETURNS EX_BADUSAGE to the builtin;
+        // `should_jump_to_top_level` fires solely when `posixly_correct`
+        // (evalstring.c:583-589). The eval'd parse-error diagnosis sets the
+        // executor's reader-abort flag (command_execute mark_parse_error on
+        // the __RUBASH_PARSE_ERROR__ node) on its way up; take it now so the
+        // containment below cannot leave it set — otherwise the script
+        // driver treats the eval'd parse error as a top-level syntax error
+        // and aborts the whole script instead of continuing with eval's
+        // rc=2 (rubash#306: `eval "echo >"` must not kill the caller).
+        // The flag also covers parse errors diagnosed in nested layers the
+        // top-level AST marker cannot see (comsub bodies inside the eval
+        // string, ast_exec last_command_substitution_parse_error), which
+        // GNU's single yyparse rejects wholesale before running anything.
+        let parse_error_raised_during_eval = self.take_parse_error();
+        // GNU error.c:324-327: a parse-error diagnostic printed while errexit
+        // was live already exit_shell(2)ed inside parser_error — before
+        // parse_and_execute's containment could see it. Such an error is a
+        // real shell exit, not eval's rc=2.
+        let parser_error_errexited = self.parser_error_errexited.take();
+        match result {
+            Err(ExecuteError::ExitCode(code))
+                if code == 2
+                    && !parser_error_errexited
+                    && (has_parse_error || parse_error_raised_during_eval) =>
+            {
+                self.exit_code = code;
+                Ok(())
+            }
+            // Same containment when an inner boundary already absorbed the
+            // error and execute_ast came back Ok with the flag set: GNU's
+            // parse-failure arm still breaks the eval loop with
+            // EX_BADUSAGE, never the caller's reader.
+            Ok(()) if parse_error_raised_during_eval && !parser_error_errexited => {
+                self.exit_code = 2;
+                Ok(())
+            }
+            // GNU evalstring.c:372 installs a local top_level catch for the
+            // string being evaluated ("prevents errors in substitution from
+            // restarting the reader loop directly"); its DISCARD arm
+            // (evalstring.c:423-450) runs the pe_dispose cleanup, forces
+            // last_command_exit_value = EXECUTION_FAILURE, and — outside a
+            // subshell — RETURNS from parse_and_execute instead of
+            // unwinding further. A bad substitution (or any DISCARD-class
+            // word-expansion failure) inside `eval '...'` therefore ends
+            // only the eval'd string: eval yields the failure status and
+            // the CALLER's remaining commands run — inside a function body
+            // `f() { eval 'x=${.sh.version}'; return 5; }` reaches the
+            // `return 5` (rubash#188), and at script top level the next
+            // line runs. The flat-subshell boundary in the eval'd list
+            // absorbs its own ExpansionFailure before it can reach here,
+            // matching GNU's forked-subshell re-jump.
+            Err(ExecuteError::ExpansionFailure(code)) => {
+                self.exit_code = code;
+                // rubash#753: the escaped Err can only be a failglob /
+                // redirect-no-match discard raised where the eval'd list's
+                // own dispatch could not consume it (a function body called
+                // from the string keeps function_depth > 0, so its frame
+                // absorbed the Err instead). GNU's evalstring DISCARD arm
+                // contains it here — drop the class flag (and the abandon
+                // it armed) so the caller's reader loop does not also skip
+                // its same-line commands (`f() { eval 'set -- nope*'; };
+                // f; echo after` prints `after`). Other classes keep their
+                // established escaping behavior (rubash#637/#639).
+                self.absorb_failglob_discard();
+                Ok(())
+            }
+            // GNU evalstring.c:365,422-442: a DISCARD-class word-expansion
+            // failure (failglob / redirect no-match, rubash#753) inside the
+            // eval'd string is caught at the eval boundary — eval returns
+            // the failure status and the CALLER's remaining commands run
+            // (`eval 'set -- /no/such/*.zzz'; echo K` prints K, verified
+            // GNU 5.3). The same-line skip inside the string already ran at
+            // the eval'd list level (`eval_list_depth` makes that list the
+            // discard boundary); this arm owns the trailing case — the
+            // failing command was the string's last, so the armed abandon
+            // survived the list — and must not leak into the caller's
+            // reader loop. The exit code is left alone: the failglob site
+            // already set 1, and a later line that ran fine yields eval rc
+            // 0, GNU's parse_and_execute loop semantics.
+            Ok(()) if self.absorb_failglob_discard() => Ok(()),
+            Ok(()) if self.evalerror_subscript_pending.replace(false) => {
+                // GNU evalstring.c:365,422-442: DISCARD inside the eval'd
+                // string is caught at the eval boundary — eval returns
+                // failure and the caller continues (rubash#637). Absorb
+                // exactly the bad-subscript class (armed alongside the
+                // abort); arithmetic and nounset failures keep escaping,
+                // and a real Err below propagates untouched. The exit code
+                // is left alone: it already holds the last status (a later
+                // line that ran fine yields eval rc 0, GNU's
+                // parse_and_execute loop semantics).
+                self.evalerror_pending.set(false);
+                self.evalerror_line.set(None);
+                Ok(())
+            }
+            other => {
+                // A real error outranks containment: drop a subscript mark
+                // the eval did not absorb so an outer eval cannot mistake
+                // it for its own string's failure. Plain Ok results never
+                // reach here with the mark set (the absorb arm above owns
+                // Ok+marked), so an ancestor eval's mark survives a nested
+                // successful eval untouched.
+                if other.is_err() {
+                    self.evalerror_subscript_pending.set(false);
+                }
+                // Not a contained parse error (e.g. a real `exit`): the
+                // parse-error flag raised inside the eval'd string keeps its
+                // abort meaning for the enclosing reader.
+                if parse_error_raised_during_eval {
+                    self.mark_parse_error();
+                }
+                other
+            }
+        }
+    }
+
+    pub fn run_exit_trap(&mut self) -> Result<i32, ExecuteError> {
+        self.run_exit_trap_for_status(self.exit_code)
+    }
+
+    pub fn run_exit_trap_with_status(&mut self, exit_status: i32) -> Result<i32, ExecuteError> {
+        self.run_exit_trap_for_status(exit_status)
+    }
+
+    pub(in crate::executor) fn run_exit_trap_for_status(
+        &mut self,
+        exit_status: i32,
+    ) -> Result<i32, ExecuteError> {
+        self.run_exit_trap_for_status_with_output_redirects(exit_status, None)
+    }
+
+    pub(in crate::executor) fn run_exit_trap_for_status_with_output_redirects(
+        &mut self,
+        exit_status: i32,
+        redirect_cmd: Option<&CommandNode>,
+    ) -> Result<i32, ExecuteError> {
+        let Some(action) = crate::builtins::trap::take_exit_trap(&mut self.shell_state.env_vars)
+        else {
+            return Ok(exit_status);
+        };
+        if action.is_empty() {
+            return Ok(exit_status);
+        }
+
+        self.exit_code = exit_status;
+        // GNU trap.c:1128 run_exit_trap saves the exiting status in
+        // trap_saved_exit_value before the action runs; a bare `exit`
+        // inside the EXIT action exits with that saved status
+        // (builtins/common.c get_exitstat, interp 1602). The exit path
+        // wipes the function/source nesting before the trap fires
+        // (execute_cmd.c:6090), and a bare `exit` inside a FUNCTION called
+        // by the EXIT action still exits with the saved status (GNU probes
+        // 2026-10-12: entry $? 5, `false` then bare `exit` -> 5, both at
+        // the action's own level and inside a called function) — so the
+        // context guard is open at every depth here, unlike ERR/RETURN
+        // (where a called function's bare exit uses the current $?
+        // instead; the C-level nesting bookkeeping behind the difference
+        // is not settled by the vendored source, so this cell is pinned
+        // behaviorally).
+        let prev_saved_exit = std::mem::replace(&mut self.trap_saved_exit_value, Some(exit_status));
+        let prev_saved_context = std::mem::replace(&mut self.trap_saved_exit_context, usize::MAX);
+        // A trap action is fresh parser input (parse.y alias_expand_token
+        // applies at its read); expand at stream level and mark the batch
+        // so executor-level expansion does not fire a second time.
+        let action = self.comsub_body_alias_splice(&action);
+        let tokens = crate::lexer::tokenize(&action);
+        let mut ast = crate::parser::parse(&tokens);
+        if let Some(redirect_cmd) = redirect_cmd {
+            self.apply_inherited_command_output_redirects(redirect_cmd, &mut ast)?;
+        }
+        let saved_trap_command = self.shell_state.debug_trap_command.borrow().clone();
+        let has_command = self.shell_state.debug_trap_command.borrow().is_none();
+        if has_command {
+            *self.shell_state.debug_trap_command.borrow_mut() = self
+                .shell_state
+                .env_vars
+                .get("__RUBASH_LAST_COMMAND")
+                .or_else(|| self.shell_state.env_vars.get("__RUBASH_CURRENT_COMMAND"))
+                .cloned();
+        }
+        let saved_alias_streamed = self.mark_alias_streamed();
+        // GNU trap.c run_exit_trap runs the action while the subshell's
+        // redirections are still in force — execute_in_subshell never undoes
+        // the child's do_redirections before run_exit_trap
+        // (execute_cmd.c:1576-1763). The caller runs this inside the scoped
+        // fd-table binding (with_command_input_redirects), so the action's
+        // output rides the same open file description as the body — no
+        // re-binding here, which would re-open `>file` and truncate what
+        // the body already wrote.
+        let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
+        self.resume_alias_streamed(saved_alias_streamed);
+        *self.shell_state.debug_trap_command.borrow_mut() = saved_trap_command;
+        self.trap_saved_exit_value = prev_saved_exit;
+        self.trap_saved_exit_context = prev_saved_context;
+        match result {
+            Ok(()) => {
+                self.exit_code = exit_status;
+                Ok(exit_status)
+            }
+            Err(ExecuteError::ExitCode(code)) => {
+                self.exit_code = code;
+                Ok(code)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Runs the DEBUG trap action before a command, mirroring Bash's
+    /// per-command debug hook. Nested executions of the trap action are
+    /// suppressed (Bash does not re-enter the DEBUG trap while an action
+    /// is running). `command_text` is the text of the command about to run,
+    /// exposed to the trap action through BASH_COMMAND like Bash does.
+    ///
+    /// Returns `Some(trap_status)` when the pending unit must be SKIPPED —
+    /// GNU's fire-site contract (execute_cmd.c:3057/3191/3532/3672/3924/
+    /// 4157/4510/5391): `debugging_mode && retval != EXECUTION_SUCCESS`,
+    /// i.e. only under extdebug and with ANY non-zero trap status. rubash's
+    /// old rule (status == 2 with no extdebug gate) failed both directions:
+    /// a status-1 trap under extdebug never skipped, and a status-2 trap
+    /// skipped without extdebug (issue #521). `$?` is preserved across the
+    /// firing (probe 2026-10-12: `trap 'false' DEBUG; true; echo $?` prints
+    /// 0); the action's status reaches the fire site through this return
+    /// value only.
+    pub(crate) fn run_debug_trap(
+        &mut self,
+        command_text: &str,
+    ) -> Result<Option<i32>, ExecuteError> {
+        if self.debug_trap_running || self.host_internal_depth.get() > 0 {
+            return Ok(None);
+        }
+        self.debug_trap_running = true;
+        // rubash#375: borrowing, allocation-free consult (GNU trap.c:1154
+        // reads trap_list[sig] once; the old path built a BTreeSet from the
+        // reset list and cloned the action string per firing).
+        let Some(action) =
+            crate::builtins::trap::active_trap_action_ref(&self.shell_state.env_vars, "DEBUG")
+        else {
+            self.debug_trap_running = false;
+            return Ok(None);
+        };
+        let saved_exit_code = self.exit_code;
+        // rubash#546 (cell 2): GNU get_bash_command (variables.c:1558) reads
+        // the_printed_command_except_trap, which the printer only refreshes
+        // while NO trap action is executing. Inside an ERR/DEBUG/signal/
+        // RETURN action the value stays frozen at whatever the trap fired
+        // with — the ERR action's entry DEBUG reports the FAILED command
+        // (`false`), never the action's own first command (probe
+        // 2026-10-12: `trap 'echo DEBUG: $BASH_COMMAND' DEBUG;
+        // trap 'echo ACT; false' ERR; false` GNU prints `DEBUG: false` for
+        // every in-action firing, not `DEBUG: echo ACT`).
+        let update_bash_command =
+            !(self.error_trap_running || self.signal_trap_running || self.return_trap_running);
+        if update_bash_command {
+            *self.shell_state.debug_trap_command.borrow_mut() = Some(command_text.to_string());
+        }
+        let call_line = self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_CURRENT_LINE")
+            .and_then(|line| line.parse::<usize>().ok());
+        // rubash#375: parse the action once per distinct spliced text (GNU
+        // parses at trap invocation, trap.c read_trap_action); per-firing
+        // tokenize+parse of a stable action is dead work. The AST is taken
+        // out of the cache cell, re-stamped and executed, then put back —
+        // no clone on the per-firing path.
+        let action = self.comsub_body_alias_splice(action);
+        let mut ast = {
+            let taken = self.debug_trap_action_cache.borrow_mut().take();
+            match taken {
+                Some((key, cached_ast)) if key == action => cached_ast,
+                _ => {
+                    let tokens = crate::lexer::tokenize(&action);
+                    crate::parser::parse(&tokens)
+                }
+            }
+        };
+        if let Some(call_line) = call_line {
+            for command in &mut ast.commands {
+                command.line = Some(call_line);
+            }
+        }
+        let saved_alias_streamed = self.mark_alias_streamed();
+        let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
+        // Cache the (re-stamped) AST under its spliced text for the next
+        // firing; the stamps are unconditionally overwritten by every
+        // firing's `command.line` walk above, so reuse is exact.
+        *self.debug_trap_action_cache.borrow_mut() = Some((action, ast));
+        self.resume_alias_streamed(saved_alias_streamed);
+        // rubash#546 (cell 2): when the firing happened inside a trap
+        // action the frozen BASH_COMMAND belongs to the enclosing action —
+        // leave it exactly as it was found.
+        if update_bash_command {
+            *self.shell_state.debug_trap_command.borrow_mut() = None;
+        }
+        self.debug_trap_running = false;
+        result?;
+        let trap_status = self.exit_code;
+        self.exit_code = saved_exit_code;
+        let extdebug =
+            crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "extdebug");
+        let skip_command = extdebug && trap_status != 0;
+        Ok(skip_command.then_some(trap_status))
+    }
+
+    /// Runs the RETURN trap action when a function (or sourced script)
+    /// returns. Mirrors Bash's `trap ... RETURN` hook used by debuggers.
+    pub(crate) fn run_return_trap(&mut self) -> Result<(), ExecuteError> {
+        if self.return_trap_running || self.host_internal_depth.get() > 0 {
+            return Ok(());
+        }
+        self.return_trap_running = true;
+        let Some(action) =
+            crate::builtins::trap::active_trap_action_ref(&self.shell_state.env_vars, "RETURN")
+        else {
+            self.return_trap_running = false;
+            return Ok(());
+        };
+        // GNU trap.c:367: the RETURN fire saves the pre-trap $? for a bare
+        // `exit`/`return` inside the action (interp 1602).
+        let prev_saved_exit =
+            std::mem::replace(&mut self.trap_saved_exit_value, Some(self.exit_code));
+        let prev_saved_context = std::mem::replace(
+            &mut self.trap_saved_exit_context,
+            self.shell_state.function_depth + self.source_nest_depth,
+        );
+        let tokens = crate::lexer::tokenize(&action);
+        let mut ast = crate::parser::parse(&tokens);
+        // GNU trap.c:_run_trap_internal:1196 only sets SEVAL_RESETLINE for
+        // ordinary signal traps; the RETURN trap keeps the caller's current
+        // line_number, so $LINENO inside the action (and the DEBUG fire for
+        // the trap command itself, execute_simple_command:4506) reports the
+        // caller's line. Stamp the parsed action with that line, mirroring
+        // run_debug_trap above.
+        let call_line = self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_CURRENT_LINE")
+            .and_then(|line| line.parse::<usize>().ok());
+        if let Some(call_line) = call_line {
+            for command in &mut ast.commands {
+                command.line = Some(call_line);
+            }
+        }
+        let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
+        self.trap_saved_exit_value = prev_saved_exit;
+        self.trap_saved_exit_context = prev_saved_context;
+        self.return_trap_running = false;
+        result
+    }
+
+    /// Whether the DEBUG trap is in execution scope at the current context.
+    /// GNU removes the DEBUG trap inside functions that do not inherit it
+    /// (execute_cmd.c:5270: no trace attribute and functrace off), so fires
+    /// for compound-command sub-parts (for / arith-for expressions) only
+    /// happen at the top level or inside inheriting functions.
+    /// GNU builtins/source.def:208-216 unsets the ENTRY DEBUG trap for a
+    /// sourced file when functrace is off — the same TABLE-driven shape as
+    /// the function case, so a trap the file INSTALLS fires like any other
+    /// command (trap.c:750-756: "If the function or sourced file changes
+    /// the DEBUG trap, SIG_TRAPPED will be set and we don't bother
+    /// restoring the original trap string"); only the entry trap's absence
+    /// is scoped (rubash#797).
+    /// Whether the DEBUG trap is in execution scope at the current context.
+    /// Function-level suppression is table-driven: execute_function removes
+    /// the inherited DEBUG trap at entry unless the function carries the
+    /// trace attribute or functrace is on (execute_cmd.c:5270), and a trap
+    /// set inside the body fires like any other command (trap.tests
+    /// "func[29] funcdebug"). Subshell environments (command substitutions,
+    /// pipeline members) inherit the DEBUG trap only under functrace, which
+    /// the cli trap contract encodes: without functrace the
+    /// substitution-internal commands do not fire, with functrace they do
+    /// (dbg-support.tests caller echoes carry the debug lines).
+    pub(crate) fn debug_trap_in_scope(&self) -> bool {
+        if self.host_internal_depth.get() > 0 {
+            return false;
+        }
+        if self.shell_state.subshell_depth.get() > 0 {
+            // Table-driven (rubash#345): every subshell entry marks an
+            // inherited DEBUG trap reset unless functrace is on
+            // (trap.rs reset_for_subshell, GNU trap.c:1588), so an ACTIVE
+            // action inside a subshell was armed there and must fire for
+            // the remaining subshell commands
+            // (`echo "$(trap 'echo DC' DEBUG; echo x)"` prints DC then x).
+            // functrace keeps the inherited action active instead.
+            return crate::builtins::set::shell_option_enabled(
+                &self.shell_state.env_vars,
+                "functrace",
+            ) || crate::builtins::trap::has_active_trap_action(
+                &self.shell_state.env_vars,
+                "DEBUG",
+                "__RUBASH_TRAP_DEBUG",
+            );
+        }
+        true
+    }
+
+    /// Whether a function carries the trace attribute (declare -ft name;
+    /// trap.def/execute_cmd.c trace_p(var)) making it inherit the DEBUG and
+    /// RETURN traps even with the global functrace option off.
+    pub(crate) fn function_has_trace_attribute(&self, name: &str) -> bool {
+        marked_env_names(&self.shell_state.env_vars, FUNC_TRACE_FUNCTIONS)
+            .iter()
+            .any(|entry| entry == name)
+    }
+
+    /// Whether the RETURN trap can fire at a sourced-file exit here.
+    /// GNU evalfile.c:395 (source_file) runs the RETURN trap unconditionally,
+    /// but inside a function that does not inherit it the trap was already
+    /// restored to default (execute_cmd.c:5295: `signal_in_progress
+    /// (DEBUG_TRAP) || ((trace_p (var) == 0) && function_trace_mode == 0)`),
+    /// so nothing fires (dbg-support.tests:96/97: no `return lineno` when
+    /// functrace is off, but `return lineno: 98 main` at the top level).
+    pub(crate) fn return_trap_in_scope(&self) -> bool {
+        if self.host_internal_depth.get() > 0 {
+            return false;
+        }
+        if self.shell_state.function_depth == 0 {
+            return true;
+        }
+        if self.debug_trap_running {
+            return false;
+        }
+        crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "functrace")
+    }
+
+    /// GNU builtins/source.def:209-217 (source_builtin): snapshot the ENTRY
+    /// DEBUG action and `restore_default_signal (DEBUG_TRAP)` it, so the
+    /// sourced file's commands do not fire the trap that was live at entry
+    /// (functrace off). The live trap table decides every fire inside the
+    /// file — a trap the file INSTALLS fires normally (trap.c:750-756).
+    /// Membership, not action text: an entry IGNORE (`trap '' DEBUG`) is
+    /// skipped whole — TRAP_STRING is NULL for an ignored trap
+    /// (trap.h:57-59), so source.def:211's `if (debug_trap && ...)` never
+    /// arms the snapshot/remove/restore chain and the ignore stays trapped
+    /// through the file (`trap -p DEBUG` keeps showing `trap -- '' DEBUG`).
+    /// Returns the entry action for `source_exit_debug_trap_restore`.
+    pub(crate) fn source_entry_debug_trap_save(&mut self) -> Option<String> {
+        // get_trap_action's Some/None IS the SIG_TRAPPED analog: Some("")
+        // for a live ignore, None for untrapped or subshell-reset — the
+        // __RUBASH_TRAPS membership the CR review keys on.
+        let entry = crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "DEBUG")?;
+        if entry.is_empty() {
+            return None;
+        }
+        crate::builtins::trap::remove_trap(&mut self.shell_state.env_vars, "DEBUG");
+        Some(entry)
+    }
+
+    /// GNU trap.c:737-763 (trap_if_untrapped via uw_maybe_set_debug_trap,
+    /// popped by source.def:216's unwind-protect after source_file's
+    /// run_return_trap): the ENTRY action comes back only when DEBUG is
+    /// UNTRAPPED at exit — SIG_TRAPPED is set for a plain install AND for
+    /// an ignore (trap.c:900 marks ignored traps SIG_TRAPPED too), so a
+    /// `trap '' DEBUG` from the file (or its RETURN action) survives and
+    /// the entry action stays retired (rubash#797 CR R1/R3: membership,
+    /// not action text — get_trap_action's Some("") must read as trapped).
+    pub(crate) fn source_exit_debug_trap_restore(&mut self, entry: Option<String>) {
+        if let Some(action) = entry {
+            if crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "DEBUG").is_none()
+            {
+                crate::builtins::trap::set_trap(&mut self.shell_state.env_vars, "DEBUG", &action);
+            }
+        }
+    }
+
+    pub(crate) fn run_pending_signal_traps(&mut self) -> Result<(), ExecuteError> {
+        // Pending signals belong to the shell process. A subshell sharing
+        // this process (the flat `( ... )` emulation, the in-process
+        // ${THIS_SH} child) must not consume the parent's mailbox or
+        // dispatch the parent's traps after resetting caught dispositions.
+        // A respawned `rubash -c` background child is different: it owns its
+        // own mailbox (`{pid}.alive` names the real process id), and GNU
+        // runs a trap set INSIDE its subshell body inside that subshell —
+        // execute_cmd.c:1670 execute_in_subshell resets only the INHERITED
+        // dispositions, a `trap` in the body installs fresh ones
+        // (builtins/trap.def), and the pending TERM dispatches at the next
+        // execute_cmd.c:643 run_pending_traps before the body scope ends.
+        if self.signal_trap_running
+            || (self.shell_state.subshell_depth.get() > 0 && self.shell_pid == std::process::id())
+        {
+            return Ok(());
+        }
+
+        // Unix kernel-disposition reconcile (rubash#226): mirror GNU's
+        // per-signal handler state before dispatching. trap.c trap_builtin
+        // installs one handler per trapped signal (sig.c:830, sa_flags=0 --
+        // no SA_RESTART); every other terminating signal stays SIG_DFL
+        // (sig.c:315-316: initialize_terminating_signals is
+        // interactive-only), so an untrapped signal kills the process at the
+        // KERNEL, never through this queue. The boundary poll (and the trap
+        // builtin's own mutation path) keeps the two in lockstep.
+        #[cfg(unix)]
+        crate::builtins::kill::reconcile_kernel_trap_dispositions(&self.shell_state.env_vars);
+
+        let signals = crate::builtins::kill::take_pending_signals(std::process::id())?;
+        for signal in signals {
+            // Stale registry flag from a disposition flip (trap cleared while
+            // a delivery raced): a signal the kernel no longer routes here
+            // cannot be a legitimate pending trap.
+            #[cfg(unix)]
+            if !crate::builtins::kill::kernel_handler_installed(signal) {
+                continue;
+            }
+            let Some(signal_name) = signal_trap_name(signal) else {
+                continue;
+            };
+            let action =
+                crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, &signal_name);
+            let Some(action) = action else {
+                // Bash's default disposition for SIGCHLD is to ignore it.
+                // Child completion/reaping notifications must not turn into
+                // a synthetic 128+SIGCHLD shell exit when no CHLD trap is
+                // installed (busybox ash `reap*.tests`). SIGCHLD follows
+                // the TARGET numbering: 17 on Linux, 20 on Darwin/BSD
+                // (crate::builtins::kill::SIGCHLD_NUMBER resolves libc on
+                // unix; non-unix keeps the mailbox wire-format 17).
+                if signal == crate::builtins::kill::SIGCHLD_NUMBER {
+                    continue;
+                }
+                // sig.c:333 (initialize_shell_signals): every shell sets
+                // SIGQUIT to SIG_IGN for itself before the interactive-only
+                // SIGINT/SIGTERM installs, so an untrapped QUIT delivery is
+                // dropped, never a 128+SIGQUIT shell exit. Only a user trap
+                // overrides the ignore, and `trap - QUIT` returns to it
+                // (trap.c marks SIGQUIT SIG_SPECIAL for that reset).
+                if signal == crate::builtins::kill::SIGQUIT_NUMBER {
+                    continue;
+                }
+                return Err(ExecuteError::ExitCode(128 + signal));
+            };
+            if action.is_empty() {
+                continue;
+            }
+
+            let saved_exit = self.exit_code;
+            self.exit_code = saved_exit;
+            self.signal_trap_running = true;
+            let old_signal_status = self.shell_state.env_vars.insert(
+                "__RUBASH_SIGNAL_TRAP_STATUS".to_string(),
+                saved_exit.to_string(),
+            );
+            // The pre-trap status override for a bare "return" applies only
+            // to the return that terminates the trap action itself (posix
+            // interp 1602). A "return" in a function CALLED by the action
+            // uses the current $?, so record the action's entry
+            // function_depth for the return builtin to compare.
+            let old_signal_depth = self.shell_state.env_vars.insert(
+                "__RUBASH_SIGNAL_TRAP_DEPTH".to_string(),
+                self.shell_state.function_depth.to_string(),
+            );
+            // GNU trap.c _run_trap_internal:373-385 binds BASH_TRAPSIG to the
+            // signal number of the trap being executed for the duration of
+            // the action, restoring the previous value afterwards
+            // (save_bash_trapsig/set_bash_trapsig/restore_bash_trapsig).
+            let old_bash_trapsig = self.shell_state.env_vars.get("BASH_TRAPSIG").cloned();
+            self.shell_state
+                .env_vars
+                .insert("BASH_TRAPSIG".to_string(), signal.to_string());
+            // BASH_TRAPSIG is bound unexported (bind_var_to_int attrs 0), but
+            // command substitutions run as child processes that only receive
+            // exported variables, so the trap action's $(kill -l
+            // $BASH_TRAPSIG) would otherwise see nothing. Export it for the
+            // duration of the action; this is invisible to the script.
+            let bash_trapsig_was_exported =
+                marked_env_names(&self.shell_state.env_vars, EXPORTED_VARS)
+                    .iter()
+                    .any(|name| name == "BASH_TRAPSIG");
+            if !bash_trapsig_was_exported {
+                mark_env_name(
+                    &mut self.shell_state.env_vars,
+                    EXPORTED_VARS,
+                    "BASH_TRAPSIG",
+                );
+            }
+            let tokens = crate::lexer::tokenize(&action);
+            let ast = crate::parser::parse(&tokens);
+            // trap.c:496 runs the action through parse_and_execute: the
+            // xtrace indirection level rises by one for the action.
+            let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
+            if !bash_trapsig_was_exported {
+                unmark_env_name(
+                    &mut self.shell_state.env_vars,
+                    EXPORTED_VARS,
+                    "BASH_TRAPSIG",
+                );
+            }
+            match old_bash_trapsig {
+                Some(value) => {
+                    self.shell_state
+                        .env_vars
+                        .insert("BASH_TRAPSIG".to_string(), value);
+                }
+                None => {
+                    self.shell_state.env_vars.remove("BASH_TRAPSIG");
+                }
+            }
+            match old_signal_depth {
+                Some(value) => {
+                    self.shell_state
+                        .env_vars
+                        .insert("__RUBASH_SIGNAL_TRAP_DEPTH".to_string(), value);
+                }
+                None => {
+                    self.shell_state
+                        .env_vars
+                        .remove("__RUBASH_SIGNAL_TRAP_DEPTH");
+                }
+            }
+            match old_signal_status {
+                Some(value) => {
+                    self.shell_state
+                        .env_vars
+                        .insert("__RUBASH_SIGNAL_TRAP_STATUS".to_string(), value);
+                }
+                None => {
+                    self.shell_state
+                        .env_vars
+                        .remove("__RUBASH_SIGNAL_TRAP_STATUS");
+                }
+            }
+            self.signal_trap_running = false;
+            match result {
+                Ok(()) => self.exit_code = saved_exit,
+                Err(error @ ExecuteError::Return(_)) => return Err(error),
+                Err(error @ ExecuteError::ExitCode(_)) => return Err(error),
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The Windows-mailbox port of GNU's "record the signal while blocked"
+    /// step: trap.c:545-627 trap_handler only calls set_trap_state
+    /// (trap.c:537-543, `pending_traps[sig]++`) when a caught signal arrives
+    /// while the shell is blocked inside a command; the ACTION itself is
+    /// deferred to the next command boundary (execute_cmd.c:643
+    /// run_pending_traps — bash manual, SIGNALS: "If bash is waiting for a
+    /// command to complete and receives a signal for which a trap has been
+    /// set, the trap will not be executed until the command completes"). An
+    /// untrapped terminating signal has no handler at all in GNU: SIG_DFL
+    /// kills the shell immediately, even mid-wait_for.
+    ///
+    /// Called from the sleep fast path and the foreground external wait.
+    /// Trapped deliveries are re-queued into the in-process queue (which the
+    /// boundary poll drains unconditionally), ignored ones are dropped (the
+    /// boundary would skip them anyway, trap_exec run_pending_signal_traps
+    /// `action.is_empty()`), and an untrapped terminating delivery ends the
+    /// shell now with 128+sig — the SIG_DFL equivalent. The subshell guard
+    /// mirrors run_pending_signal_traps above: a flat subshell sharing this
+    /// process must leave the shared mailbox alone, while a respawned
+    /// background child observes its own mailbox even inside its subshell
+    /// body.
+    pub(crate) fn observe_signals_while_blocked(&mut self) -> Result<(), ExecuteError> {
+        if self.signal_trap_running
+            || (self.shell_state.subshell_depth.get() > 0 && self.shell_pid == std::process::id())
+        {
+            return Ok(());
+        }
+        let signals =
+            crate::builtins::kill::take_pending_signals_now(std::process::id()).unwrap_or_default();
+        if signals.is_empty() {
+            return Ok(());
+        }
+        let mut trapped = Vec::new();
+        for &signal in &signals {
+            // Stale registry flag from a disposition flip: drop it (see
+            // run_pending_signal_traps above).
+            #[cfg(unix)]
+            if !crate::builtins::kill::kernel_handler_installed(signal) {
+                continue;
+            }
+            let Some(signal_name) = signal_trap_name(signal) else {
+                continue;
+            };
+            let action =
+                crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, &signal_name);
+            match action {
+                Some(action) if !action.is_empty() => trapped.push(signal),
+                Some(_) => {}
+                None if signal == crate::builtins::kill::SIGCHLD_NUMBER => {}
+                // sig.c:333: every shell ignores SIGQUIT for itself; an
+                // untrapped delivery while blocked is dropped, not fatal.
+                None if signal == crate::builtins::kill::SIGQUIT_NUMBER => {}
+                None => return Err(ExecuteError::ExitCode(128 + signal)),
+            }
+        }
+        crate::builtins::kill::requeue_pending_signals(trapped);
+        Ok(())
+    }
+
+    /// GNU `sleep N` is an external child process, so the waiting shell
+    /// stays interruptible (jobs.c:3064 wait_for; a caught signal is
+    /// recorded by trap.c:545 trap_handler and dispatched when the sleep
+    /// completes, an untrapped one kills the shell via SIG_DFL). The
+    /// in-process fast path emulates that by slicing the sleep and running
+    /// observe_signals_while_blocked between slices.
+    pub(crate) fn sleep_interruptibly(&mut self, seconds: f64) -> Result<(), ExecuteError> {
+        const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep((deadline - now).min(SLICE));
+            self.observe_signals_while_blocked()?;
+        }
+    }
+
+    /// Run the ERR trap after a command (or pipeline) completes with a
+    /// non-zero status. GNU execute_cmd.c fires the error trap for every
+    /// failing command that is not part of a &&/|| list, not inverted with
+    /// the ! keyword, and not suppressed by errexit handling; functions
+    /// inherit it only under "set -o errtrace" (trap.c error_trace_mode).
+    pub(crate) fn maybe_run_error_trap(
+        &mut self,
+        command: &CommandNode,
+    ) -> Result<(), ExecuteError> {
+        self.maybe_run_error_trap_inner(command, None, None, false)
+    }
+
+    /// Run the ERR adjudication for a flat `f() ( list )` region boundary —
+    /// the rubash#720 form 2 fire. GNU runs a user subshell's completion ERR
+    /// check in the frame that waited for the fork, after wait_for
+    /// (execute_cmd.c:769-778), keyed on the subshell command itself: the
+    /// site checks user_subshell, was_error_trap, ignore_return, invert and
+    /// the status — there is NO &&/|| exemption there (probe: `f() ( false
+    /// && true ); f` fires). The forkless engine has no command node for
+    /// the region, so `command_text` carries the region's print_cmd text —
+    /// GNU's the_printed_command_except_trap is make_command_string of the
+    /// subshell, fixed by the fork preamble (execute_cmd.c:703-710) — and
+    /// `line` is the subshell's own close-paren line (execute_cmd.c:696
+    /// SET_LINE_NUMBER(command->value.Subshell->line), the line the :769
+    /// fire reports as $LINENO).
+    pub(crate) fn maybe_run_error_trap_for_flat_region(
+        &mut self,
+        command: &CommandNode,
+        command_text: String,
+        line: Option<usize>,
+    ) -> Result<(), ExecuteError> {
+        self.maybe_run_error_trap_inner(command, Some(command_text), line, true)
+    }
+
+    fn maybe_run_error_trap_inner(
+        &mut self,
+        command: &CommandNode,
+        command_text_override: Option<String>,
+        line_override: Option<usize>,
+        bypass_and_or_gate: bool,
+    ) -> Result<(), ExecuteError> {
+        // GNU trap.c run_error_trap (execute_cmd.c callers): the ERR trap
+        // refuses to run while it is already in progress —
+        // `signal_in_progress (ERROR_TRAP)` — so a failing command inside
+        // the ERR action cannot recursively re-trigger it. Rubash's
+        // error_trap_running flag mirrors SIG_INPROGRESS.
+        if self.exit_code == 0
+            || command.inverted
+            || (command.and_or().is_some() && !bypass_and_or_gate)
+            || self.suppress_errexit != 0
+            || self.error_trap_running
+            || self.host_internal_depth.get() > 0
+            // rubash#439: a word/assignment expansion error (GNU subst.c
+            // expand_wdesc_error -> exp_jump_to_top_level(DISCARD)) abandons
+            // the command BEFORE it executes, and the DISCARD jump bypasses
+            // the run_error_trap call sites in execute_cmd.c — so the trap
+            // never fires for the expansion failure itself (`trap 'echo E'
+            // ERR; x=${!bad}` must print only the diagnostic). A command
+            // substitution failure (`x=$(false)`) is NOT this class: the
+            // inner command ran and the assignment carries its status, so
+            // the ERR trap still fires there.
+            || self.command_expansion_failed.get()
+            || (self.shell_state.function_depth > 0
+                && !crate::builtins::set::shell_option_enabled(
+                    &self.shell_state.env_vars,
+                    "errtrace",
+                ))
+        {
+            return Ok(());
+        }
+        let Some(action) =
+            crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "ERR")
+        else {
+            return Ok(());
+        };
+        if action.is_empty() {
+            return Ok(());
+        }
+        self.error_trap_running = true;
+        let saved_exit = self.exit_code;
+        // GNU trap.c:367 _run_trap_internal saves last_command_exit_value in
+        // trap_saved_exit_value before running the action (the failing
+        // command's status here); trap.c:383 records funcnest + sourcenest
+        // as trap_return_context. A bare `exit` inside the action resolves
+        // to the saved value (builtins/common.c get_exitstat, POSIX interp
+        // 1602) — commands inside the action cannot change it.
+        let prev_saved_exit = std::mem::replace(&mut self.trap_saved_exit_value, Some(saved_exit));
+        let prev_saved_context = std::mem::replace(
+            &mut self.trap_saved_exit_context,
+            self.shell_state.function_depth + self.source_nest_depth,
+        );
+        let saved_trap_command = self.shell_state.debug_trap_command.borrow().clone();
+        // GNU get_bash_command (variables.c:1558) reads
+        // the_printed_command_except_trap — the last command printed
+        // while no trap was in progress — not necessarily the node that
+        // failed: a failing function call reports the function body's
+        // last inner command (cond-error1.sub: `func` at line 28 reports
+        // `[[ -z nonempty ]]`), and a failing pipeline reports its last
+        // stage (`true | false` reports `false`). The flat-region caller
+        // overrides with the region's own `( list )` text: GNU's
+        // except_trap at the :769 wait still holds make_command_string of
+        // the subshell from the fork preamble, not the body's last command.
+        *self.shell_state.debug_trap_command.borrow_mut() = command_text_override
+            .or_else(|| {
+                self.shell_state
+                    .env_vars
+                    .get("__RUBASH_LAST_COMMAND")
+                    .or_else(|| self.shell_state.env_vars.get("__RUBASH_CURRENT_COMMAND"))
+                    .cloned()
+            })
+            .or_else(|| {
+                Some(crate::executor::command_text::bash_command_source_text(
+                    command,
+                ))
+            });
+        // GNU executes the ERR trap action with LINENO bound to the failed
+        // command's line (trap3.sub: `false | false | false` on line 8 makes
+        // the ERR action's $LINENO print 8). The action AST re-parses with
+        // position-1 lines, which set_current_line would otherwise clobber
+        // the tracking value with — pin the action's node lines instead, the
+        // way run_debug_trap does. The flat-region caller pins the subshell's
+        // close-paren line (execute_cmd.c:696, honored by the :769 fire).
+        let failed_line = line_override.or(command.line);
+        let action = self.comsub_body_alias_splice(&action);
+        let tokens = crate::lexer::tokenize(&action);
+        let mut ast = crate::parser::parse(&tokens);
+        if let Some(line) = failed_line {
+            for action_command in &mut ast.commands {
+                action_command.line = Some(line);
+            }
+        }
+        let saved_alias_streamed = self.mark_alias_streamed();
+        let result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
+        self.resume_alias_streamed(saved_alias_streamed);
+        *self.shell_state.debug_trap_command.borrow_mut() = saved_trap_command;
+        self.error_trap_running = false;
+        self.trap_saved_exit_value = prev_saved_exit;
+        self.trap_saved_exit_context = prev_saved_context;
+        // GNU builtins/exit.def (exit_or_logout): an `exit` inside ANY trap
+        // action unwinds to the top level immediately (the EXITBLTIN jump) —
+        // the unwind passes THROUGH run_error_trap, and the shell
+        // terminates with that status instead of returning to the
+        // interrupted flow (execute_cmd.c:5537 honors the jump by ending
+        // execution with last_command_exit_value; eval.c reader_loop ends
+        // the run). The discarded execute_ast result used to swallow that
+        // unwind, so `trap 'echo ETRAP; exit 42' ERR; false; echo never`
+        // printed ETRAP + never and exited 0; GNU prints ETRAP and exits 42
+        // (rubash#524). A bare `exit` exits with the trap-time $?, which
+        // GNU resolves from trap_saved_exit_value (builtins/common.c
+        // get_exitstat; probe: GNU exits 1). Only the exit unwind
+        // propagates — other action-level states keep the historical
+        // swallow here.
+        let exit_unwind = matches!(result, Err(ExecuteError::ExitCode(_)));
+        self.exit_code = saved_exit;
+        if exit_unwind {
+            return result;
+        }
+        Ok(())
+    }
+
+    /// Run the SIGCHLD trap once for one reaped child. GNU bash processes
+    /// each child-death notification after waitpid and runs a set SIGCHLD
+    /// trap at the next boundary (trap8.sub: four CHLD firings for the
+    /// reaped background subshell, two background sleeps, and the
+    /// foreground sleep).
+    pub(crate) fn run_sigchld_trap_for_reaped_child(&mut self) -> Result<(), ExecuteError> {
+        if self.signal_trap_running {
+            // A child death notification arrived while the SIGCHLD trap
+            // action is already running: queue it, and the outermost run
+            // re-executes the action once per pending notification (bash
+            // delivers one SIGCHLD per reaped child; trap.tests expects
+            // three catches for three background jobs).
+            self.sigchld_notifications_pending
+                .set(self.sigchld_notifications_pending.get() + 1);
+            return Ok(());
+        }
+        if self.shell_state.subshell_depth.get() > 0 {
+            return Ok(());
+        }
+        let Some(action) =
+            crate::builtins::trap::get_trap_action(&self.shell_state.env_vars, "SIGCHLD")
+        else {
+            return Ok(());
+        };
+        if action.is_empty() {
+            return Ok(());
+        }
+        let saved_exit = self.exit_code;
+        self.signal_trap_running = true;
+        let mut result: Result<(), ExecuteError> = Ok(());
+        loop {
+            let tokens = crate::lexer::tokenize(&action);
+            let ast = crate::parser::parse(&tokens);
+            result = self.with_xtrace_indirection(|executor| executor.execute_ast(&ast));
+            if result.is_err() {
+                break;
+            }
+            if self.sigchld_notifications_pending.get() == 0 {
+                break;
+            }
+            self.sigchld_notifications_pending
+                .set(self.sigchld_notifications_pending.get() - 1);
+        }
+        self.signal_trap_running = false;
+        match result {
+            Ok(()) => self.exit_code = saved_exit,
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn run_function_return_trap(&mut self) -> Result<(), ExecuteError> {
+        // GNU execute_cmd.c:5295 (execute_function): while the DEBUG trap is
+        // executing (signal_in_progress (DEBUG_TRAP)), a function does not
+        // inherit the RETURN trap at all (restore_default_signal(RETURN_TRAP)
+        // plus the unwind-protect restore), so no RETURN trap fires when the
+        // DEBUG trap handler function itself returns
+        // (dbg-support.tests: no "return lineno" lines for print_debug_trap).
+        if self.debug_trap_running {
+            return Ok(());
+        }
+        // Bash only fires a RETURN trap for function returns when the
+        // function inherits the DEBUG/RETURN traps. GNU execute_cmd.c:5291-
+        // 5293: "Shell functions inherit the RETURN trap if function
+        // tracing is on globally or on individually for this function" —
+        // the gate is `trace_p (var) == 0 && function_trace_mode == 0`
+        // (execute_cmd.c:5295; function_trace_mode is the functrace set -o
+        // flag, NOT debugging_mode — shopt extdebug reaches it only through
+        // the functrace it enables, shopt.def:621). trace_p(var) is the
+        // per-function attribute `declare -ft name` sets, so a traced
+        // function fires the RETURN trap even with the global option off
+        // (rubash#343: `declare -ft f; trap 'echo R' RETURN; f` prints R).
+        // The name stack is still holding this call's frame at the fire
+        // site (function_calls.rs pops it after run_function_return_trap).
+        let current_function_traced = self
+            .shell_state
+            .function_name_stack
+            .first()
+            .is_some_and(|name| self.function_has_trace_attribute(name));
+        let traced =
+            crate::builtins::set::shell_option_enabled(&self.shell_state.env_vars, "functrace")
+                || current_function_traced;
+        let function_scoped = self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_RETURN_TRAP_FUNCTION")
+            .zip(self.shell_state.function_name_stack.first())
+            .is_some_and(|(registered, current)| registered == current);
+        if !traced && !function_scoped {
+            return Ok(());
+        }
+        self.run_return_trap()
+    }
+
+    pub(in crate::executor) fn note_return_trap_scope(&mut self, args: &[String]) {
+        let mut index = usize::from(args.first().map(String::as_str) == Some("--"));
+        let Some(action) = args.get(index) else {
+            return;
+        };
+        if action != "-" && action.starts_with('-') {
+            return;
+        }
+        index += 1;
+        let has_return = args[index..].iter().any(|signal| {
+            signal
+                .strip_prefix("SIG")
+                .unwrap_or(signal)
+                .eq_ignore_ascii_case("RETURN")
+        });
+        if !has_return {
+            return;
+        }
+        if action == "-" {
+            self.shell_state
+                .env_vars
+                .remove("__RUBASH_RETURN_TRAP_FUNCTION");
+        } else if let Some(function) = self.shell_state.function_name_stack.first() {
+            self.shell_state.env_vars.insert(
+                "__RUBASH_RETURN_TRAP_FUNCTION".to_string(),
+                function.clone(),
+            );
+        }
+    }
+
+    pub(crate) fn apply_command_output_redirects(
+        &mut self,
+        cmd: &CommandNode,
+        ast: &mut Ast,
+    ) -> Result<(), ExecuteError> {
+        self.apply_command_output_redirects_inner(cmd, ast, true)
+    }
+
+    pub(crate) fn apply_inherited_command_output_redirects(
+        &mut self,
+        cmd: &CommandNode,
+        ast: &mut Ast,
+    ) -> Result<(), ExecuteError> {
+        self.apply_command_output_redirects_inner(cmd, ast, false)
+    }
+
+    /// GNU execute_cmd.c applies a compound command's redirections in the
+    /// parent context before the body runs: a `cd` inside `( ... ) > f`
+    /// cannot relocate `f`. The body commands here re-open the injected
+    /// redirect target at their own execution time, so a relative target
+    /// must be anchored to the current directory now (niubash#118).
+    pub(in crate::executor) fn anchor_compound_redirect_target(&self, target: &str) -> String {
+        if is_closed_redirect_target(target)
+            || redirect_target_fd(target).is_some()
+            || is_null_device(target)
+            || target.starts_with('&')
+        {
+            return target.to_string();
+        }
+        let path = shell_path_to_windows(target, &self.shell_state.env_vars);
+        if path.is_absolute() {
+            return target.to_string();
+        }
+        match env::current_dir() {
+            Ok(cwd) => shell_display_path(&cwd.join(&path).to_string_lossy()),
+            Err(_) => target.to_string(),
+        }
+    }
+
+    fn apply_command_output_redirects_inner(
+        &mut self,
+        cmd: &CommandNode,
+        ast: &mut Ast,
+        prepare_targets: bool,
+    ) -> Result<(), ExecuteError> {
+        // The stdio mirror fields are fd-blind parser conveniences:
+        // `3>&1`/`2>&1` also land in `redirect_out`. Only an fd-1 (or
+        // default) entry is a stdout redirect; numbered entries propagate
+        // through splice_numbered_output_redirects_in_order below instead.
+        if let Some(redirect) = cmd.redirect_out.as_ref().filter(|r| r.fd.unwrap_or(1) == 1) {
+            // GNU do_redirections opens the expanded word once, relative to
+            // the cwd in force when the compound command starts; the
+            // diagnostic reports that word (redir.c report_error on
+            // redirectee.filename->word). The anchored spelling is only for
+            // the propagated per-leaf redirect, which opens later and must
+            // survive a `cd` inside the body (niubash#118).
+            let expanded = self.expand_redirect_target(redirect);
+            // subst.c:12663-12668 failglob: abort before the target is
+            // created/anchored and spliced into the body leaves.
+            if self.redirect_failglob_aborted() {
+                return Err(ExecuteError::ExpansionFailure(1));
+            }
+            // fd-dup targets (`>&1`) are entry-time dup2s — see the
+            // redirect_err guard above (rubash#170).
+            if redirect_target_fd(&expanded).is_none() {
+                if prepare_targets
+                    && !is_closed_redirect_target(&expanded)
+                    && redirect_target_fd(&expanded).is_none()
+                {
+                    self.create_redirect_output(&expanded, redirect.clobber)?;
+                }
+                let target = self.anchor_compound_redirect_target(&expanded);
+                let append_redirect = Redirect {
+                    fd: redirect.fd,
+                    fd_var: redirect.fd_var.clone(),
+                    operator: ">>".to_string(),
+                    operator_metadata: Box::new(crate::parser::WordMetadata::new(
+                        0,
+                        ">>".to_string(),
+                        ">>".to_string(),
+                    )),
+                    kind: crate::parser::RedirectKind::Append,
+                    target_metadata: Box::new(crate::parser::WordMetadata::new(
+                        0,
+                        target.clone(),
+                        target.clone(),
+                    )),
+                    target,
+                    append: true,
+                    clobber: false,
+                };
+                apply_stdout_append_redirect(&mut ast.commands, &append_redirect);
+            }
+        } else if let Some(redirect) = cmd.append.as_ref().filter(|r| r.fd.unwrap_or(1) == 1) {
+            let expanded = self.expand_redirect_target(redirect);
+            // subst.c:12663-12668 failglob: abort before anchoring.
+            if self.redirect_failglob_aborted() {
+                return Err(ExecuteError::ExpansionFailure(1));
+            }
+            let target = self.anchor_compound_redirect_target(&expanded);
+            let append_redirect = Redirect {
+                fd: redirect.fd,
+                fd_var: redirect.fd_var.clone(),
+                operator: redirect.operator.clone(),
+                operator_metadata: redirect.operator_metadata.clone(),
+                kind: redirect.kind.clone(),
+                target_metadata: Box::new(crate::parser::WordMetadata::new(
+                    0,
+                    target.clone(),
+                    target.clone(),
+                )),
+                target,
+                append: true,
+                clobber: false,
+            };
+            apply_stdout_append_redirect(&mut ast.commands, &append_redirect);
+        }
+
+        if let Some(redirect) = cmd.redirect_err.as_ref().filter(|r| r.fd.unwrap_or(2) == 2) {
+            let expanded = self.expand_redirect_target(redirect);
+            // subst.c:12663-12668 failglob: abort before the target is
+            // created/anchored (see the redirect_out arm above).
+            if self.redirect_failglob_aborted() {
+                return Err(ExecuteError::ExpansionFailure(1));
+            }
+            // An fd-dup target (`2>&1`) is a dup2 GNU applies ONCE at
+            // compound entry (redir.c do_redirection_internal), snapshotted
+            // by open_compound_output_redirects' scoped fd-table binding.
+            // Splicing a per-leaf re-dup instead re-evaluates fd 1 at every
+            // leaf — after the body's own `exec > f` rebound it, `>&2`
+            // writes land in f while GNU keeps them on the original stdout
+            // (rubash#170 nest4). Same guard on every stdio mirror branch
+            // below.
+            if redirect_target_fd(&expanded).is_none() {
+                if prepare_targets
+                    && !is_closed_redirect_target(&expanded)
+                    && redirect_target_fd(&expanded).is_none()
+                    && !is_null_device(&expanded)
+                {
+                    self.create_redirect_output(&expanded, redirect.clobber)?;
+                }
+                let target = self.anchor_compound_redirect_target(&expanded);
+                let append_redirect = Redirect {
+                    fd: redirect.fd,
+                    fd_var: redirect.fd_var.clone(),
+                    operator: "2>>".to_string(),
+                    operator_metadata: Box::new(crate::parser::WordMetadata::new(
+                        0,
+                        "2>>".to_string(),
+                        "2>>".to_string(),
+                    )),
+                    kind: crate::parser::RedirectKind::Append,
+                    target_metadata: Box::new(crate::parser::WordMetadata::new(
+                        0,
+                        target.clone(),
+                        target.clone(),
+                    )),
+                    target,
+                    append: true,
+                    clobber: false,
+                };
+                apply_stderr_append_redirect(&mut ast.commands, &append_redirect);
+            }
+        } else if let Some(redirect) = cmd
+            .redirect_err_append
+            .as_ref()
+            .filter(|r| r.fd.unwrap_or(2) == 2)
+        {
+            let expanded = self.expand_redirect_target(redirect);
+            // subst.c:12663-12668 failglob: abort before anchoring.
+            if self.redirect_failglob_aborted() {
+                return Err(ExecuteError::ExpansionFailure(1));
+            }
+            // fd-dup targets (`2>>&1` is still a dup2 in GNU — the append
+            // marker on an fd target is ignored) bind at entry; see the
+            // redirect_err guard above (rubash#170).
+            if redirect_target_fd(&expanded).is_none() {
+                let target = self.anchor_compound_redirect_target(&expanded);
+                let append_redirect = Redirect {
+                    fd: redirect.fd,
+                    fd_var: redirect.fd_var.clone(),
+                    operator: redirect.operator.clone(),
+                    operator_metadata: redirect.operator_metadata.clone(),
+                    kind: redirect.kind.clone(),
+                    target_metadata: Box::new(crate::parser::WordMetadata::new(
+                        0,
+                        target.clone(),
+                        target.clone(),
+                    )),
+                    target,
+                    append: true,
+                    clobber: false,
+                };
+                apply_stderr_append_redirect(&mut ast.commands, &append_redirect);
+            }
+        }
+
+        // Numbered (fd-prefixed) output redirects — `3>&1`, `10>f` — bind
+        // real fd-table entries for the body's duration through
+        // open_compound_output_redirects (with_command_input_redirects /
+        // with_compound_output_redirects), matching GNU
+        // do_redirection_internal which dups/opens the group's descriptors
+        // before the body runs (redir.c:767-955). Leaves then resolve
+        // `1>&3` against the group's binding rather than a spliced-in
+        // re-dup of their own fd 1 (which mis-binds inside pipelines).
+
+        Ok(())
+    }
+
+    pub(in crate::executor) fn execute_exec(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<i32, ExecuteError> {
+        if exec_has_only_redirects(cmd) {
+            if let Some(status) = self.execute_stdio_only_exec_redirect(cmd)? {
+                return Ok(status);
+            }
+        }
+
+        // Bash applies redirections before `exec` parses its options.  This
+        // matters when an expanded option is invalid: the diagnostic is still
+        // emitted, but a stdout redirection remains in effect afterwards.
+        if self.exec_has_no_command_operand_after_expansion(cmd) {
+            self.execute_stdio_only_exec_redirect(cmd)?;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let status = crate::builtins::exec::execute_with_io(
+                &cmd.words[1..],
+                &self.shell_state.env_vars,
+                &mut stdout,
+                &mut stderr,
+                // No spawn happens on this path (a bare `exec` with
+                // redirects only reports option diagnostics); inherit is
+                // the no-op value.
+                Stdio::inherit(),
+            )?;
+            // GNU exec.def reports option errors through builtin_error,
+            // which carries the script:line context prefix
+            // (redir.tests:53: "./redir.tests: line 53: exec: -1: invalid
+            // option"). The builtin emits the bare shell-name form; swap
+            // the prefix when running inside a script.
+            let prefix = self.diagnostic_prefix();
+            if prefix != "rubash: " {
+                let text = String::from_utf8_lossy(&stderr).into_owned();
+                if text.starts_with("rubash: ") {
+                    stderr.clear();
+                    stderr.extend_from_slice(
+                        format!("{}{}", prefix, &text["rubash: ".len()..]).as_bytes(),
+                    );
+                }
+            }
+            self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+            return Ok(status);
+        }
+
+        // GNU redir.c do_redirections → redir_varassign: `exec cmd {var}>f`
+        // still allocates the descriptor and assigns var persistently
+        // before running the operand. The stdio-only paths above already
+        // covered the no-operand forms; apply the fd_var redirects here so
+        // a real operand sees them (and they persist after it exits).
+        if self.apply_dynamic_fd_var_redirects(cmd, false)? {
+            return Ok(1);
+        }
+
+        // GNU redir.c do_redirection_internal applies the command's fd-0
+        // input redirections (`exec cat < f`, here-strings, heredocs,
+        // `<&N` dups) BEFORE execve, and subst.c command_substitute keeps
+        // the shell's fd 0 open inside command substitutions — the exec'd
+        // image reads exactly the descriptor the shell carried. rubash#575:
+        // the exec builtin's spawn sites never set a child stdin, and std's
+        // Command::output() defaults stdin to Stdio::null(), so a
+        // `$(exec cat)` read EOF where WSL bash 5.3.0 reads the outer
+        // stdin. Bind the node's input redirects for the spawn's duration —
+        // the same primitives with_command_input_redirects uses for
+        // compound bodies — resolve the child handle from the bound state
+        // (see exec_inherited_stdin), then unwind the shell's fd 0.
+        if let Some(message) = self.compound_stdin_open_failure(cmd) {
+            let mut stderr = Vec::new();
+            writeln!(&mut stderr, "{message}")?;
+            self.write_redirected_command_stderr(cmd, &stderr)?;
+            self.exit_code = 1;
+            return Ok(1);
+        }
+        // `<&N` dups and numbered input redirects are real descriptor
+        // operations on the spawn's fd table (the numbered path already
+        // applies them for compounds; open_compound_numbered_input_redirects
+        // deliberately covers fd-0 dups).
+        let saved_numbered = self.open_compound_numbered_input_redirects(cmd)?;
+        let guard = self.bind_command_fd0_input(cmd)?;
+        let status = self.execute_exec_spawn(cmd);
+        if let Some(guard) = guard {
+            self.restore_command_fd0_input(guard);
+        }
+        self.restore_compound_numbered_input_redirects(saved_numbered);
+        status
+    }
+
+    /// The spawn arms of execute_exec, run with the command's fd-0 input
+    /// redirects already bound (see the guard in execute_exec). Every arm
+    /// passes the child stdin resolved by exec_inherited_stdin explicitly —
+    /// none of the spawn helpers may rely on std's defaults.
+    fn execute_exec_spawn(&mut self, cmd: &CommandNode) -> Result<i32, ExecuteError> {
+        if let Some(redirect) = &cmd.redirect_out {
+            let target = self.expand_redirect_target(redirect);
+            // GNU redir.c:832-838: `exec cmd >&WORD` with a non-numeric
+            // WORD translates to r_err_and_out - the child's stdout AND
+            // stderr go to WORD. The raw target keeps the `&` dup marker,
+            // so strip it before opening (redir4.sub: exec >&$fd).
+            if redirect.fd.unwrap_or(1) == 1 && redirect.fd_var.is_none() && target.starts_with('&')
+            {
+                let path = target.strip_prefix('&').unwrap_or(&target).to_string();
+                let mut file = self.create_redirect_output(&path, redirect.clobber)?;
+                // r_err_and_out: the child's stdout and stderr both go to
+                // WORD, so the builtin's own diagnostics follow the file too.
+                let child_stdout = Stdio::from(file.try_clone()?);
+                let child_stderr = Stdio::from(file.try_clone()?);
+                let mut child_diag = file.try_clone()?;
+                let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
+                    &cmd.words[1..],
+                    crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
+                    crate::executor::dev_fd_operands::DevOperandStdout::Path(
+                        shell_path_to_windows(&path, &self.shell_state.env_vars),
+                    ),
+                );
+                let status = crate::builtins::exec::execute_with_child_stdio(
+                    &exec_args,
+                    &self.shell_state.env_vars,
+                    &mut file,
+                    &mut child_diag,
+                    child_stdout,
+                    child_stderr,
+                    self.exec_inherited_stdin()?,
+                )?;
+                self.finish_dev_fd_operands(dev_ops);
+                return Ok(status);
+            }
+            let mut file = self.create_redirect_output(&target, redirect.clobber)?;
+            let child_stdout = Stdio::from(file.try_clone()?);
+            let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
+                &cmd.words[1..],
+                crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
+                crate::executor::dev_fd_operands::DevOperandStdout::Path(shell_path_to_windows(
+                    &target,
+                    &self.shell_state.env_vars,
+                )),
+            );
+            let status = crate::builtins::exec::execute_with_child_stdio(
+                &exec_args,
+                &self.shell_state.env_vars,
+                &mut file,
+                &mut std::io::stderr().lock(),
+                child_stdout,
+                Stdio::inherit(),
+                self.exec_inherited_stdin()?,
+            )?;
+            self.finish_dev_fd_operands(dev_ops);
+            return Ok(status);
+        }
+
+        if let Some(redirect) = &cmd.append {
+            let target = self.expand_redirect_target(redirect);
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+            let child_stdout = Stdio::from(file.try_clone()?);
+            let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
+                &cmd.words[1..],
+                crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
+                crate::executor::dev_fd_operands::DevOperandStdout::Path(shell_path_to_windows(
+                    &target,
+                    &self.shell_state.env_vars,
+                )),
+            );
+            let status = crate::builtins::exec::execute_with_child_stdio(
+                &exec_args,
+                &self.shell_state.env_vars,
+                &mut file,
+                &mut std::io::stderr().lock(),
+                child_stdout,
+                Stdio::inherit(),
+                self.exec_inherited_stdin()?,
+            )?;
+            self.finish_dev_fd_operands(dev_ops);
+            return Ok(status);
+        }
+
+        if let Some(redirect) = &cmd.redirect_err {
+            let target = self.expand_redirect_target(redirect);
+            let mut file = self.create_redirect_output(&target, redirect.clobber)?;
+            let child_stderr = Stdio::from(file.try_clone()?);
+            let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
+                &cmd.words[1..],
+                crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
+                crate::executor::dev_fd_operands::DevOperandStdout::FdTable,
+            );
+            // GNU redir.c do_redirections: `exec cmd 2>/dev/null` rebinds
+            // ONLY fd 2 — the child's fd 1 keeps whatever the shell carried,
+            // which inside a command substitution is the capture pipe
+            // (subst.c:7143). Stdio::inherit() here instead gave the child
+            // the CONSOLE stdout, leaking its output past the capture
+            // (modernish goodsh.sh `_Msh_Gsh_doTestShell`, rubash#252).
+            // Route through the capture-aware sink under the same
+            // fd1_lands_in_capture condition as the no-redirect arm below.
+            let fd1_lands_in_capture = self.fd_table.write_endpoint(1)
+                == Some(FdWriteEndpoint::Stdout)
+                && (self.stdout_capture.is_some()
+                    || crate::executor::shell_options::stdout_capture_active());
+            let status = if fd1_lands_in_capture {
+                crate::builtins::exec::execute_with_io(
+                    &exec_args,
+                    &self.shell_state.env_vars,
+                    &mut crate::executor::GlobalStdout,
+                    &mut file,
+                    self.exec_inherited_stdin()?,
+                )?
+            } else {
+                crate::builtins::exec::execute_with_child_stdio(
+                    &exec_args,
+                    &self.shell_state.env_vars,
+                    &mut crate::executor::GlobalStdout,
+                    &mut file,
+                    Stdio::inherit(),
+                    child_stderr,
+                    self.exec_inherited_stdin()?,
+                )?
+            };
+            self.finish_dev_fd_operands(dev_ops);
+            return Ok(status);
+        }
+
+        if let Some(redirect) = &cmd.redirect_err_append {
+            let target = self.expand_redirect_target(redirect);
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+            let child_stderr = Stdio::from(file.try_clone()?);
+            let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
+                &cmd.words[1..],
+                crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
+                crate::executor::dev_fd_operands::DevOperandStdout::FdTable,
+            );
+            // Same capture-aware fd-1 routing as the redirect_err arm above
+            // (GNU redir.c: the append redirect on fd 2 never rebinds fd 1).
+            let fd1_lands_in_capture = self.fd_table.write_endpoint(1)
+                == Some(FdWriteEndpoint::Stdout)
+                && (self.stdout_capture.is_some()
+                    || crate::executor::shell_options::stdout_capture_active());
+            let status = if fd1_lands_in_capture {
+                crate::builtins::exec::execute_with_io(
+                    &exec_args,
+                    &self.shell_state.env_vars,
+                    &mut crate::executor::GlobalStdout,
+                    &mut file,
+                    self.exec_inherited_stdin()?,
+                )?
+            } else {
+                crate::builtins::exec::execute_with_child_stdio(
+                    &exec_args,
+                    &self.shell_state.env_vars,
+                    &mut crate::executor::GlobalStdout,
+                    &mut file,
+                    Stdio::inherit(),
+                    child_stderr,
+                    self.exec_inherited_stdin()?,
+                )?
+            };
+            self.finish_dev_fd_operands(dev_ops);
+            return Ok(status);
+        }
+
+        self.apply_no_output_builtin_redirects(cmd)?;
+        // GNU exec.def exec_builtin -> shell_execve (execute_cmd.c:6126):
+        // the exec'd program inherits the shell's fd 1 — inside a command
+        // substitution that descriptor IS the capture pipe (subst.c:7143
+        // command_substitute dup2'd it before the body ran), so
+        // `exec prog` at the end of a script captured via `$(script)` feeds
+        // the capture, not the console (rubash#193: rbenv's
+        // `exec rbenv---version`). An fd-1 Stdout endpoint with an active
+        // in-process capture has no inheritable OS handle, so run the child
+        // piped and forward its bytes through the capture-aware sink — the
+        // same shape run_external_command_substitution uses for external
+        // comsub bodies.
+        let fd1_lands_in_capture = self.fd_table.write_endpoint(1) == Some(FdWriteEndpoint::Stdout)
+            && (self.stdout_capture.is_some()
+                || crate::executor::shell_options::stdout_capture_active());
+        let (exec_args, dev_ops) = self.materialize_dev_fd_operands(
+            &cmd.words[1..],
+            crate::executor::dev_fd_operands::DevOperandStdin::FdTable,
+            crate::executor::dev_fd_operands::DevOperandStdout::FdTable,
+        );
+        let status = if fd1_lands_in_capture {
+            // `exec cmd 2>&1` inside the substitution resolves fd 2 to the
+            // same Stdout endpoint — its diagnostics join the capture too;
+            // a plain fd 2 stays the terminal stream.
+            if self.fd_table.write_endpoint(2) == Some(FdWriteEndpoint::Stdout) {
+                crate::builtins::exec::execute_with_io(
+                    &exec_args,
+                    &self.shell_state.env_vars,
+                    &mut crate::executor::GlobalStdout,
+                    &mut crate::executor::GlobalStdout,
+                    self.exec_inherited_stdin()?,
+                )?
+            } else {
+                crate::builtins::exec::execute_with_io(
+                    &exec_args,
+                    &self.shell_state.env_vars,
+                    &mut crate::executor::GlobalStdout,
+                    &mut std::io::stderr().lock(),
+                    self.exec_inherited_stdin()?,
+                )?
+            }
+        } else {
+            // GNU exec.def: `exec cmd` runs cmd in the shell's current fd
+            // context — a group/ambient redirect already bound on the fd
+            // table (`${THIS_SH} script >file`, `{ exec cmd; } >file`) must
+            // reach the spawned child. Inheriting raw process stdio
+            // bypasses the bound file and leaks the child's output to the
+            // console while leaving the redirect target empty (niubash
+            // run-test gate).
+            let child_stdout = self.exec_inherited_stdio(1)?;
+            let child_stderr = self.exec_inherited_stdio(2)?;
+            crate::builtins::exec::execute_with_child_stdio(
+                &exec_args,
+                &self.shell_state.env_vars,
+                &mut crate::executor::GlobalStdout,
+                &mut std::io::stderr().lock(),
+                child_stdout,
+                child_stderr,
+                self.exec_inherited_stdin()?,
+            )?
+        };
+        self.finish_dev_fd_operands(dev_ops);
+        Ok(status)
+    }
+
+    /// Resolve the concrete child stdio for an `exec`'d fd from the fd
+    /// table. GNU's fork-exec model inherits whatever the group's
+    /// redirections already dup2'd onto the descriptor (redir.c
+    /// do_redirections runs before exec_builtin), so a bound file endpoint
+    /// or an `N>&M` dup chain must be realized as the child's real std
+    /// handle. `M` dup targets are resolved transitively (`2>&1` follows
+    /// fd 1's endpoint, sharing its open file description).
+    fn exec_inherited_stdio(&self, fd: u32) -> Result<Stdio, ExecuteError> {
+        self.exec_stdio_for_endpoint(fd, 0)
+    }
+
+    /// Resolve the concrete child stdin for an `exec`'d program from the
+    /// fd table's endpoint 0 — the read-side twin of
+    /// exec_inherited_stdio(1)/(2). GNU exec.def exec_builtin ->
+    /// shell_execve replaces the shell image in place, so the exec'd
+    /// program keeps fd 0 exactly as do_redirections bound it (redir.c),
+    /// and subst.c command_substitute dups ONLY fd 1 for the capture pipe,
+    /// leaving fd 0 inherited — a `$(exec cat)` therefore reads the outer
+    /// stdin (WSL bash 5.3.0 matrix: pipe, file and read-then-exec shapes
+    /// all feed the child; rubash#575). std's Command::output() defaults
+    /// stdin to Stdio::null() unless .stdin() is set, so this channel must
+    /// be resolved and passed explicitly at every exec spawn site.
+    fn exec_inherited_stdin(&self) -> Result<Stdio, ExecuteError> {
+        // FUNCTION_STDIN stages bound virtual text (command_input_scope's
+        // bind_command_fd0_input, pipeline staging); the unread remainder
+        // is what the exec'd image would read off fd 0. background_stdio
+        // materializes it the same way for async subshells.
+        if let Some(remaining) = self.function_stdin_remaining() {
+            let bytes = crate::executor::substitution_metadata::shell_text_to_raw_bytes(&remaining);
+            let file = self.materialize_exec_stdin_bytes(&bytes)?;
+            return Ok(file.map(Stdio::from).unwrap_or(Stdio::null()));
+        }
+        match self.fd_table.read_endpoint(0) {
+            Some(FdReadEndpoint::File(file))
+            | Some(FdReadEndpoint::CoprocStdout { fd: file, .. }) => {
+                let dup = crate::fd::duplicate_handle_inheritable(file.handle)?;
+                Ok(Stdio::from(crate::fd::handle_to_file(dup)))
+            }
+            // Virtual descriptors have no OS handle: materialize the unread
+            // remainder on a temp file — the shared-open-file-description
+            // shape GNU's dup2 hands the image.
+            Some(FdReadEndpoint::Text(_)) | Some(FdReadEndpoint::ProcessSubstitution(_)) => {
+                match self.fd_table.input_snapshot_bytes(0) {
+                    Some((data, offset)) => {
+                        let file =
+                            self.materialize_exec_stdin_bytes(&data[offset.min(data.len())..])?;
+                        Ok(file.map(Stdio::from).unwrap_or(Stdio::null()))
+                    }
+                    None => Ok(Stdio::null()),
+                }
+            }
+            Some(FdReadEndpoint::InheritedProcessStdin) => Ok(Stdio::inherit()),
+            // fd 0 closed (`exec 0<&-`): the closest spawnable state to
+            // GNU's inherited-but-unreadable descriptor.
+            None if self.fd_table.has_entry(0) => Ok(Stdio::null()),
+            None => Ok(Stdio::inherit()),
+        }
+    }
+
+    /// Write `bytes` to a fresh temp file and open it for the child.
+    /// process_substitution_temp_path names are unique per call. An empty
+    /// payload spawns nothing — Stdio::null() yields the same EOF.
+    fn materialize_exec_stdin_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Option<std::fs::File>, ExecuteError> {
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let path = self.process_substitution_temp_path()?;
+        std::fs::write(&path, bytes).map_err(ExecuteError::IoError)?;
+        Ok(std::fs::File::open(&path).ok())
+    }
+
+    fn exec_stdio_for_endpoint(&self, fd: u32, depth: u32) -> Result<Stdio, ExecuteError> {
+        if depth > 4 {
+            return Ok(Stdio::inherit());
+        }
+        if self.fd_table.has_entry(fd) && !self.fd_table.is_open_for_write(fd) {
+            return Ok(Stdio::null());
+        }
+        match self.fd_table.write_endpoint(fd) {
+            Some(FdWriteEndpoint::File(file_fd)) => {
+                let dup = crate::fd::duplicate_handle_inheritable(file_fd.handle)?;
+                Ok(Stdio::from(crate::fd::handle_to_file(dup)))
+            }
+            Some(FdWriteEndpoint::Stdout) if fd != 1 => self.exec_stdio_for_endpoint(1, depth + 1),
+            // A Stderr endpoint on fd != 2 is a dup2 snapshot of the
+            // ORIGINAL stderr object (rubash#279): resolving through the
+            // live fd 2 would send a child's `>&3` output into the group's
+            // later `2>/dev/null`. Stdio::inherit() passes the process's
+            // real stderr handle, which is exactly the object the dup
+            // copied (a bound fd 2 clones its File entry instead of
+            // carrying the Stderr marker, so the marker really means the
+            // implicit process stderr).
+            Some(FdWriteEndpoint::Stderr) if fd != 2 => Ok(Stdio::inherit()),
+            _ => Ok(Stdio::inherit()),
+        }
+    }
+
+    fn execute_stdio_only_exec_redirect(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<Option<i32>, ExecuteError> {
+        // GNU redir.c: `exec` with only redirections applies every
+        // redirection left to right (do_redirection_internal over the whole
+        // redirect list, redir.c:767+), keeping each descriptor open
+        // persistently and undoing nothing (RX_ACTIVE without undo). The
+        // parser mirrors every stdio shortcut field into cmd.redirects, so
+        // iterating that list in source order covers `exec >file 2>&1`,
+        // `exec 1>&3 2>&4` (redir4.sub:54), `exec 4>&1 >&3 3>&-`
+        // (redir7.sub:23), `exec 4>&- 5>&-` (redir.tests:88) and
+        // single-redirect forms alike.
+        let mut handled = false;
+        // A compound command's redirect injected into cmd.redirects (see
+        // GROUP_REDIRECT_INJECTED_MARK) is the ambient fd state GNU applies
+        // before exec runs — it participates in `>&N` resolution but must
+        // not be persisted, since exec only persists its own redirect list
+        // (execute_cmd.c exec_builtin) and the group undoes its own
+        // redirections (redir.c REDIRECTION_SAVEFD). Track those targets in
+        // `ambient` instead of the persistent fd table (niubash#118:
+        // `{ exec 10>&1; } >file` must not leave fd 1 pointing at file).
+        let mut ambient: std::collections::BTreeMap<u32, String> =
+            std::collections::BTreeMap::new();
+        for redirect in &cmd.redirects {
+            let target = self.expand_redirect_target(redirect);
+            if crate::executor::support_names::is_injected_group_redirect(redirect) {
+                let fd = redirect.fd.unwrap_or_else(|| match redirect.kind {
+                    crate::parser::RedirectKind::Input
+                    | crate::parser::RedirectKind::ReadWrite
+                    | crate::parser::RedirectKind::DuplicateInput
+                    | crate::parser::RedirectKind::CloseInput
+                    | crate::parser::RedirectKind::HereString
+                    | crate::parser::RedirectKind::HereDoc => 0,
+                    _ => 1,
+                });
+                ambient.insert(fd, target);
+                continue;
+            }
+            // Mark the redirect as handled before dispatching: every arm
+            // below ends in a `continue`, which would otherwise bypass a
+            // bottom-of-loop flag and make `exec >&file` fall through to
+            // the legacy redirect_out shortcut with the raw `&word` target
+            // (GNU redir.c do_redirection_internal applies the whole list;
+            // exec with only redirections always ends with status 0 unless
+            // a redirection itself fails).
+            handled = true;
+            // GNU redir.c do_redirection_internal → redir_varassign
+            // (redir.c:1133-1166): `exec {var}>file` allocates a fresh
+            // descriptor in list order and assigns it to var persistently
+            // (exec redirections are never undone). A failed redirect stops
+            // the list — do_redirections returns on the first error.
+            if redirect.fd_var.is_some() {
+                match self.execute_dynamic_fd_var_redirect(redirect, false) {
+                    Ok(_) => {}
+                    Err(ExecuteError::IoError(error)) => {
+                        let mut stderr = Vec::new();
+                        writeln!(
+                            &mut stderr,
+                            "{}{}",
+                            self.diagnostic_prefix(),
+                            crate::posix_errors::message(&error)
+                        )?;
+                        self.write_default_stderr(&stderr)?;
+                        self.exit_code = 1;
+                        return Ok(Some(1));
+                    }
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
+            match redirect.kind {
+                crate::parser::RedirectKind::Output
+                | crate::parser::RedirectKind::Append
+                | crate::parser::RedirectKind::ClobberOutput
+                | crate::parser::RedirectKind::CombinedOutput
+                | crate::parser::RedirectKind::CombinedAppend => {
+                    let fd = redirect.fd.unwrap_or(1);
+                    if is_closed_redirect_target(&target) {
+                        if let Some(name) = redirect.fd_var.as_deref() {
+                            self.close_dynamic_fd(name)?;
+                        } else {
+                            self.close_persistent_output_fd(fd)?;
+                            self.shell_state
+                                .env_vars
+                                .insert(fd_closed_key(fd), "1".to_string());
+                        }
+                        continue;
+                    }
+                    if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
+                        if move_source {
+                            self.close_persistent_output_fd(source_fd)?;
+                        }
+                        continue;
+                    }
+                    // GNU redir.c:832-838: exec >&WORD with a non-numeric
+                    // WORD and redirector 1 translates to r_err_and_out -
+                    // both stdout and stderr go to WORD
+                    // (redir4.sub: exec >&${TMPDIR}/err-and-out).
+                    if redirect.fd.unwrap_or(1) == 1
+                        && redirect.fd_var.is_none()
+                        && target.starts_with('&')
+                        && redirect_target_fd(&target).is_none()
+                    {
+                        let path = target.strip_prefix('&').unwrap_or(&target).to_string();
+                        if !is_null_device(&path) {
+                            self.create_redirect_output(&path, redirect.clobber)?;
+                        }
+                        self.set_fd_output_file(1, path.clone(), false, false)?;
+                        self.share_fd_output_file(1, 2, &path, false);
+                        continue;
+                    }
+                    if self.open_persistent_output_process_substitution(fd, &target)? {
+                        continue;
+                    }
+                    let append = matches!(
+                        redirect.kind,
+                        crate::parser::RedirectKind::Append
+                            | crate::parser::RedirectKind::CombinedAppend
+                    );
+                    if !is_null_device(&target) && !append {
+                        // noclobber/existing-file diagnostics live here;
+                        // the real handle open in set_fd_output_file follows.
+                        self.create_redirect_output(&target, redirect.clobber)?;
+                    }
+                    self.set_fd_output_file(fd, target.clone(), fd >= 10, append)?;
+                    if matches!(
+                        redirect.kind,
+                        crate::parser::RedirectKind::CombinedOutput
+                            | crate::parser::RedirectKind::CombinedAppend
+                    ) {
+                        // &>file / &>>file: stderr follows stdout through
+                        // the same open file description (redir.c
+                        // r_err_and_out / r_append_err_and_out).
+                        self.share_fd_output_file(fd, 2, &target, fd >= 10);
+                    }
+                }
+                crate::parser::RedirectKind::DuplicateOutput => {
+                    let fd = redirect.fd.unwrap_or(1);
+                    if is_closed_redirect_target(&target) {
+                        self.close_persistent_output_fd(fd)?;
+                        self.shell_state
+                            .env_vars
+                            .insert(fd_closed_key(fd), "1".to_string());
+                        continue;
+                    }
+                    if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        self.copy_exec_output_fd_resolving_ambient(fd, source_fd, &ambient);
+                        if move_source {
+                            self.close_persistent_output_fd(source_fd)?;
+                        }
+                        continue;
+                    }
+                    if redirect.fd.unwrap_or(1) == 1
+                        && redirect.fd_var.is_none()
+                        && target.starts_with('&')
+                    {
+                        // GNU redir.c:832-838 r_duplicating_output_word
+                        // translation (see above).
+                        let path = target.strip_prefix('&').unwrap_or(&target).to_string();
+                        if !is_null_device(&path) {
+                            self.create_redirect_output(&path, redirect.clobber)?;
+                        }
+                        self.set_fd_output_file(1, path.clone(), false, false)?;
+                        self.share_fd_output_file(1, 2, &path, false);
+                        continue;
+                    }
+                    // Other non-numeric dup targets stay AMBIGUOUS_REDIRECT
+                    // (redir.c:839-843); reject_ambiguous_redirects already
+                    // reported them before exec ran.
+                }
+                crate::parser::RedirectKind::CloseOutput => {
+                    let fd = redirect.fd.unwrap_or(1);
+                    self.close_persistent_output_fd(fd)?;
+                    self.shell_state
+                        .env_vars
+                        .insert(fd_closed_key(fd), "1".to_string());
+                }
+                crate::parser::RedirectKind::Input | crate::parser::RedirectKind::ReadWrite => {
+                    let fd = redirect.fd.unwrap_or(0);
+                    if is_closed_redirect_target(&target) {
+                        self.close_persistent_input_fd(fd);
+                        self.shell_state
+                            .env_vars
+                            .insert(fd_closed_key(fd), "1".to_string());
+                        continue;
+                    }
+                    if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        self.copy_persistent_input_fd(fd, source_fd);
+                        if move_source {
+                            self.close_persistent_input_fd(source_fd);
+                        }
+                        continue;
+                    }
+                    if let Some(source_fd) = redirect_target_fd(&target) {
+                        self.copy_persistent_input_fd(fd, source_fd);
+                        continue;
+                    }
+
+                    if let Some(source) = target
+                        .strip_prefix("<(")
+                        .and_then(|target| target.strip_suffix(')'))
+                    {
+                        if let Some(input) = self.process_substitution_output(source) {
+                            self.fd_table.open_input(
+                                fd,
+                                FdReadEndpoint::process_substitution(&input),
+                                fd != 0,
+                            );
+                            self.set_fd_input_text(fd, input, fd != 0);
+                            continue;
+                        }
+                    }
+
+                    if matches!(
+                        target.as_str(),
+                        "/dev/stdin" | "/proc/self/fd/0" | "/dev/fd/0"
+                    ) {
+                        self.fd_table.open_input(
+                            fd,
+                            FdReadEndpoint::InheritedProcessStdin,
+                            fd != 0,
+                        );
+                        continue;
+                    }
+
+                    // The operator token keeps any numeric redirector prefix
+                    // (`exec 6<>file` lexes as `6<>`), so match on the
+                    // suffix (redir.tests: `exec 6<>$TMPDIR/bash-c` then
+                    // `echo to c 1>&6`). Real handle on the slot: [N]<> is a
+                    // single O_RDWR open file description (redir.c
+                    // r_input_output) shared by both directions.
+                    if redirect.operator.ends_with("<>") {
+                        self.set_fd_readwrite_file(fd, &target, fd != 0)
+                            .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                    } else {
+                        let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                        let file = FileFd::open_read(path)
+                            .map_err(|e| crate::posix_errors::path_error(&target, e))?;
+                        self.set_fd_input_file(fd, file, fd != 0);
+                    }
+                }
+                crate::parser::RedirectKind::CloseInput => {
+                    let fd = redirect.fd.unwrap_or(0);
+                    self.close_persistent_input_fd(fd);
+                    self.shell_state
+                        .env_vars
+                        .insert(fd_closed_key(fd), "1".to_string());
+                }
+                crate::parser::RedirectKind::DuplicateInput => {
+                    let fd = redirect.fd.unwrap_or(0);
+                    if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                        if self.fd_table.is_open(source_fd) {
+                            self.copy_persistent_input_fd(fd, source_fd);
+                            if move_source {
+                                // `N<&M-` moves the descriptor wholesale:
+                                // both directions of M close (redir.c
+                                // dup_redirects move case).
+                                let _ = self.close_persistent_fd(source_fd);
+                            }
+                        } else {
+                            self.shell_state
+                                .env_vars
+                                .insert(fd_closed_key(fd), "1".to_string());
+                            // GNU redirection_error (redir.c:149-161): an
+                            // EBADF from a dup/move redirection names the
+                            // *source* fd (redirectee.dest), not the target.
+                            let _ = self.write_default_stderr(
+                                format!(
+                                    "{}{}: Bad file descriptor
+",
+                                    self.diagnostic_prefix(),
+                                    source_fd
+                                )
+                                .as_bytes(),
+                            );
+                            self.exit_code = 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            handled = true;
+        }
+
+        // `{var}<<EOF` heredocs live in heredoc_redirects, not redirects.
+        // GNU redir.c make_here_document writes the body to a temp file and
+        // redir_varassign binds the fresh fd to var persistently under exec
+        // (vredir1.sub: `exec {v}<<-EOF` leaves v holding a readable fd).
+        for redirect in &cmd.heredoc_redirects {
+            if redirect.fd_var.is_none() {
+                continue;
+            }
+            handled = true;
+            match self.execute_dynamic_fd_var_heredoc(redirect, false) {
+                Ok(_) => {}
+                Err(ExecuteError::IoError(error)) => {
+                    let mut stderr = Vec::new();
+                    writeln!(
+                        &mut stderr,
+                        "{}{}",
+                        self.diagnostic_prefix(),
+                        crate::posix_errors::message(&error)
+                    )?;
+                    self.write_default_stderr(&stderr)?;
+                    self.exit_code = 1;
+                    return Ok(Some(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if let Some((fd, input)) = self.exec_heredoc_fd_input(cmd) {
+            self.set_fd_input_text(fd, input, fd != 0);
+            return Ok(Some(0));
+        }
+
+        if handled {
+            // GNU applys the redirections and keeps `exec` itself as a
+            // no-op with status 0 (redir.c / builtins/exec.def: `exec`
+            // with only redirections).
+            return Ok(Some(0));
+        }
+        Ok(None)
+    }
+
+    fn exec_heredoc_fd_input(&self, cmd: &CommandNode) -> Option<(u32, String)> {
+        let redirect = cmd
+            .heredoc_redirects
+            .iter()
+            .rev()
+            .find(|redirect| redirect.fd.is_some() && redirect.body.is_some())?;
+        let fd = redirect.fd?;
+        let body = redirect.body.as_deref()?;
+        let input = if let Some(carrier) = &redirect.body_carrier {
+            if let crate::parser::StdinBody::Preexpanded(text) = carrier {
+                text.clone()
+            } else {
+                // NeedsExpansion case: fall through to legacy checks
+                if let Some(word) = body.strip_prefix(STORAGE_WORD_PREFIX) {
+                    let mut input =
+                        decode_ansi_c_quoted_word(word).unwrap_or_else(|| self.expand_word(word));
+                    input.push('\n');
+                    input
+                } else {
+                    strip_unterminated_heredoc_marker(strip_quoted_heredoc_marker(body)).to_string()
+                }
+            }
+        } else if let Some(word) = body.strip_prefix(STORAGE_WORD_PREFIX) {
+            let mut input =
+                decode_ansi_c_quoted_word(word).unwrap_or_else(|| self.expand_word(word));
+            input.push('\n');
+            input
+        } else if let Some(pre) = preexpanded_stdin_body(body) {
+            pre.to_string()
+        } else {
+            strip_unterminated_heredoc_marker(strip_quoted_heredoc_marker(body)).to_string()
+        };
+        Some((fd, input))
+    }
+
+    /// `exec fd>&src` inside a redirected compound must resolve `src`
+    /// against the ambient fd state the compound's own redirects created
+    /// (GROUP_REDIRECT_INJECTED_MARK entries collect into `ambient`),
+    /// without persisting those ambient writes. Follows alias chains and
+    /// file targets; falls back to the persistent fd table when the source
+    /// fd has no ambient entry (niubash#118).
+    fn copy_exec_output_fd_resolving_ambient(
+        &mut self,
+        target_fd: u32,
+        source_fd: u32,
+        ambient: &std::collections::BTreeMap<u32, String>,
+    ) {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut current = source_fd;
+        while let Some(target) = ambient.get(&current) {
+            if !seen.insert(current) {
+                break;
+            }
+            if is_closed_redirect_target(target) {
+                let _ = self.close_persistent_output_fd(target_fd);
+                self.shell_state
+                    .env_vars
+                    .insert(fd_closed_key(target_fd), "1".to_string());
+                return;
+            }
+            if let Some((next_fd, _)) = redirect_target_fd_and_move(target) {
+                current = next_fd;
+                continue;
+            }
+            // dup semantics: point the fd at the same target without
+            // re-opening/truncating — the compound's own open already
+            // created and truncated the file (niubash#118: a fresh
+            // create here erased earlier group output).
+            if self.fd_table.dup_output(target_fd, current).is_err() {
+                let path = shell_path_to_windows(target, &self.shell_state.env_vars);
+                if let Ok(file) = FileFd::open_write(path, true, false) {
+                    self.fd_table.open_output(
+                        target_fd,
+                        FdWriteEndpoint::File(file),
+                        target_fd >= 10,
+                    );
+                    self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
+                    self.shell_state
+                        .env_vars
+                        .insert(fd_output_key(target_fd), target.clone());
+                }
+            }
+            return;
+        }
+        self.copy_persistent_output_fd(target_fd, current);
+    }
+
+    /// Writes the `__RUBASH_FD_*` write-side ledger for `fd` from whatever
+    /// write endpoint is installed (or clears it). Used after dup/open.
+    pub(in crate::executor) fn record_output_fd_ledger(&mut self, target_fd: u32) {
+        match self.fd_table.output_endpoint(target_fd) {
+            Some(FdWriteEndpoint::Stdout) => {
+                self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
+                self.shell_state
+                    .env_vars
+                    .insert(fd_output_key(target_fd), FD_STDOUT_TARGET.to_string());
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_output_process_substitution_key(target_fd));
+            }
+            Some(FdWriteEndpoint::Stderr) => {
+                self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
+                self.shell_state
+                    .env_vars
+                    .insert(fd_output_key(target_fd), FD_STDERR_TARGET.to_string());
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_output_process_substitution_key(target_fd));
+            }
+            Some(FdWriteEndpoint::File(file_fd)) => {
+                self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
+                self.shell_state.env_vars.insert(
+                    fd_output_key(target_fd),
+                    shell_display_path(&file_fd.path.to_string_lossy()),
+                );
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_output_process_substitution_key(target_fd));
+            }
+            Some(FdWriteEndpoint::CoprocStdin { pid, .. }) => {
+                self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
+                self.shell_state.env_vars.insert(
+                    fd_output_key(target_fd),
+                    format!("{FD_COPROC_STDIN_TARGET_PREFIX}{pid}"),
+                );
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_output_process_substitution_key(target_fd));
+            }
+            Some(FdWriteEndpoint::ProcessSubstitution { path, command }) => {
+                self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
+                self.shell_state.env_vars.insert(
+                    fd_output_key(target_fd),
+                    shell_display_path(&path.to_string_lossy()),
+                );
+                self.shell_state
+                    .env_vars
+                    .insert(fd_output_process_substitution_key(target_fd), command);
+            }
+            None => {
+                self.shell_state.env_vars.remove(&fd_output_key(target_fd));
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_output_process_substitution_key(target_fd));
+            }
+        }
+    }
+
+    fn copy_persistent_output_fd(&mut self, target_fd: u32, source_fd: u32) {
+        // GNU dup2 semantics: `N>&M` copies the whole descriptor — a
+        // read-only source (`exec 0>&3`) also installs the read side.
+        if self.fd_table.is_open(source_fd) {
+            let source_endpoint = self.fd_table.write_endpoint(source_fd);
+            let target_endpoint = self.fd_table.write_endpoint(target_fd);
+            if target_fd != source_fd
+                && target_endpoint.as_ref().is_some_and(|endpoint| {
+                    matches!(endpoint, FdWriteEndpoint::ProcessSubstitution { .. })
+                })
+                && target_endpoint != source_endpoint
+            {
+                let _ = self.close_persistent_output_fd(target_fd);
+            }
+            if self.fd_table.dup_output(target_fd, source_fd).is_ok() {
+                self.record_output_fd_ledger(target_fd);
+                self.record_input_fd_ledger(target_fd);
+            } else {
+                let _ = self.close_persistent_output_fd(target_fd);
+                self.shell_state
+                    .env_vars
+                    .insert(fd_closed_key(target_fd), "1".to_string());
+            }
+            return;
+        }
+        if self
+            .shell_state
+            .env_vars
+            .contains_key(&fd_closed_key(source_fd))
+        {
+            let _ = self.close_persistent_output_fd(target_fd);
+            self.shell_state
+                .env_vars
+                .insert(fd_closed_key(target_fd), "1".to_string());
+        } else if self.coproc_write_file(source_fd).is_some() {
+            self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
+            self.shell_state.env_vars.insert(
+                fd_output_key(target_fd),
+                format!("{FD_COPROC_STDIN_TARGET_PREFIX}{source_fd}"),
+            );
+            self.shell_state
+                .env_vars
+                .remove(&fd_output_process_substitution_key(target_fd));
+        } else if let Some(target) = self
+            .shell_state
+            .env_vars
+            .get(&fd_output_key(source_fd))
+            .cloned()
+        {
+            self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
+            self.shell_state
+                .env_vars
+                .insert(fd_output_key(target_fd), target);
+            if let Some(source) = self
+                .shell_state
+                .env_vars
+                .get(&fd_output_process_substitution_key(source_fd))
+                .cloned()
+            {
+                self.shell_state
+                    .env_vars
+                    .insert(fd_output_process_substitution_key(target_fd), source);
+            } else {
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_output_process_substitution_key(target_fd));
+            }
+        } else if let Some(target) = stdio_output_target(source_fd) {
+            self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
+            self.shell_state
+                .env_vars
+                .insert(fd_output_key(target_fd), target.to_string());
+            self.shell_state
+                .env_vars
+                .remove(&fd_output_process_substitution_key(target_fd));
+        } else {
+            let _ = self.close_persistent_output_fd(target_fd);
+            self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
+        }
+    }
+
+    fn open_persistent_output_process_substitution(
+        &mut self,
+        fd: u32,
+        target: &str,
+    ) -> Result<bool, ExecuteError> {
+        let Some(source) = target
+            .strip_prefix(">(")
+            .and_then(|target| target.strip_suffix(')'))
+        else {
+            return Ok(false);
+        };
+
+        let path = self.empty_process_substitution_temp()?;
+        self.fd_table.open_output(
+            fd,
+            FdWriteEndpoint::ProcessSubstitution {
+                path: path.clone(),
+                command: source.to_string(),
+            },
+            fd >= 10,
+        );
+        self.shell_state.env_vars.remove(&fd_closed_key(fd));
+        self.shell_state
+            .env_vars
+            .insert(fd_output_key(fd), path.to_string_lossy().into_owned());
+        self.shell_state
+            .env_vars
+            .insert(fd_output_process_substitution_key(fd), source.to_string());
+        Ok(true)
+    }
+
+    fn close_persistent_output_fd(&mut self, fd: u32) -> Result<(), ExecuteError> {
+        let coproc_pid = self
+            .fd_table
+            .entries
+            .get(&fd)
+            .filter(|entry| !entry.closed)
+            .and_then(|entry| match entry.write.as_ref() {
+                Some(FdWriteEndpoint::CoprocStdin { pid, .. }) => Some(*pid),
+                _ => None,
+            });
+        self.fd_table.close_output(fd);
+        if let Some(pid) = coproc_pid {
+            self.mark_coproc_array_endpoint_closed(pid, fd);
+        }
+        let target = self.shell_state.env_vars.remove(&fd_output_key(fd));
+        let source = self
+            .shell_state
+            .env_vars
+            .remove(&fd_output_process_substitution_key(fd));
+        if let (Some(target), Some(source)) = (target, source) {
+            let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+            let input = fs::read_to_string(&path).unwrap_or_default();
+            self.execute_persistent_output_process_substitution(&source, input)?;
+            let _ = fs::remove_file(path);
+        }
+        Ok(())
+    }
+
+    fn close_persistent_input_fd(&mut self, fd: u32) {
+        let coproc_pid = self
+            .fd_table
+            .read_endpoint(fd)
+            .and_then(|endpoint| match endpoint {
+                FdReadEndpoint::CoprocStdout { pid, .. } => Some(pid),
+                _ => None,
+            });
+        self.fd_table.close_input(fd);
+        if let Some(pid) = coproc_pid {
+            self.mark_coproc_array_endpoint_closed(pid, fd);
+        }
+        self.shell_state.env_vars.remove(&fd_stdin_key(fd));
+        self.shell_state.env_vars.remove(&fd_stdin_offset_key(fd));
+        self.shell_state.env_vars.remove(&fd_dynamic_input_key(fd));
+    }
+
+    fn mark_coproc_array_endpoint_closed(&mut self, pid: u32, fd: u32) {
+        let names: Vec<String> = self
+            .shell_state
+            .env_vars
+            .iter()
+            .filter_map(|(name, value)| {
+                (name.ends_with("_PID") && value.parse::<u32>().ok() == Some(pid))
+                    .then(|| name.trim_end_matches("_PID").to_string())
+            })
+            .collect();
+        for name in names {
+            let Some(storage) = self.shell_state.env_vars.get(&name).cloned() else {
+                continue;
+            };
+            let mut entries = indexed_array_entries(&storage);
+            let mut changed = false;
+            for value in entries.values_mut() {
+                if value == &fd.to_string() {
+                    *value = "-1".to_string();
+                    changed = true;
+                }
+            }
+            if changed {
+                crate::executor::arrays::sync_typed_indexed_array(
+                    &mut self.shell_state.variables,
+                    name.as_str(),
+                    &entries,
+                );
+                self.shell_state
+                    .env_vars
+                    .insert(name, format_indexed_array_storage(entries));
+                self.shell_state.env_vars.clear_array_cells_dirty();
+            }
+        }
+    }
+
+    fn close_persistent_fd(&mut self, fd: u32) -> Result<(), ExecuteError> {
+        self.close_persistent_output_fd(fd)?;
+        self.close_persistent_input_fd(fd);
+        self.fd_table.close(fd);
+        self.shell_state
+            .env_vars
+            .insert(fd_closed_key(fd), "1".to_string());
+        Ok(())
+    }
+
+    pub(in crate::executor) fn execute_persistent_output_process_substitution(
+        &mut self,
+        source: &str,
+        input: String,
+    ) -> Result<(), ExecuteError> {
+        let tokens = crate::lexer::tokenize(source);
+        let ast = crate::parser::parse(&tokens);
+        let old_stdin = self.shell_state.env_vars.get(FUNCTION_STDIN).cloned();
+        let old_offset = self
+            .shell_state
+            .env_vars
+            .get(FUNCTION_STDIN_OFFSET)
+            .cloned();
+        let old_fd0 = self.fd_table.entries.get(&0).cloned();
+        let fd0_key = fd_stdin_key(0);
+        let fd0_offset_key = fd_stdin_offset_key(0);
+        let fd0_dynamic_key = fd_dynamic_input_key(0);
+        let fd0_closed_key = fd_closed_key(0);
+        let old_fd0_stdin = self.shell_state.env_vars.get(&fd0_key).cloned();
+        let old_fd0_offset = self.shell_state.env_vars.get(&fd0_offset_key).cloned();
+        let old_fd0_dynamic = self.shell_state.env_vars.get(&fd0_dynamic_key).cloned();
+        let old_fd0_closed = self.shell_state.env_vars.get(&fd0_closed_key).cloned();
+        self.set_fd_input_text(0, input.clone(), false);
+        self.shell_state
+            .env_vars
+            .insert(FUNCTION_STDIN.to_string(), input);
+        self.shell_state
+            .env_vars
+            .insert(FUNCTION_STDIN_OFFSET.to_string(), "0".to_string());
+        let result = self.execute_ast(&ast);
+        match old_fd0 {
+            Some(entry) => {
+                self.fd_table.entries.insert(0, entry);
+            }
+            None => {
+                self.fd_table.entries.remove(&0);
+            }
+        }
+        restore_optional_env_var(&mut self.shell_state.env_vars, &fd0_key, old_fd0_stdin);
+        restore_optional_env_var(
+            &mut self.shell_state.env_vars,
+            &fd0_offset_key,
+            old_fd0_offset,
+        );
+        restore_optional_env_var(
+            &mut self.shell_state.env_vars,
+            &fd0_dynamic_key,
+            old_fd0_dynamic,
+        );
+        restore_optional_env_var(
+            &mut self.shell_state.env_vars,
+            &fd0_closed_key,
+            old_fd0_closed,
+        );
+        restore_optional_env_var(&mut self.shell_state.env_vars, FUNCTION_STDIN, old_stdin);
+        restore_optional_env_var(
+            &mut self.shell_state.env_vars,
+            FUNCTION_STDIN_OFFSET,
+            old_offset,
+        );
+        result
+    }
+
+    /// GNU redir.c do_redirections → redir_varassign (redir.c:1133-1166):
+    /// every `{var}` redirection allocates a fresh descriptor and assigns
+    /// the number to the variable — for builtins, functions and external
+    /// commands alike — before the command runs. Applies all fd_var
+    /// redirects of `cmd` in list order; returns whether any failed (the
+    /// command then does not run, matching GNU's redirection-error
+    /// abort). `auto_close` mirrors the caller's varredir_close handling
+    /// (the option itself is checked inside execute_dynamic_fd_var_redirect).
+    pub(in crate::executor) fn apply_dynamic_fd_var_redirects(
+        &mut self,
+        cmd: &CommandNode,
+        auto_close: bool,
+    ) -> Result<bool, ExecuteError> {
+        // RESTRICTED_SHELL (#804 F1/N2): the refusal must precede
+        // redir_varassign — GNU checks restricted before the varassign arm
+        // opens or creates the target — and it speaks at the FIRST
+        // restricted-write entry in the list (`> s1.txt {v}> s2.txt`
+        // refuses `s1.txt`, never materializing either; `2>/dev/null
+        // {v}> g.txt` refuses the /dev/null form itself, GNU 5.3), on
+        // every applier path (simple-command preflight and the
+        // exec-with-operand site alike).
+        if self.reject_restricted_write_redirect_entry(cmd)? {
+            return Ok(true);
+        }
+        let mut redirect_failed = false;
+        self.fd_var_external_undo.clear();
+        for redirect in &cmd.redirects {
+            let Some(name) = redirect.fd_var.as_deref() else {
+                continue;
+            };
+            // Record the variable's prior value so commands that fork
+            // before do_redirections (external programs, forced-fork null
+            // commands — execute_cmd.c:4216) can undo the binding. The
+            // scalar store lives in both env_vars and the typed VariableStore
+            // (temporary_assignments.rs apply_shell_assignment_inner), so the
+            // snapshot covers both.
+            let resolved = self
+                .resolved_variable_name(name)
+                .unwrap_or_else(|| name.to_string());
+            let prior = self.shell_state.env_vars.get(&resolved).cloned();
+            let prior_typed = self.shell_state.variables.get(&resolved).cloned();
+            self.fd_var_external_undo
+                .push((resolved, prior, prior_typed));
+            match self.execute_dynamic_fd_var_redirect(redirect, auto_close) {
+                Ok(_) => {}
+                Err(ExecuteError::IoError(error)) => {
+                    let mut stderr = Vec::new();
+                    writeln!(
+                        &mut stderr,
+                        "{}{}",
+                        self.diagnostic_prefix(),
+                        crate::posix_errors::message(&error)
+                    )?;
+                    self.write_default_stderr(&stderr)?;
+                    self.exit_code = 1;
+                    redirect_failed = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // `{var}<<EOF` heredocs live in heredoc_redirects, not redirects.
+        // GNU redir.c make_here_document writes the body to a temp file and
+        // redir_varassign binds the fresh fd to var, so `exec {v}<<-EOF`
+        // leaves v holding a readable descriptor (vredir1.sub).
+        for redirect in &cmd.heredoc_redirects {
+            let Some(name) = redirect.fd_var.as_deref() else {
+                continue;
+            };
+            let resolved = self
+                .resolved_variable_name(name)
+                .unwrap_or_else(|| name.to_string());
+            let prior = self.shell_state.env_vars.get(&resolved).cloned();
+            let prior_typed = self.shell_state.variables.get(&resolved).cloned();
+            self.fd_var_external_undo
+                .push((resolved, prior, prior_typed));
+            match self.execute_dynamic_fd_var_heredoc(redirect, auto_close) {
+                Ok(_) => {}
+                Err(ExecuteError::IoError(error)) => {
+                    let mut stderr = Vec::new();
+                    writeln!(
+                        &mut stderr,
+                        "{}{}",
+                        self.diagnostic_prefix(),
+                        crate::posix_errors::message(&error)
+                    )?;
+                    self.write_default_stderr(&stderr)?;
+                    self.exit_code = 1;
+                    redirect_failed = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(redirect_failed)
+    }
+
+    /// `{var}<<[-]EOF` / `{var}<<<word` — allocate a dynamic fd holding the
+    /// heredoc/herestring body and bind it to var (redir.c make_here_document
+    /// + redir_varassign).
+    fn execute_dynamic_fd_var_heredoc(
+        &mut self,
+        redirect: &crate::parser::HereDocRedirect,
+        auto_close: bool,
+    ) -> Result<bool, ExecuteError> {
+        let Some(name) = redirect.fd_var.as_deref() else {
+            return Ok(false);
+        };
+        if self.dynamic_fd_assignment_readonly(name) {
+            let prefix = self.diagnostic_prefix();
+            let payload =
+                format!("{name}: readonly variable\n{prefix}{name}: cannot assign fd to variable");
+            return Err(ExecuteError::IoError(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                payload,
+            )));
+        }
+        let close_after_command = auto_close
+            && crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "varredir_close");
+        let body = if redirect.body_carrier.is_some() {
+            if redirect.here_string {
+                self.expand_here_string_mut_from_carrier(&redirect.body_carrier)
+            } else {
+                self.expand_heredoc_body_mut_from_carrier(&redirect.body_carrier)
+            }
+        } else if let Some(body) = &redirect.body {
+            self.expand_heredoc_body_mut(body)
+        } else {
+            String::new()
+        };
+        let Some(fd) = self.allocate_dynamic_fd() else {
+            // GNU exhausts {var} heredocs through the same REDIR_VARASSIGN
+            // fcntl F_DUPFD path (probe: ulimit -Sn 6 then exec {v}<<E
+            // prints "redirection error: cannot duplicate fd: ..." too), so
+            // carry the identical errno-aware payload; GNU's own line-2
+            // target word for heredocs is the internal doc pointer, the
+            // variable name is the honest stand-in.
+            return Err(ExecuteError::IoError(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                self.fd_dup_error_payload(name),
+            )));
+        };
+        self.fd_table
+            .open_input(fd, FdReadEndpoint::text(&body), true);
+        if !self.set_dynamic_fd_variable(name, fd) {
+            self.close_persistent_fd(fd)?;
+            return Err(ExecuteError::IoError(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("{name}: cannot assign fd to variable"),
+            )));
+        }
+        if close_after_command {
+            self.close_persistent_fd(fd)?;
+        }
+        Ok(true)
+    }
+
+    /// GNU execute_cmd.c: an external command forks before do_redirections,
+    /// so a `{var}` redirection binds only in the child — the parent's
+    /// variable is untouched and the freshly allocated descriptor dies
+    /// with the child. Undoes what apply_dynamic_fd_var_redirects recorded
+    /// for the just-finished command.
+    pub(in crate::executor) fn undo_child_fd_var_redirects(&mut self) {
+        let undo = std::mem::take(&mut self.fd_var_external_undo);
+        for (name, prior, prior_typed) in undo {
+            if let Some(fd) = self.dynamic_fd_variable_value(&name) {
+                let _ = self.close_persistent_fd(fd);
+            }
+            match prior {
+                Some(value) => {
+                    self.shell_state.env_vars.insert(name.clone(), value);
+                }
+                None => {
+                    self.shell_state.env_vars.remove(&name);
+                }
+            }
+            match prior_typed {
+                Some(variable) => {
+                    let _ = self.shell_state.variables.set(name, variable);
+                }
+                None => {
+                    let _ = self.shell_state.variables.remove(&name);
+                }
+            }
+        }
+    }
+
+    pub(in crate::executor) fn execute_dynamic_fd_var_redirect(
+        &mut self,
+        redirect: &Redirect,
+        auto_close: bool,
+    ) -> Result<bool, ExecuteError> {
+        let Some(name) = redirect.fd_var.as_deref() else {
+            return Ok(false);
+        };
+        let target = self.expand_redirect_target(redirect);
+        let is_close = matches!(
+            redirect.kind,
+            crate::parser::RedirectKind::CloseInput | crate::parser::RedirectKind::CloseOutput
+        );
+        if !is_close && self.dynamic_fd_assignment_readonly(name) {
+            // GNU sets up the redirection (creating output targets, opening
+            // input files) before failing the assignment, and the command
+            // itself never runs.
+            match redirect.kind {
+                crate::parser::RedirectKind::Output => {
+                    self.create_redirect_output(&target, redirect.clobber)?;
+                }
+                crate::parser::RedirectKind::Append => {
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+                }
+                crate::parser::RedirectKind::ReadWrite => {
+                    OpenOptions::new()
+                        .create(true)
+                        .read(true)
+                        .write(true)
+                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+                }
+                crate::parser::RedirectKind::Input => {
+                    let _ = crate::executor::substitution_metadata::read_shell_input_file(
+                        shell_path_to_windows(&target, &self.shell_state.env_vars),
+                    )
+                    .map_err(|io| crate::posix_errors::path_error(&target, io))?;
+                }
+                _ => {}
+            }
+            let prefix = self.diagnostic_prefix();
+            let payload =
+                format!("{name}: readonly variable\n{prefix}{name}: cannot assign fd to variable");
+            return Err(ExecuteError::IoError(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                payload,
+            )));
+        }
+        let close_after_command = auto_close
+            && crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "varredir_close");
+
+        let close_after_success = |executor: &mut Self, fd: u32| -> Result<(), ExecuteError> {
+            if close_after_command {
+                executor.close_persistent_fd(fd)?;
+            }
+            Ok(())
+        };
+
+        match redirect.kind {
+            crate::parser::RedirectKind::CloseInput => {
+                // GNU redir.c:1219-1223 (r_close_this + REDIR_VARASSIGN):
+                // the fd to close comes from redir_varvalue — an unset or
+                // non-numeric variable is an ambiguous redirect.
+                if self.dynamic_fd_variable_value(name).is_none() {
+                    return Err(ExecuteError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{name}: ambiguous redirect"),
+                    )));
+                }
+                self.close_dynamic_input_fd(name);
+                return Ok(true);
+            }
+            crate::parser::RedirectKind::CloseOutput => {
+                if self.dynamic_fd_variable_value(name).is_none() {
+                    return Err(ExecuteError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{name}: ambiguous redirect"),
+                    )));
+                }
+                self.close_dynamic_output_fd(name)?;
+                return Ok(true);
+            }
+            crate::parser::RedirectKind::DuplicateInput => {
+                if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                    if !self.fd_table.is_open_for_read(source_fd) {
+                        return Ok(true);
+                    }
+                    let Some(fd) = self.allocate_dynamic_fd() else {
+                        return Err(ExecuteError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            self.fd_dup_error_payload(&target),
+                        )));
+                    };
+                    self.copy_persistent_input_fd(fd, source_fd);
+                    if !self.set_dynamic_fd_variable(name, fd) {
+                        // GNU redir.c:1161-1166: redir_varassign failure
+                        // closes the just-duplicated fd — no slot leak.
+                        self.close_persistent_fd(fd)?;
+                        return Err(ExecuteError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("{name}: cannot assign fd to variable"),
+                        )));
+                    }
+                    if move_source {
+                        self.close_persistent_input_fd(source_fd);
+                    }
+                    close_after_success(self, fd)?;
+                    return Ok(true);
+                }
+            }
+            crate::parser::RedirectKind::DuplicateOutput => {
+                if let Some((source_fd, move_source)) = redirect_target_fd_and_move(&target) {
+                    if !self.fd_table.is_open_for_write(source_fd) {
+                        return Ok(true);
+                    }
+                    let Some(fd) = self.allocate_dynamic_fd() else {
+                        return Err(ExecuteError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            self.fd_dup_error_payload(&target),
+                        )));
+                    };
+                    self.copy_persistent_output_fd(fd, source_fd);
+                    if !self.set_dynamic_fd_variable(name, fd) {
+                        self.close_persistent_fd(fd)?;
+                        return Err(ExecuteError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("{name}: cannot assign fd to variable"),
+                        )));
+                    }
+                    if move_source {
+                        self.close_persistent_output_fd(source_fd)?;
+                    }
+                    close_after_success(self, fd)?;
+                    return Ok(true);
+                }
+            }
+            crate::parser::RedirectKind::Input | crate::parser::RedirectKind::ReadWrite => {
+                if let Some(source) = target
+                    .strip_prefix("<(")
+                    .and_then(|target| target.strip_suffix(')'))
+                {
+                    if let Some(input) = self.process_substitution_output(source) {
+                        let Some(fd) = self.allocate_dynamic_fd() else {
+                            return Err(ExecuteError::IoError(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                self.fd_dup_error_payload(&target),
+                            )));
+                        };
+                        self.fd_table.open_input(
+                            fd,
+                            FdReadEndpoint::process_substitution(&input),
+                            true,
+                        );
+                        self.set_fd_input_text(fd, input, true);
+                        if redirect.kind == crate::parser::RedirectKind::ReadWrite {
+                            // `<(...)` has no openable path; ledger-only
+                            // companion is best-effort.
+                            let _ = self.set_fd_output_file(fd, target.clone(), true, true);
+                        }
+                        if !self.set_dynamic_fd_variable(name, fd) {
+                            self.close_persistent_fd(fd)?;
+                            return Err(ExecuteError::IoError(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("{name}: cannot assign fd to variable"),
+                            )));
+                        }
+                        close_after_success(self, fd)?;
+                        return Ok(true);
+                    }
+                }
+
+                // GNU redir.c redir_open: on Linux `/dev/stdin` is a symlink
+                // to /proc/self/fd/N, so opening it hands back the LIVE
+                // stream behind that fd (same pipe buffer, same terminal) —
+                // never a fresh device. Windows has no such filesystem and
+                // the host path translation maps /dev/stdin to the CONIN$
+                // console device, which blocks forever on read. Recognize
+                // the fd-alias spellings here and dup the referenced fd,
+                // exactly like the `N<&M` branch above (niubash#118 fixed
+                // the plain fd-0 read path the same way; bashdb's
+                // `exec {fd}</dev/stdin` command-file reader hits this).
+                if redirect.kind == crate::parser::RedirectKind::Input {
+                    if let Some(source_fd) = redirect_target_fd(&target) {
+                        if self.fd_table.is_open_for_read(source_fd) {
+                            let Some(fd) = self.allocate_dynamic_fd() else {
+                                return Err(ExecuteError::IoError(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    self.fd_dup_error_payload(&target),
+                                )));
+                            };
+                            self.copy_persistent_input_fd(fd, source_fd);
+                            if !self.set_dynamic_fd_variable(name, fd) {
+                                self.close_persistent_fd(fd)?;
+                                return Err(ExecuteError::IoError(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("{name}: cannot assign fd to variable"),
+                                )));
+                            }
+                            close_after_success(self, fd)?;
+                            return Ok(true);
+                        }
+                    }
+                }
+
+                let path = shell_path_to_windows(&target, &self.shell_state.env_vars);
+                let file = if redirect.kind == crate::parser::RedirectKind::ReadWrite {
+                    FileFd::open_readwrite(path)
+                } else {
+                    FileFd::open_read(path)
+                }
+                .map_err(|io| crate::posix_errors::path_error(&target, io))?;
+                let Some(fd) = self.allocate_dynamic_fd() else {
+                    return Err(ExecuteError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        self.fd_dup_error_payload(&target),
+                    )));
+                };
+                self.set_fd_input_file(fd, file.clone(), true);
+                if redirect.kind == crate::parser::RedirectKind::ReadWrite {
+                    self.fd_table
+                        .open_output(fd, FdWriteEndpoint::File(file), true);
+                    self.shell_state.env_vars.remove(&fd_closed_key(fd));
+                    self.shell_state
+                        .env_vars
+                        .insert(fd_output_key(fd), target.clone());
+                }
+                if !self.set_dynamic_fd_variable(name, fd) {
+                    self.close_persistent_fd(fd)?;
+                    return Err(ExecuteError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{name}: cannot assign fd to variable"),
+                    )));
+                }
+                close_after_success(self, fd)?;
+                return Ok(true);
+            }
+            crate::parser::RedirectKind::Output
+            | crate::parser::RedirectKind::Append
+            | crate::parser::RedirectKind::ClobberOutput => {
+                let Some(fd) = self.allocate_dynamic_fd() else {
+                    return Err(ExecuteError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        self.fd_dup_error_payload(&target),
+                    )));
+                };
+                if let Some(source) = target
+                    .strip_prefix(">(")
+                    .and_then(|target| target.strip_suffix(')'))
+                {
+                    if self.open_persistent_output_process_substitution(fd, &target)? {
+                        if !self.set_dynamic_fd_variable(name, fd) {
+                            self.close_persistent_fd(fd)?;
+                            return Err(ExecuteError::IoError(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("{name}: cannot assign fd to variable"),
+                            )));
+                        }
+                        close_after_success(self, fd)?;
+                        return Ok(true);
+                    }
+                    let _ = source;
+                }
+                if redirect.kind != crate::parser::RedirectKind::Append {
+                    self.create_redirect_output(&target, redirect.clobber)?;
+                }
+                self.set_fd_output_file(
+                    fd,
+                    target,
+                    true,
+                    redirect.kind == crate::parser::RedirectKind::Append,
+                )?;
+                if !self.set_dynamic_fd_variable(name, fd) {
+                    self.close_persistent_fd(fd)?;
+                    return Err(ExecuteError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{name}: cannot assign fd to variable"),
+                    )));
+                }
+                close_after_success(self, fd)?;
+                return Ok(true);
+            }
+            _ => {}
+        }
+
+        Ok(true)
+    }
+
+    /// Writes the `__RUBASH_FD_*` read-side ledger for `fd` from whatever
+    /// read endpoint is installed (or clears it). Used after dup/open.
+    fn record_input_fd_ledger(&mut self, target_fd: u32) {
+        match self
+            .fd_table
+            .entries
+            .get(&target_fd)
+            .and_then(|entry| entry.read.clone())
+        {
+            Some(FdReadEndpoint::InheritedProcessStdin) => {
+                self.shell_state
+                    .env_vars
+                    .insert(fd_stdin_key(target_fd), FD_PROCESS_STDIN_TARGET.to_string());
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_stdin_offset_key(target_fd));
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_dynamic_input_key(target_fd));
+            }
+            Some(FdReadEndpoint::Text(_)) | Some(FdReadEndpoint::ProcessSubstitution(_)) => {
+                if let Some((input, offset)) = self.fd_table.input_snapshot(target_fd) {
+                    self.shell_state
+                        .env_vars
+                        .insert(fd_stdin_key(target_fd), input);
+                    self.shell_state
+                        .env_vars
+                        .insert(fd_stdin_offset_key(target_fd), offset.to_string());
+                    self.shell_state
+                        .env_vars
+                        .insert(fd_dynamic_input_key(target_fd), "1".to_string());
+                }
+            }
+            Some(FdReadEndpoint::File(file_fd)) => {
+                self.shell_state.env_vars.insert(
+                    fd_stdin_key(target_fd),
+                    shell_display_path(&file_fd.path.to_string_lossy()),
+                );
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_stdin_offset_key(target_fd));
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_dynamic_input_key(target_fd));
+            }
+            Some(FdReadEndpoint::CoprocStdout { pid, .. }) => {
+                self.shell_state.env_vars.insert(
+                    fd_stdin_key(target_fd),
+                    format!("{FD_COPROC_STDIN_TARGET_PREFIX}{pid}"),
+                );
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_stdin_offset_key(target_fd));
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_dynamic_input_key(target_fd));
+            }
+            None => {
+                self.shell_state.env_vars.remove(&fd_stdin_key(target_fd));
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_stdin_offset_key(target_fd));
+                self.shell_state
+                    .env_vars
+                    .remove(&fd_dynamic_input_key(target_fd));
+            }
+        }
+    }
+
+    fn copy_persistent_input_fd(&mut self, target_fd: u32, source_fd: u32) {
+        // GNU dup2 semantics (redir.c dup_redirects): `N<&M` copies the whole
+        // descriptor — the `<`/`>` letter only picks the default fd number.
+        // A write-only source (e.g. `exec 8<&1`) still installs fd 8's write
+        // side, which is what makes `echo >&8` work.
+        //
+        // fd 0's input may live on the FUNCTION_STDIN text channel (an
+        // in-process THIS_SH child's `< file` installs it there while
+        // fd_table[0] stays InheritedProcessStdin). GNU dup2 of fd 0 copies
+        // the redirected open file description, so materialize the channel
+        // into a shared Text endpoint first — the Rc<RefCell<TextInput>>
+        // then gives both slots one cursor (redir4.sub `exec 3<&0`).
+        if source_fd == 0
+            && matches!(
+                self.fd_table.read_endpoint(0),
+                Some(FdReadEndpoint::InheritedProcessStdin)
+            )
+        {
+            // FUNCTION_STDIN keeps the full buffer and its offset cursor for
+            // consumers that read it directly; the fd-table endpoint gets the
+            // unread tail so both channels agree on what fd 0 serves next.
+            if let Some(remaining) = self.function_stdin_remaining() {
+                self.set_fd_input_bytes(
+                    0,
+                    crate::executor::substitution_metadata::shell_text_to_raw_bytes(&remaining),
+                    false,
+                );
+            }
+        }
+        if self.fd_table.is_open(source_fd) {
+            if self.fd_table.dup_input(target_fd, source_fd).is_ok() {
+                self.record_input_fd_ledger(target_fd);
+                self.record_output_fd_ledger(target_fd);
+                self.shell_state.env_vars.remove(&fd_closed_key(target_fd));
+            } else {
+                self.close_persistent_input_fd(target_fd);
+                self.shell_state
+                    .env_vars
+                    .insert(fd_closed_key(target_fd), "1".to_string());
+            }
+            return;
+        }
+        // A source that is absent from FdTable is closed. Do not resurrect
+        // shell input from the legacy environment mirror.
+        self.close_persistent_input_fd(target_fd);
+    }
+
+    /// The RLIMIT_NOFILE *soft* limit the {var} allocator must stay below
+    /// (GNU redir.c:940 fcntl F_DUPFD semantics), or None for unlimited.
+    ///
+    /// The Windows emulation stores the pair as `"<soft>:<hard>"` decimal
+    /// under `__RUBASH_ULIMIT_N` (builtins/ulimit.rs plat::set; u64::MAX
+    /// means unlimited) and forwards it to spawned children, so parse the
+    /// soft side. An absent key is NOT unlimited: it is the default soft
+    /// limit (10240 — the WSL GNU 5.3.0 oracle's RLIMIT_NOFILE soft, which
+    /// is also what the emulation reports before any `ulimit` call).
+    /// rubash#773: the old parser ran `parse::<u32>()` over the whole
+    /// `"soft:hard"` cell, so it failed on every stored value and the
+    /// allocator silently fell back to its 1024 hard cap.
+    pub(in crate::executor) fn open_files_limit(&self) -> Option<u32> {
+        const UNLIMITED: u64 = u64::MAX;
+        let raw = self.shell_state.env_vars.get("__RUBASH_ULIMIT_N");
+        let Some(value) = raw else {
+            return Some(FdTable::DEFAULT_OPEN_FILES_SOFT_LIMIT);
+        };
+        let soft = value.split(':').next().unwrap_or(value);
+        if soft == "unlimited" {
+            return None;
+        }
+        match soft.parse::<u64>() {
+            Ok(UNLIMITED) => None,
+            Ok(soft) => Some(u32::try_from(soft).unwrap_or(u32::MAX)),
+            Err(_) => Some(FdTable::DEFAULT_OPEN_FILES_SOFT_LIMIT),
+        }
+    }
+
+    pub(in crate::executor) fn allocate_dynamic_fd(&mut self) -> Option<u32> {
+        let limit = self.open_files_limit();
+        self.fd_table.allocate_dynamic_with_limit(limit)
+    }
+
+    /// GNU redir.c:940-946 (REDIR_VARASSIGN): a failed
+    /// `fcntl(fd, F_DUPFD, SHELL_FD_BASE)` reports
+    /// `sys_error("redirection error: cannot duplicate fd")` carrying the
+    /// F_DUPFD errno. Which errno that is depends on where the limit bit
+    /// the request (WSL GNU 5.3.0 probes, 2026-10-19): EMFILE — "Too many
+    /// open files" — when the table is saturated below the soft limit
+    /// (default 10240: exhaustion lands at ~10229 allocations); EINVAL —
+    /// "Invalid argument" — when the base 10 itself sits at/above the soft
+    /// limit (`ulimit -Sn 6`). rubash#773: report the same split instead of
+    /// the hardcoded EINVAL text, which sent EMFILE scripts debugging the
+    /// wrong layer.
+    fn fd_dup_error_payload(&self, target: &str) -> String {
+        let errno = match self.open_files_limit() {
+            Some(limit) if limit <= 10 => "Invalid argument",
+            _ => "Too many open files",
+        };
+        format!(
+            "redirection error: cannot duplicate fd: {errno}\n{}{target}: {errno}",
+            self.diagnostic_prefix()
+        )
+    }
+
+    pub(in crate::executor) fn close_dynamic_fd(&mut self, name: &str) -> Result<(), ExecuteError> {
+        if let Some(fd) = self.dynamic_fd_variable_value(name) {
+            self.close_persistent_fd(fd)?;
+        }
+        Ok(())
+    }
+
+    fn close_dynamic_input_fd(&mut self, name: &str) {
+        if let Some(fd) = self.dynamic_fd_variable_value(name) {
+            self.close_persistent_input_fd(fd);
+            if !self.fd_table.is_open_for_write(fd) {
+                self.fd_table.close(fd);
+                self.shell_state
+                    .env_vars
+                    .insert(fd_closed_key(fd), "1".to_string());
+            }
+        }
+    }
+
+    fn close_dynamic_output_fd(&mut self, name: &str) -> Result<(), ExecuteError> {
+        let Some(fd) = self.dynamic_fd_variable_value(name) else {
+            return Ok(());
+        };
+
+        // A dynamic fd opened with `<>` is one shell descriptor.  Closing its
+        // output side with `>&-` must release the descriptor completely;
+        // otherwise its still-live input side prevents Bash's lowest-free fd
+        // allocation from reusing the slot. Coprocess endpoints are modeled
+        // as one-sided entries, so they retain the capability-specific path.
+        if self.fd_table.read_endpoint(fd).is_some() {
+            self.close_persistent_fd(fd)?;
+            return Ok(());
+        }
+
+        // Coprocess input/output endpoints currently share the child PID as
+        // their virtual descriptor. Close only the output capability so
+        // `exec {COPROC[1]}>&-` does not invalidate `COPROC[0]` as well.
+        self.close_persistent_output_fd(fd)?;
+        if !self.fd_table.is_open_for_read(fd) {
+            self.fd_table.close(fd);
+            self.shell_state
+                .env_vars
+                .insert(fd_closed_key(fd), "1".to_string());
+        }
+        Ok(())
+    }
+
+    fn dynamic_fd_variable_value(&self, name: &str) -> Option<u32> {
+        if let Some((array_name, index)) = parse_array_numeric_subscript(name) {
+            return self
+                .array_element_parameter_value(&format!("{array_name}[{index}]"))
+                .and_then(|value| value.parse::<u32>().ok());
+        }
+
+        let storage_name = self.resolved_variable_name(name)?;
+        self.shell_state
+            .env_vars
+            .get(&storage_name)
+            .and_then(|value| value.parse::<u32>().ok())
+    }
+
+    fn dynamic_fd_assignment_readonly(&self, name: &str) -> bool {
+        let base_name = parse_array_numeric_subscript(name)
+            .map(|(array_name, _)| array_name)
+            .unwrap_or(name);
+        let resolved = self
+            .resolved_variable_name(base_name)
+            .unwrap_or_else(|| base_name.to_string());
+        is_marked_var(&self.shell_state.env_vars, READONLY_VARS, &resolved)
+    }
+
+    /// GNU redir.c bind_dynamic_variable -> bind_variable: a `{var}` fd
+    /// assignment is a real variable binding — nameref targets resolve, an
+    /// empty-cell nameref stores the fd number as its cell and is validated
+    /// (`exec {r}>f` on `declare -n r` reports `` `10': not a valid
+    /// identifier `` under the command name and fails), and element-form
+    /// names assign through assign_array_element. Returns false when the
+    /// binding was rejected.
+    fn set_dynamic_fd_variable(&mut self, name: &str, fd: u32) -> bool {
+        self.apply_shell_assignment(name, fd.to_string())
+    }
+
+    pub(in crate::executor) fn execute_exec_command(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<(), ExecuteError> {
+        // GNU builtins/exec.def:151 exec_builtin resolves the operand with
+        // search_for_command and shell_execve's it — on POSIX `env` is the
+        // external coreutils binary that consumes the VAR=value prefixes and
+        // execs the target. Rubash ports the external `env` as an internally
+        // emulated command (external_inner.rs execute_env_command) that a
+        // plain `env VAR=x cmd` always dispatches to; `exec env VAR=x cmd`
+        // must resolve the same way. The PATH-search fallback instead binds
+        // to whatever `env`-named file comes first in PATH — on a Windows
+        // profile that is the extensionless ~/.local/bin/env POSIX shim,
+        // which ignores its operands and exits 0, so the whole exec chain
+        // silently no-ops (rubash#172).
+        if let Some(status) = self.execute_exec_env_command(cmd)? {
+            self.exit_code = status;
+            return self.finish_exec_replacement(cmd, status);
+        }
+        let status = self.execute_exec(cmd)?;
+        self.exit_code = status;
+        self.finish_exec_replacement(cmd, status)
+    }
+
+    /// The exit contract of `exec_builtin` (exec.def:248-260): with a
+    /// command operand exec replaces the shell, so the script terminates
+    /// with the command's status instead of continuing past it.
+    fn finish_exec_replacement(
+        &mut self,
+        cmd: &CommandNode,
+        status: i32,
+    ) -> Result<(), ExecuteError> {
+        // GNU exec.def: a failed `exec command` exits a noninteractive
+        // shell (EXECUTION_FAILURE). A `{var}` word that reached argv is a
+        // spaced form — an ordinary operand — while the adjacent
+        // `{var}redir` form was already consumed by the parser into
+        // redirect.fd_var (parse.y:5821-5843 REDIR_WORD), so it never
+        // appears here.
+        if crate::builtins::exec::replaces_shell(&cmd.words[1..]) {
+            // GNU exec.def failed_exec: `if (subshell_environment ||
+            // (interactive == 0 && no_exit_on_failed_exec == 0))
+            // exit_shell (exit_value)` — a subshell always dies, a
+            // noninteractive shell dies unless the execfail shopt
+            // (no_exit_on_failed_exec, shopt.def) is set, and an
+            // interactive shell always continues. A SUCCESSFUL exec never
+            // returns (execve replaced the process), so the exemption only
+            // applies to failing statuses (rubash#347: `shopt -s execfail;
+            // exec /no/such/cmd` prints the diagnostic and the script keeps
+            // running, $? = 127).
+            let execfail =
+                crate::builtins::shopt::option_enabled(&self.shell_state.env_vars, "execfail");
+            let interactive = self
+                .shell_state
+                .env_vars
+                .get("__RUBASH_INTERACTIVE")
+                .map(String::as_str)
+                == Some("1");
+            if status == 0
+                || self.shell_state.subshell_depth.get() > 0
+                || (!interactive && !execfail)
+            {
+                return Err(ExecuteError::ExitCode(status));
+            }
+        }
+        Ok(())
+    }
+
+    /// Run `exec env ...` through rubash's internal emulation of the
+    /// external `env` command. Returns None when the operand shape is not
+    /// the plain `exec env ...` form (exec's own options like `-c`/`-a`
+    /// keep the execve semantics of the fallback path) or when the
+    /// emulation is disabled.
+    fn execute_exec_env_command(&mut self, cmd: &CommandNode) -> Result<Option<i32>, ExecuteError> {
+        if cmd.words.get(1).map(String::as_str) != Some("env") {
+            return Ok(None);
+        }
+        if crate::builtins::enable::is_disabled(&self.shell_state.env_vars, "env") {
+            return Ok(None);
+        }
+        let mut env_cmd = cmd.clone();
+        env_cmd.words = cmd.words[1..].to_vec();
+        self.execute_env_command(&env_cmd)?;
+        Ok(Some(self.exit_code))
+    }
+
+    fn exec_has_no_command_operand_after_expansion(&self, cmd: &CommandNode) -> bool {
+        if cmd.words.len() <= 1 {
+            return false;
+        }
+
+        let expanded_args: Vec<String> = cmd.words[1..]
+            .iter()
+            .map(|word| self.expand_word(word))
+            .collect();
+        !crate::builtins::exec::replaces_shell(&expanded_args)
+            && (cmd.redirect_out.is_some()
+                || cmd.append.is_some()
+                || cmd.redirect_err.is_some()
+                || cmd.redirect_err_append.is_some()
+                || cmd.redirect_in.is_some()
+                || !cmd.redirects.is_empty())
+    }
+}
+
+pub(crate) fn signal_trap_name(signal: i32) -> Option<String> {
+    if signal <= 0 {
+        return None;
+    }
+    crate::builtins::kill::translate_signal(&signal.to_string()).map(|name| format!("SIG{name}"))
+}
+
+fn exec_has_only_redirects(cmd: &CommandNode) -> bool {
+    if cmd.words.len() == 1 {
+        return true;
+    }
+
+    matches!(
+        cmd.words.as_slice(),
+        [command, fd_word]
+            if command == "exec"
+                && fd_word.chars().all(|ch| ch.is_ascii_digit())
+                && cmd
+                    .redirects
+                    .iter()
+                    .any(|redirect| redirect.fd.is_some_and(|fd| fd.to_string() == *fd_word))
+    )
+}

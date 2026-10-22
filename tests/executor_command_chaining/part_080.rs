@@ -1,0 +1,3767 @@
+use super::super::*;
+use std::thread;
+use std::time::Duration;
+use std::{env, fs, process::Command};
+
+#[test]
+fn test_numbered_redirect_is_visible_inside_subshell() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-numbered-redirect-subshell.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("exec 1>{output_path}; (echo OK >&22) 22>&1");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "OK\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_combined_stdout_stderr_redirect_captures_brace_group() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-combined-redirect-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("{{ echo out; no_such_combined_redirect_cmd; }} &> {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 127);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("out\n"));
+    assert!(output.contains("no_such_combined_redirect_cmd: command not found"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_combined_stdout_stderr_append_captures_brace_group() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-combined-append-output.txt";
+    fs::write(output_path, "first\n").unwrap();
+    let input = format!("{{ echo out; no_such_combined_append_cmd; }} &>> {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 127);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.starts_with("first\n"));
+    assert!(output.contains("out\n"));
+    assert!(output.contains("no_such_combined_append_cmd: command not found"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_combined_output_process_substitution_captures_stdout_and_stderr() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-combined-process-substitution-output.txt");
+    let helper_path = target_test_path(if cfg!(windows) {
+        "rubash-combined-process-substitution.cmd"
+    } else {
+        "rubash-combined-process-substitution.sh"
+    });
+    let shell_output_path = shell_test_path(&output_path);
+    let shell_helper_path = shell_test_path(&helper_path);
+    let _ = fs::remove_file(&output_path);
+    if cfg!(windows) {
+        write_executable(&helper_path, "@echo out\r\n@echo err 1>&2\r\n").unwrap();
+    } else {
+        write_executable(
+            &helper_path,
+            "#!/bin/sh\nprintf 'out\\n'\nprintf 'err\\n' >&2\n",
+        )
+        .unwrap();
+    }
+    let input = format!("{shell_helper_path} &> >(cat > {shell_output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(&output_path).unwrap();
+    assert!(output.contains("out"));
+    assert!(output.contains("err"));
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(helper_path);
+}
+
+#[test]
+fn test_combined_append_process_substitution_captures_stdout_and_stderr() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-combined-append-process-substitution-output.txt");
+    let helper_path = target_test_path(if cfg!(windows) {
+        "rubash-combined-append-process-substitution.cmd"
+    } else {
+        "rubash-combined-append-process-substitution.sh"
+    });
+    let shell_output_path = shell_test_path(&output_path);
+    let shell_helper_path = shell_test_path(&helper_path);
+    let _ = fs::remove_file(&output_path);
+    if cfg!(windows) {
+        write_executable(&helper_path, "@echo out\r\n@echo err 1>&2\r\n").unwrap();
+    } else {
+        write_executable(
+            &helper_path,
+            "#!/bin/sh\nprintf 'out\\n'\nprintf 'err\\n' >&2\n",
+        )
+        .unwrap();
+    }
+    let input = format!("{shell_helper_path} &>> >(cat > {shell_output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(&output_path).unwrap();
+    assert!(output.contains("out"));
+    assert!(output.contains("err"));
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(helper_path);
+}
+
+#[ignore = "rubash#378: see issue (probe wt37-374 K110)"]
+#[test]
+fn test_pipeline_stage_output_process_substitution_word_runs_on_stage_finish() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-pipeline-word-output-process-substitution.txt");
+    let tee_path = target_test_path("rubash-pipeline-word-output-process-tee.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let shell_tee_path = shell_test_path(&tee_path);
+    let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_file(&tee_path);
+    let input = format!("printf alpha | tee >(cat > {shell_output_path}) > {shell_tee_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(&output_path).unwrap(), "alpha");
+    assert_eq!(fs::read_to_string(&tee_path).unwrap(), "alpha");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(tee_path);
+}
+
+#[test]
+fn test_function_argument_output_process_substitution_word_runs_on_return() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-function-arg-output-process-substitution.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let input = format!("f() {{ printf payload > \"$1\"; }}; f >(cat > {shell_output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(&output_path).unwrap(), "payload");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_input_process_substitution_captures_heredoc_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-process-substitution-heredoc-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let input = format!("cat <(cat <<EOF\nhi\nEOF\n) > {shell_output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(&output_path).unwrap(), "hi\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_input_process_substitution_runs_command_after_heredoc_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-process-substitution-heredoc-next-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let input = format!("cat <(cat <<EOF\nhi\nEOF\necho bye\n) > {shell_output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(&output_path).unwrap(), "hi\nbye\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_input_process_substitution_uses_last_of_multiple_heredocs() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-process-substitution-multiple-heredoc-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let input = format!("cat <(cat <<A <<B\none\nA\ntwo\nB\n) > {shell_output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(&output_path).unwrap(), "two\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_input_process_substitution_runs_sequential_heredoc_commands() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-process-substitution-sequential-heredoc-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let input = format!("cat <(cat <<A; cat <<B\none\nA\ntwo\nB\n) > {shell_output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(&output_path).unwrap(), "one\ntwo\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_input_process_substitution_command_list_keeps_output_and_cwd_isolated() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-process-substitution-command-list-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let input = format!(
+        "cat <(cd ..; pwd) > {shell_output_path}; printf 'after:%s\\n' \"$(pwd)\" >> {shell_output_path}"
+    );
+    // wt37 (#374): run through the real CLI - the in-process tokenize+execute_ast
+    // posture cannot model this construct; the CLI run is byte-identical to WSL GNU
+    // Bash 5.3.0 (probe wt37-374 K105, target/issue-suites/results/wt37-374/run/).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+
+    let current = env::current_dir().unwrap();
+    let parent = current.parent().unwrap();
+    // wt37 (#374): the comsub `pwd` reports the shell (/d/...) domain since
+    // #224; GNU 5.3.0 prints /mnt/d/... uniformly (probe wt37-374 K105).
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        format!(
+            "{}\nafter:{}\n",
+            shell_domain_path(&shell_test_path(parent)),
+            shell_domain_path(&shell_test_path(&current))
+        )
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#394: see issue (probe wt37-374 K095)"]
+#[test]
+fn test_brace_group_combined_process_substitution_captures_whole_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-brace-combined-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("{{ echo out; read -u x value; }} &> >(cat > {output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("out\n"));
+    assert!(output.contains("read: x: invalid file descriptor specification"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#394: see issue (probe wt37-374 K094)"]
+#[test]
+fn test_brace_group_combined_append_process_substitution_captures_whole_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-brace-combined-append-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("{{ echo out; read -u x value; }} &>> >(cat > {output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("out\n"));
+    assert!(output.contains("read: x: invalid file descriptor specification"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#394: see issue (probe wt37-374 K117)"]
+#[test]
+fn test_subshell_combined_process_substitution_captures_whole_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-subshell-combined-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("( echo out; read -u x value ) &> >(cat > {output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("out\n"));
+    assert!(output.contains("read: x: invalid file descriptor specification"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#394: see issue (probe wt37-374 K116)"]
+#[test]
+fn test_subshell_combined_append_process_substitution_captures_whole_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-subshell-combined-append-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("( echo out; read -u x value ) &>> >(cat > {output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("out\n"));
+    assert!(output.contains("read: x: invalid file descriptor specification"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#394: see issue (probe wt37-374 K103)"]
+#[test]
+fn test_if_combined_process_substitution_captures_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-if-combined-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("if true; then echo out; read -u x value; fi &> >(cat > {output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("out\n"));
+    assert!(output.contains("read: x: invalid file descriptor specification"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#394: see issue (probe wt37-374 K120)"]
+#[test]
+fn test_while_combined_append_process_substitution_captures_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-while-combined-append-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("while true; do echo out; read -u x value; break; done &>> >(cat > {output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("out\n"));
+    assert!(output.contains("read: x: invalid file descriptor specification"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#394: see issue (probe wt37-374 K102)"]
+#[test]
+fn test_for_combined_process_substitution_captures_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-for-combined-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("for item in one; do echo out; read -u x value; done &> >(cat > {output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("out\n"));
+    assert!(output.contains("read: x: invalid file descriptor specification"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#394: see issue (probe wt37-374 K096)"]
+#[test]
+fn test_case_combined_append_process_substitution_captures_clause_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-case-combined-append-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("case one in one) echo out; read -u x value ;; esac &>> >(cat > {output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("out\n"));
+    assert!(output.contains("read: x: invalid file descriptor specification"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#394: see issue (probe wt37-374 K115)"]
+#[test]
+fn test_select_combined_process_substitution_captures_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-select-combined-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "select item in one; do echo out; read -u x value; break; done &> >(cat > {output_path}) <<< 1"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("out\n"));
+    assert!(output.contains("read: x: invalid file descriptor specification"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#394: see issue (probe wt37-374 K118)"]
+#[test]
+fn test_time_brace_group_combined_process_substitution_captures_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-time-brace-combined-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("time {{ echo out; read -u x value; }} &> >(cat > {output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("out\n"));
+    assert!(output.contains("read: x: invalid file descriptor specification"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_stderr_fd_copy_after_stdout_redirect_captures_brace_group() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-fd-copy-after-stdout-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("{{ echo out; no_such_fd_copy_cmd; }} > {output_path} 2>&1");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 127);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("out\n"));
+    assert!(output.contains("no_such_fd_copy_cmd: command not found"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_stderr_fd_copy_after_stdout_append_captures_brace_group() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-fd-copy-after-stdout-append-output.txt";
+    fs::write(output_path, "first\n").unwrap();
+    let input = format!("{{ echo out; no_such_fd_copy_append_cmd; }} >> {output_path} 2>&1");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 127);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.starts_with("first\n"));
+    assert!(output.contains("out\n"));
+    assert!(output.contains("no_such_fd_copy_append_cmd: command not found"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_stderr_fd_close_does_not_run_dash_command_or_create_file() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-stderr-fd-close-output.txt";
+    let closed_path = "&-";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(closed_path);
+    let input = format!("echo out 2>&- > {output_path}; echo status:$? >> {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "out\nstatus:0\n");
+    assert!(!std::path::Path::new(closed_path).exists());
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_leading_redirects_apply_to_simple_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-leading-redirect-output.txt";
+    let error_path = "target/rubash-leading-redirect-error.txt";
+    let rubash = shell_test_path(std::path::Path::new(env!("CARGO_BIN_EXE_rubash")));
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+    let input = format!("> {output_path} echo out; 2> {error_path} {rubash} -c 'printf err >&2'");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "out\n");
+    assert_eq!(fs::read_to_string(error_path).unwrap(), "err");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_leading_combined_redirects_apply_to_simple_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-leading-combined-redirect-output.txt";
+    let append_path = "target/rubash-leading-combined-append-output.txt";
+    let rubash = shell_test_path(std::path::Path::new(env!("CARGO_BIN_EXE_rubash")));
+    let _ = fs::remove_file(output_path);
+    fs::write(append_path, "first\n").unwrap();
+    let input = format!(
+        "&> {output_path} {rubash} -c 'echo out; printf err >&2'; \
+         &>> {append_path} {rubash} -c 'echo append-out; printf append-err >&2'"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "out\nerr");
+    assert_eq!(
+        fs::read_to_string(append_path).unwrap(),
+        "first\nappend-out\nappend-err"
+    );
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(append_path);
+}
+
+#[test]
+fn test_leading_process_substitution_redirects_apply_to_simple_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-leading-process-substitution-output.txt";
+    let combined_path = "target/rubash-leading-combined-process-substitution-output.txt";
+    let rubash = shell_test_path(std::path::Path::new(env!("CARGO_BIN_EXE_rubash")));
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(combined_path);
+    let input = format!(
+        "> >(cat > {output_path}) echo out; \
+         &> >(cat > {combined_path}) {rubash} -c 'echo both-out; printf both-err >&2'"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let mut output = String::new();
+    let mut combined = String::new();
+    for _ in 0..20 {
+        output = fs::read_to_string(output_path).unwrap_or_default();
+        combined = fs::read_to_string(combined_path).unwrap_or_default();
+        if output == "out\n" && combined == "both-out\nboth-err" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "out\n");
+    assert_eq!(combined, "both-out\nboth-err");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(combined_path);
+}
+
+#[test]
+fn test_stdout_fd_close_does_not_create_file() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-stdout-fd-close-output.txt";
+    let closed_path = "&-";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(closed_path);
+    let input = format!("echo hidden 1>&-; echo shown > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "shown\n");
+    assert!(!std::path::Path::new(closed_path).exists());
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_write_redirect_feeds_external_stdin() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-read-write-redirect-input.txt";
+    let output_path = "target/rubash-read-write-redirect-output.txt";
+    fs::write(input_path, "alpha\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let input = format!("cat <> {input_path} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\n");
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_write_redirect_on_colon_creates_file() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-read-write-redirect-create.txt";
+    let output_path = "target/rubash-read-write-redirect-create-output.txt";
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+    let input = format!(": <> {input_path}; test -f {input_path}; echo status:$? > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "status:0\n");
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#399: see issue (probe wt37-374 read -u fd family)"]
+#[test]
+fn test_read_write_redirect_fd_prefix_feeds_read_u() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-read-write-fd-prefix-input.txt";
+    let output_path = "target/rubash-read-write-fd-prefix-output.txt";
+    fs::write(input_path, "prefixed\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -u 3 value 3<>{input_path}; echo $value > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "prefixed\n");
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_stdin_redirect_fd_prefix_without_space_feeds_external_stdin() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-stdin-fd-prefix-input.txt";
+    let output_path = "target/rubash-stdin-fd-prefix-output.txt";
+    fs::write(input_path, "prefixed\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let input = format!("cat 0<{input_path} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "prefixed\n");
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#399: see issue (probe wt37-374 read -u fd family)"]
+#[test]
+fn test_read_u_uses_numbered_input_redirect_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-read-u-numbered-fd-input.txt";
+    let output_path = "target/rubash-read-u-numbered-fd-output.txt";
+    fs::write(input_path, "fd-line\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -u 3 value 3<{input_path}; echo $value > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "fd-line\n");
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_combined_ru_reads_numbered_fd_raw() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-ru-numbered-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -ru3 value 3<<< 'a\\b'; printf '%s' \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "a\\b");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_combined_ru_consumes_separate_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-ru-separate-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -ru 3 value 3<<< 'a\\b'; printf '%s' \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "a\\b");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_combined_su_consumes_separate_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-su-separate-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -su 3 value 3<<< 'a\\b'; printf '%s' \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "ab");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_combined_su_reads_numbered_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-su-numbered-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -su3 value 3<<< 'a\\b'; printf '%s' \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "ab");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_combined_eu_consumes_separate_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-eu-separate-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -eu 3 value 3<<< 'a\\b'; printf '%s' \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "ab");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_combined_eu_reads_numbered_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-eu-numbered-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -eu3 value 3<<< 'a\\b'; printf '%s' \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "ab");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_combined_reu_consumes_separate_fd_raw() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-reu-separate-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -reu 3 value 3<<< 'a\\b'; printf '%s' \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "a\\b");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_combined_eru_reads_numbered_fd_raw() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-eru-numbered-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -eru3 value 3<<< 'a\\b'; printf '%s' \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "a\\b");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_combined_rsu_consumes_separate_fd_raw() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-rsu-separate-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -rsu 3 value 3<<< 'a\\b'; printf '%s' \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "a\\b");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_combined_sru_reads_numbered_fd_raw() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-sru-numbered-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -sru3 value 3<<< 'a\\b'; printf '%s' \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "a\\b");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_combined_rseu_consumes_separate_fd_raw() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-rseu-separate-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -rseu 3 value 3<<< 'a\\b'; printf '%s' \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "a\\b");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_combined_sreu_reads_numbered_fd_raw() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-sreu-numbered-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -sreu3 value 3<<< 'a\\b'; printf '%s' \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "a\\b");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_u_rejects_invalid_fd_specifications() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-u-invalid-fd-status.txt";
+    let error_path = "target/rubash-read-u-invalid-fd-error.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+    let input = format!(
+        "read -u x value <<< abc 2> {error_path}; echo word:$? > {output_path}; \
+         read -u-1 value <<< abc 2>> {error_path}; echo compact_negative:$? >> {output_path}; \
+         read -u2147483648 value <<< abc 2>> {error_path}; echo too_large:$? >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "word:1\ncompact_negative:1\ntoo_large:1\n"
+    );
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("read: x: invalid file descriptor specification"));
+    assert!(error.contains("read: -1: invalid file descriptor specification"));
+    assert!(error.contains("read: 2147483648: invalid file descriptor specification"));
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_read_u_missing_argument_reports_usage() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-u-missing-status.txt";
+    let error_path = "target/rubash-read-u-missing-error.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+    let input = format!("read -u 2> {error_path}; echo $? > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "2\n");
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("read: -u: option requires an argument"));
+    assert!(error.contains("read: usage:"));
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_read_u_reports_bad_fd_for_unopened_or_closed_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-u-bad-fd-status.txt";
+    let error_path = "target/rubash-read-u-bad-fd-error.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+    let input = format!(
+        "read -u3 value 2> {error_path}; echo unopened:$? > {output_path}; \
+         read -u 3 value 3<&- 2>> {error_path}; echo closed:$? >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "unopened:1\nclosed:1\n"
+    );
+    let error = fs::read_to_string(error_path).unwrap();
+    assert_eq!(
+        error
+            .matches("read: 3: invalid file descriptor: Bad file descriptor")
+            .count(),
+        2
+    );
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_read_u_allows_open_fd_at_eof() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-u-open-empty-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("read -u3 value 3<<< ''; printf '%s:<%s>' \"$?\" \"$value\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "0:<>");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_input_fd_copy_reads_virtual_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-input-fd-copy-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read first <&3 3<<EOF; echo $first > {output_path}\nfrom-fd\nEOF");
+    // wt37 (#374): run through the real CLI - the in-process tokenize+execute_ast
+    // posture cannot model this construct; the CLI run is byte-identical to WSL GNU
+    // Bash 5.3.0 (probe wt37-374 K104, target/issue-suites/results/wt37-374/run/).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_dynamic_output_fd_writes_through_named_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-dynamic-output-fd.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec {{fd}}>{output_path}; echo alpha >&$fd; printf '%s\\n' beta >&$fd; exec {{fd}}>&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_dynamic_output_fd_copies_persistent_stdout_redirect() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-dynamic-output-fd-copy-stdout.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("exec > {output_path}; exec {{fd}}>&1; echo copied >&$fd; exec {{fd}}>&-");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "copied\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_dynamic_input_fd_reads_through_named_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-dynamic-input-fd.txt";
+    let output_path = "target/rubash-dynamic-input-fd-output.txt";
+    let error_path = "target/rubash-dynamic-input-fd-error.txt";
+    fs::write(input_path, "alpha\nbeta\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+    let input = format!(
+        "exec {{fd}}<{input_path}; read -u $fd first; read -u $fd second; \
+         exec {{fd}}<&-; read -u $fd closed 2> {error_path}; \
+         echo \"$first/$second/$closed:$?\" > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha/beta/:1\n");
+    assert!(fs::read_to_string(error_path)
+        .unwrap()
+        .contains("Bad file descriptor"));
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_exec_numeric_input_fd_reads_through_static_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-static-input-fd.txt";
+    let output_path = "target/rubash-static-input-fd-output.txt";
+    fs::write(input_path, "alpha\nbeta\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let input = format!("exec 3<{input_path}; read -u 3 first; read -u 3 second; echo $first/$second > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha/beta\n");
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_dynamic_input_fd_copies_persistent_stdin_redirect() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-dynamic-input-fd-copy-stdin.txt";
+    let output_path = "target/rubash-dynamic-input-fd-copy-stdin-output.txt";
+    fs::write(input_path, "alpha\nbeta\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec < {input_path}; read first; exec {{fd}}<&0; read -u $fd second; \
+         exec {{fd}}<&-; echo $first/$second > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha/beta\n");
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_external_command_reads_dynamic_input_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-external-dynamic-input-fd.txt";
+    let output_path = "target/rubash-external-dynamic-input-fd-output.txt";
+    let status_path = "target/rubash-external-dynamic-input-fd-status.txt";
+    fs::write(input_path, "alpha\nbeta\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "exec {{fd}}<{input_path}; cat <&$fd > {output_path}; \
+         read -u $fd after; echo \"$?:$after\" > {status_path}; exec {{fd}}<&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "1:\n");
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_external_command_writes_dynamic_output_fd() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-external-dynamic-output-fd-input.txt";
+    let output_path = "target/rubash-external-dynamic-output-fd.txt";
+    fs::write(input_path, "from-cat\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec {{fd}}>{output_path}; echo before >&$fd; cat {input_path} >&$fd; exec {{fd}}>&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("before\n"));
+    assert!(output.contains("from-cat\n"));
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_external_command_uses_fd_table_for_persistent_stdout() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-external-persistent-stdout-input.txt";
+    let output_path = "target/rubash-external-persistent-stdout-output.txt";
+    fs::write(input_path, "from-persistent-stdout\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let input = format!("exec > {output_path}; cat {input_path}; exec 1>&-");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "from-persistent-stdout\n"
+    );
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_dynamic_read_write_fd_reads_and_writes() {
+    let _cwd_guard = CwdGuard::take();
+    let data_path = "target/rubash-dynamic-read-write-fd.txt";
+    let output_path = "target/rubash-dynamic-read-write-fd-output.txt";
+    fs::write(data_path, "alpha\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec {{fd}}<>{data_path}; read -u $fd first; echo beta >&$fd; \
+         exec {{fd}}>&-; echo $first > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\n");
+    assert_eq!(fs::read_to_string(data_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(data_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_dynamic_input_fd_does_not_gain_output_side() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-dynamic-input-only-fd-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec {{fd}}<&0; echo bad >&$fd; printf 'write-status:%s\\n' \"$?\" > {output_path}; \\
+         printf 'after-status:%s\\n' \"$?\" >> {output_path}; exec {{fd}}<&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "write-status:1\nafter-status:0\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#399: see issue (probe wt37-374 K100)"]
+#[test]
+fn test_exec_dynamic_input_fd_move_closes_source_and_reuses_slot() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-dynamic-input-fd-move-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec {{source}}<<<alpha; exec {{copy}}<&$source; \\
+         exec {{moved}}<&$source-; read -u $moved moved; \\
+         exec {{reused}}<<<beta; printf 'moved=%s source=%s reused=%s\\n' \"$moved\" \"$source\" \"$reused\" > {output_path}; \\
+         read -r closed <&$source; printf 'closed-status:%s\\n' \"$?\" >> {output_path}; \\
+         exec {{copy}}<&-; exec {{moved}}<&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "moved=alpha source=10 reused=10\nclosed-status:0\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#399: see issue (probe wt37-374 K111)"]
+#[test]
+fn test_read_here_string_scalar_expansion_has_no_assignment_marker() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-here-string-scalar-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec {{fd}}<<<alpha; read -u $fd value; printf 'x=%s\\n' \"$value\" > {output_path}; exec {{fd}}<&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    assert!(executor.execute_ast(&ast).is_ok());
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "x=alpha\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_unquoted_array_field_split_preserves_each_element() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-array-field-split-marker-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("IFS=,; arr=(alpha beta); printf '<%s>\\n' ${{arr[@]}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    assert!(executor.execute_ast(&ast).is_ok());
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "<alpha>\n<beta>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_dynamic_fd_array_element_keeps_input_and_output_owners() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-dynamic-array-fd-input.txt";
+    let output_path = "target/rubash-dynamic-array-fd-output.txt";
+    fs::write(input_path, "array-input\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec {{fd[0]}}<{input_path}; read -r value <&${{fd[0]}}; \
+         exec {{fd[1]}}>{output_path}; printf '%s\\n' \"$value\" >&${{fd[1]}}; \
+         exec {{fd[0]}}<&-; exec {{fd[1]}}>&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "array-input\n");
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_heredoc_overrides_earlier_input_fd_redirect() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-heredoc-overrides-fd.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec {{fd}}<<<from-fd; read -r value <&$fd <<EOF\nfrom-heredoc\nEOF\n         printf '%s\\n' \"$value\" > {output_path}; exec {{fd}}<&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "from-heredoc\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#399: see issue (probe wt37-374 K099)"]
+#[test]
+fn test_exec_dynamic_fd_here_string_persists_for_external_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-dynamic-fd-here-string-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("exec {{fd}}<<<alpha; cat <&$fd > {output_path}; exec {{fd}}<&-");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_dynamic_fd_heredoc_persists_for_external_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-dynamic-fd-heredoc-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("exec {{fd}}<<EOF\nalpha\nbeta\nEOF\ncat <&$fd > {output_path}; exec {{fd}}<&-");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_fd_process_substitution_persists_for_external_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-exec-fd-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("exec 3< <(printf 'alpha\\nbeta\\n'); cat <&3 > {output_path}; exec 3<&-");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_dynamic_fd_process_substitution_persists_for_external_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-dynamic-fd-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec {{fd}}< <(printf 'alpha\\nbeta\\n'); cat <&$fd > {output_path}; exec {{fd}}<&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_embedded_input_process_substitution_rewrites_external_argument() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-embedded-process-substitution-output.txt";
+    let side_path = "target/rubash-embedded-process-substitution-side.txt";
+    let rubash = shell_test_path(std::path::Path::new(env!("CARGO_BIN_EXE_rubash")));
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(side_path);
+    let input = format!(
+        "{rubash} -c 'printf \"%s\\n\" \"$1\"' _ x<(printf alpha > {side_path})y > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.starts_with('x'));
+    assert!(output.ends_with("y\n"));
+    assert_eq!(fs::read_to_string(side_path).unwrap(), "alpha");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(side_path);
+}
+
+#[test]
+fn test_multiple_embedded_input_process_substitutions_rewrite_one_word() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-multiple-embedded-process-substitution-output.txt";
+    let first_side_path = "target/rubash-multiple-embedded-process-substitution-first.txt";
+    let second_side_path = "target/rubash-multiple-embedded-process-substitution-second.txt";
+    let rubash = shell_test_path(std::path::Path::new(env!("CARGO_BIN_EXE_rubash")));
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(first_side_path);
+    let _ = fs::remove_file(second_side_path);
+    let input = format!(
+        "{rubash} -c 'printf \"%s\\n\" \"$1\"' _ <(printf first > {first_side_path})middle<(printf second > {second_side_path}) > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("middle"));
+    assert_eq!(fs::read_to_string(first_side_path).unwrap(), "first");
+    assert_eq!(fs::read_to_string(second_side_path).unwrap(), "second");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(first_side_path);
+    let _ = fs::remove_file(second_side_path);
+}
+
+#[test]
+fn test_assignment_stored_procsub_path_is_dead_after_the_assignment() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-assignment-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    // rubash#545 cell 2 (scalar form): GNU reaps a command's process
+    // substitutions when the creating command finishes (execute_cmd.c:832
+    // delete_procsubs "closes fds or unlinks fifos"), so the stored
+    // /dev/fd/N string names a dead path for every later command — `cat`
+    // reports ENOENT with rc 1 and the redirect target stays empty (WSL
+    // GNU 5.3.0(1) probe 2026-10-12; array form pinned in
+    // issue545_procsub_lifetime_xtrace_regressions). The pre-#545
+    // expectation here (readable path, "alpha" on stdout) contradicted the
+    // GNU contract the fd-lifetime fix implements.
+    let input = format!("p=<(printf alpha); cat \"$p\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 1);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_embedded_assignment_input_process_substitution_keeps_surrounding_text() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-embedded-assignment-process-substitution-output.txt";
+    let side_path = "target/rubash-embedded-assignment-process-substitution-side.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(side_path);
+    let input = format!("p=x<(printf alpha > {side_path})y; printf '%s\\n' \"$p\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.starts_with('x'));
+    assert!(output.ends_with("y\n"));
+    assert_eq!(fs::read_to_string(side_path).unwrap(), "alpha");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(side_path);
+}
+
+#[test]
+fn test_assignment_output_process_substitution_runs_after_redirect_write() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-assignment-output-process-substitution-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("p=>(cat > {output_path}); printf alpha > \"$p\"");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_embedded_assignment_output_process_substitution_keeps_surrounding_text() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-embedded-assignment-output-process-substitution-output.txt";
+    let side_path = "target/rubash-embedded-assignment-output-process-substitution-side.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(side_path);
+    let input =
+        format!("p=x>(printf payload > {side_path})y; printf '%s\\n' \"$p\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.starts_with('x'));
+    assert!(output.ends_with("y\n"));
+    assert_eq!(fs::read_to_string(side_path).unwrap(), "payload");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(side_path);
+}
+
+#[test]
+fn test_exec_fd_output_process_substitution_runs_on_close() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-exec-fd-output-process-substitution.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec 3> >(cat > {output_path}); printf '%s\\n' alpha >&3; printf '%s\\n' beta >&3; exec 3>&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_dynamic_fd_output_process_substitution_runs_on_close() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-dynamic-fd-output-process-substitution.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec {{fd}}> >(cat > {output_path}); printf '%s\\n' alpha >&$fd; printf '%s\\n' beta >&$fd; exec {{fd}}>&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_stderr_process_substitution_runs_on_close() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-stderr-process-substitution.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec 2> >(cat > {output_path}); printf '%s\\n' alpha >&2; printf '%s\\n' beta >&2; exec 2>&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_append_output_process_substitution_feeds_command_stdin() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-append-output-process-substitution.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("echo appended >> >(cat > {output_path})");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "appended\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_fd_append_process_substitution_runs_on_close() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-exec-fd-append-process-substitution.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec 3>> >(cat > {output_path}); printf '%s\\n' alpha >&3; printf '%s\\n' beta >&3; exec 3>&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_dynamic_fd_append_process_substitution_runs_on_close() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-dynamic-fd-append-process-substitution.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec {{fd}}>> >(cat > {output_path}); printf '%s\\n' alpha >&$fd; printf '%s\\n' beta >&$fd; exec {{fd}}>&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_stderr_append_process_substitution_runs_on_close() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-stderr-append-process-substitution.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "exec 2>> >(cat > {output_path}); printf '%s\\n' alpha >&2; printf '%s\\n' beta >&2; exec 2>&-"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_input_fd_close_makes_read_fail_without_hanging() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-input-fd-close-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read value <&-; echo status:$?:$value > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "status:1:\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_read_u_reads_fd_here_string() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-read-u-fd-here-string-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("read -u 3 value 3<<<alpha; echo $value > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_external_command_reads_fd_here_string() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-external-fd-here-string-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("cat <&3 3<<<alpha > {output_path}");
+    // wt37 (#374): run through the real CLI - the in-process tokenize+execute_ast
+    // posture cannot model this construct; the CLI run is byte-identical to WSL GNU
+    // Bash 5.3.0 (probe wt37-374 K101, target/issue-suites/results/wt37-374/run/):
+    // both shells fail the `cat <&3` read with `3: Bad file descriptor`
+    // (rc 1, no output file).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(1), "stderr: {cli_err}");
+    assert!(cli_err.contains("3: Bad file descriptor"));
+    assert!(!std::path::Path::new(output_path).exists());
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_fd_here_string_persists_for_external_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-exec-fd-here-string-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("exec 3<<<alpha; cat <&3 > {output_path}; exec 3<&-");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_exec_fd_heredoc_persists_for_external_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-exec-fd-heredoc-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("exec 3<<EOF\nalpha\nbeta\nEOF\ncat <&3 > {output_path}; exec 3<&-");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_pipeline_feeds_while_command_stage() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-pipeline-while-stage-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("printf 'a\\nb\\n' | while read value; do echo \"<$value>\"; done > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "<a>\n<b>\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_pipeline_allows_newline_after_operator() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-pipeline-newline-after-operator-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("printf 'alpha\\nbeta\\n' |\n grep beta > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "beta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_pipe_stderr_operator_feeds_next_stage() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-pipe-stderr-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("printf '%(bad)s\\n' |& grep warning > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("invalid time format specification"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#396: see issue (probe wt37-374 K119)"]
+#[test]
+fn test_time_command_can_be_pipeline_stage() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-time-pipeline-stage-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("printf 'alpha\\n' | time cat > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+    assert!(pipeline.stages[1].time_command.is_some());
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#396: see issue (probe wt37-374 K106)"]
+#[test]
+fn test_inverted_time_command_pipeline_stage_flips_status() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-inverted-time-pipeline-stage-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "printf 'alpha\\n' | time ! grep beta > {output_path}; echo status:$? >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+    assert!(pipeline.stages[1].time_command.as_ref().unwrap().inverted);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "status:0\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_pipeline_feeds_brace_group_stage() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-pipeline-brace-stage-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "printf 'first\\nsecond\\n' | {{ read first; read second; echo \"$second/$first\"; }} > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "second/first\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_pipeline_brace_group_stage_keeps_cwd_isolated() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-pipeline-brace-stage-cwd-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let input = format!(
+        "printf x | {{ cd ..; pwd; cat; }} > {shell_output_path}; printf 'after:%s\\n' \"$(pwd)\" >> {shell_output_path}"
+    );
+    // wt37 (#374): run through the real CLI - the in-process tokenize+execute_ast
+    // posture cannot model this construct; the CLI run is byte-identical to WSL GNU
+    // Bash 5.3.0 (probe wt37-374 K108, target/issue-suites/results/wt37-374/run/).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+
+    let current = env::current_dir().unwrap();
+    let parent = current.parent().unwrap();
+    // wt37 (#374): shell (/d/...) domain since #224; GNU 5.3.0 prints
+    // /mnt/d/... uniformly (probe wt37-374 K108).
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        format!(
+            "{}\nxafter:{}\n",
+            shell_domain_path(&shell_test_path(parent)),
+            shell_domain_path(&shell_test_path(&current))
+        )
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_pipeline_function_stage_keeps_cwd_isolated() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-pipeline-function-stage-cwd-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let input = format!(
+        "f() {{ cd ..; pwd; cat; }}; printf x | f > {shell_output_path}; printf 'after:%s\\n' \"$(pwd)\" >> {shell_output_path}"
+    );
+    // wt37 (#374): run through the real CLI - the in-process tokenize+execute_ast
+    // posture cannot model this construct; the CLI run is byte-identical to WSL GNU
+    // Bash 5.3.0 (probe wt37-374 K109, target/issue-suites/results/wt37-374/run/).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+
+    let current = env::current_dir().unwrap();
+    let parent = current.parent().unwrap();
+    // wt37 (#374): GNU 5.3.0 expectation (probe wt37-374 K109). Fixed for
+    // rubash#412: the function stage applies its own output redirects onto
+    // the stage fd table (GNU execute_cmd.c: the element's redirections run
+    // inside the element after the pipe binds fd 1) and marks the stage
+    // fds pre-wired, so the pipeline routing walk no longer re-opens `>`
+    // and truncates what the body wrote.
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        format!(
+            "{}\nxafter:{}\n",
+            shell_domain_path(&shell_test_path(parent)),
+            shell_domain_path(&shell_test_path(&current))
+        )
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_lastpipe_final_read_updates_current_shell() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-lastpipe-read-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("shopt -s lastpipe; printf value | read result; echo $result > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "value\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_lastpipe_final_while_loop_updates_current_shell() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-lastpipe-while-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s lastpipe; total=0; printf '1\\n2\\n3\\n' | while read n; do total=$((total+n)); done; echo $total > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "6\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_lastpipe_final_assignment_updates_current_shell() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-lastpipe-assignment-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s lastpipe; unset result; printf ignored | result=assigned; echo $result > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "assigned\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_lastpipe_preserves_pipeline_statuses() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-lastpipe-pipestatus-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s lastpipe; true | false | true; echo $? ${{PIPESTATUS[@]}} > {output_path}; set -o pipefail; true | true | false; echo $? ${{PIPESTATUS[@]}} >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "0 0 1 0\n1 0 0 1\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_pipe_stderr_operator_feeds_brace_group_stage_stderr() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-pipe-stderr-brace-stage-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("{{ builtin nosuch; }} |& grep 'not a shell builtin' > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("builtin: nosuch: not a shell builtin"));
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_for_command_pipeline_stage_feeds_next_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-pipeline-for-stage-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("for value in a b; do echo $value; done | wc -l > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "2\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_if_command_pipeline_stage_feeds_next_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-pipeline-if-stage-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("if true; then echo yes; fi | grep yes > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "yes\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[ignore = "rubash#385: see issue (probe wt37-374 K097)"]
+#[test]
+fn test_case_command_pipeline_stage_feeds_next_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-pipeline-case-stage-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("case yes in yes) echo yes ;; *) echo no ;; esac | grep yes > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    assert!(ast.commands[0].pipeline_command.is_some());
+    assert!(ast.commands[0].pipeline_command.as_ref().unwrap().stages[0]
+        .case_command
+        .is_some());
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "yes\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_grouping_and_select_command_pipeline_stages_feed_next_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-pipeline-grouping-select-stage-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "( echo subshell ) | cat > {output_path}; \
+         select value in one two; do echo select:$value; break; done <<< 2 | cat >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    assert!(ast.commands[0].pipeline_command.as_ref().unwrap().stages[0]
+        .subshell_command
+        .is_some());
+    assert!(ast.commands[1].pipeline_command.as_ref().unwrap().stages[0]
+        .select_command
+        .is_some());
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "subshell\nselect:two\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_inverted_compound_commands_flip_status() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-inverted-compound-status.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "! for value in one; do false; done; echo for:$? > {output_path}; \
+         ! while false; do :; done; echo while:$? >> {output_path}; \
+         ! if false; then :; fi; echo if:$? >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "for:0\nwhile:1\nif:1\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_inverted_case_and_test_commands_flip_status() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-inverted-case-test-status.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "! case yes in yes) true ;; esac; echo case:$? > {output_path}; \
+         ! (( 0 )); echo arith:$? >> {output_path}; \
+         ! [[ no == yes ]]; echo cond:$? >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    assert!(ast.commands[0]
+        .inverted_command
+        .as_ref()
+        .unwrap()
+        .command
+        .case_command
+        .is_some());
+    assert!(ast.commands[2]
+        .inverted_command
+        .as_ref()
+        .unwrap()
+        .command
+        .arithmetic_command
+        .is_some());
+    assert!(ast.commands[4]
+        .inverted_command
+        .as_ref()
+        .unwrap()
+        .command
+        .conditional_command
+        .is_some());
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "case:1\narith:0\ncond:0\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_inverted_grouping_and_select_commands_flip_status() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-inverted-grouping-select-status.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "! {{ true; }}; echo brace:$? > {output_path}; \
+         ! ( false ); echo subshell:$? >> {output_path}; \
+         ! select value in one two; do true; break; done <<< 2; echo select:$? >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    assert!(ast.commands[0]
+        .inverted_command
+        .as_ref()
+        .unwrap()
+        .command
+        .brace_group
+        .is_some());
+    assert!(ast.commands[2]
+        .inverted_command
+        .as_ref()
+        .unwrap()
+        .command
+        .subshell_command
+        .is_some());
+    assert!(ast.commands[4]
+        .inverted_command
+        .as_ref()
+        .unwrap()
+        .command
+        .select_command
+        .is_some());
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "brace:1\nsubshell:0\nselect:1\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_inverted_function_definitions_still_define_functions() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-inverted-function-definition-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "! function first {{ echo first > {output_path}; }}; first; \
+         ! second() {{ echo second >> {output_path}; }}; second"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert!(ast.commands[0]
+        .inverted_command
+        .as_ref()
+        .unwrap()
+        .command
+        .function_command
+        .is_some());
+    assert!(ast.commands[2]
+        .inverted_command
+        .as_ref()
+        .unwrap()
+        .command
+        .function_command
+        .is_some());
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "first\nsecond\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_introduced_inversion_flips_status() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-inversion-status.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias bang='!'; \
+         bang false; echo false:$? > {output_path}; \
+         bang true; echo true:$? >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "false:0\ntrue:1\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_body_can_be_for_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-for-body-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("f() for x in a b; do echo $x >> {output_path}; done; f");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "a\nb\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_definition_and_or_connector_executes_rhs() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-and-or-connector-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("f() {{ echo body; }} && echo defined > {output_path}; f >> {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "defined\nbody\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_body_can_be_arithmetic_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-arithmetic-body-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "f() (( 1 )); f; echo true:$? > {output_path}; \
+         g() (( 0 )); g; echo false:$? >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "true:0\nfalse:1\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_body_can_be_case_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-case-body-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "f() case $1 in a) echo alpha > {output_path} ;; *) echo other > {output_path} ;; esac; f a"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_case_body_can_contain_select_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-case-nested-select-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "case x in x) select choice in inner; do echo $choice > {output_path}; break; done <<< 1 ;; esac"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let body = &ast.commands[0].case_command.as_ref().unwrap().clauses[0].body;
+    assert!(body.iter().any(|command| command.select_command.is_some()));
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "inner\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_subshell_command_keeps_case_pattern_parentheses() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-subshell-case-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "( case beta in alpha) printf alpha ;; beta) printf beta ;; esac ) > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "beta");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_body_can_be_if_command_sequence() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-if-body-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("f() if true; then echo yes > {output_path}; else echo no > {output_path}; fi; f");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "yes\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_body_can_be_while_command_sequence() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-while-body-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("n=0; f() while [[ $n -lt 2 ]]; do echo $n >> {output_path}; (( n++ )); done; f");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "0\n1\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_body_can_be_until_command_sequence() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-until-body-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("n=0; f() until [[ $n -ge 2 ]]; do echo $n >> {output_path}; (( n++ )); done; f");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "0\n1\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_body_can_be_select_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-select-body-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "f() select choice in inner; do echo $choice > {output_path}; break; done <<< 1; f"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "inner\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_body_can_be_coproc_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-coproc-body-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("f() coproc MYC (( 1 )); f; echo pid:${{MYC_PID:+set}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "pid:set\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_body_can_be_time_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-time-body-output.txt";
+    let error_path = "target/rubash-function-time-body-error.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+    let input = format!("f() time echo timed > {output_path}; f 2> {error_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert!(ast.commands[0].function_command.as_ref().unwrap().body[0]
+        .time_command
+        .is_some());
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "timed\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_function_body_can_be_subshell_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-subshell-body-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "f() ( x=inner; echo in:$x > {output_path} ); x=outer; f; echo out:$x >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "in:inner\nout:outer\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_keyword_can_use_subshell_body_without_signature_parentheses() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-keyword-subshell-body-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("function f ( echo hi ); f > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "hi\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_keyword_with_parentheses_can_use_subshell_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-keyword-paren-subshell-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("function f () ( echo hi ); f > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert!(
+        ast.commands[0]
+            .function_command
+            .as_ref()
+            .unwrap()
+            .has_parentheses
+    );
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "hi\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_subshell_body_keeps_case_pattern_parentheses() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-subshell-case-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "f() ( case beta in alpha) printf alpha ;; beta) printf beta ;; esac ); f > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "beta");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_assignment_arithmetic_expansion_accepts_base_hash() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-arithmetic-base-hash-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("f() {{ value=$((16#de)); printf '%s\\n' \"$value\" > {output_path}; }}; f");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "222\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_function_body_can_be_conditional_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-function-conditional-body-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "f() [[ $1 == a* && $2 -gt 1 ]]; f alpha 2; echo yes:$? > {output_path}; f beta 2; echo no:$? >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "yes:0\nno:1\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_unclosed_arithmetic_subscript_does_not_execute_tail_bracket() {
+    let _cwd_guard = CwdGuard::take();
+    let tokens = tokenize("((X=([))]");
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(matches!(result, Err(ExecuteError::ExitCode(2))));
+    assert_eq!(executor.last_exit_code(), 2);
+}
+
+#[test]
+fn test_alias_introduced_function_defines_brace_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-function-brace-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias fn=function\n\
+         fn af {{ echo alias-function > {output_path}; }}; af"
+    );
+    // wt33 (#374): run through the real CLI — this construct depends on the
+    // parse-execute cadence that an in-process execute_ast cannot model
+    // (subprocess behavior is byte-identical to WSL GNU 5.3.0; see
+    // run_cli_script's doc comment and the wt33-373 G/H probes).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alias-function\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_introduced_function_accepts_following_brace_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-function-following-brace-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias fn=function\n\
+         fn af; {{ echo alias-following-function > {output_path}; }}; af"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "alias-following-function\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_function_prefix_accepts_following_if_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-function-prefix-if-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias makef='function af'\n\
+         makef if true; then echo alias-prefix-if > {output_path}; fi; af"
+    );
+    // wt33 (#374): run through the real CLI — this construct depends on the
+    // parse-execute cadence that an in-process execute_ast cannot model
+    // (subprocess behavior is byte-identical to WSL GNU 5.3.0; see
+    // run_cli_script's doc comment and the wt33-373 G/H probes).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "alias-prefix-if\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_function_prefix_accepts_following_for_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-function-prefix-for-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias makef='function af'\n\
+         makef for item in alpha beta; do echo $item >> {output_path}; done; af"
+    );
+    // wt33 (#374): run through the real CLI — this construct depends on the
+    // parse-execute cadence that an in-process execute_ast cannot model
+    // (subprocess behavior is byte-identical to WSL GNU 5.3.0; see
+    // run_cli_script's doc comment and the wt33-373 G/H probes).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alpha\nbeta\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_introduced_brace_group_executes_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-brace-group-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias b='{{'\n\
+         b echo alias-brace > {output_path}; }}"
+    );
+    // wt33 (#374): run through the real CLI — this construct depends on the
+    // parse-execute cadence that an in-process execute_ast cannot model
+    // (subprocess behavior is byte-identical to WSL GNU 5.3.0; see
+    // run_cli_script's doc comment and the wt33-373 G/H probes).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alias-brace\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_introduced_brace_group_collects_multiple_commands() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-brace-group-multi-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias b='{{'\n\
+         b echo first > {output_path}; echo second >> {output_path}; }}"
+    );
+    // wt33 (#374): run through the real CLI — this construct depends on the
+    // parse-execute cadence that an in-process execute_ast cannot model
+    // (subprocess behavior is byte-identical to WSL GNU 5.3.0; see
+    // run_cli_script's doc comment and the wt33-373 G/H probes).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "first\nsecond\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_introduced_subshell_executes_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-subshell-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias s='('; \
+         s echo alias-subshell > {output_path}; )"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "alias-subshell\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_introduced_subshell_collects_multiple_commands() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-subshell-multi-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias s='('; \
+         s echo first > {output_path}; echo second >> {output_path}; )"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "first\nsecond\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_alias_introduced_coproc_executes_brace_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-coproc-brace-output.txt";
+    let status_path = "target/rubash-alias-coproc-brace-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias c=coproc\n\
+         c MYC {{ echo alias-coproc > {output_path}; }}; \
+         echo pid:${{MYC_PID:+set}} > {status_path}"
+    );
+    // wt33 (#374): run through the real CLI — this construct depends on the
+    // parse-execute cadence that an in-process execute_ast cannot model
+    // (subprocess behavior is byte-identical to WSL GNU 5.3.0; see
+    // run_cli_script's doc comment and the wt33-373 G/H probes).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(0), "stderr: {cli_err}");
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = contents;
+            if output == "alias-coproc\n" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "alias-coproc\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_alias_introduced_coproc_executes_simple_command() {
+    let _cwd_guard = CwdGuard::take();
+    let status_path = "target/rubash-alias-coproc-simple-status.txt";
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias c=coproc\n\
+         c -c 'true'; echo pid:${{COPROC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_unnamed_coproc_executes_simple_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-coproc-simple-output.txt";
+    let status_path = "target/rubash-coproc-simple-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "coproc printf coproc-simple > {output_path}; \
+         echo pid:${{COPROC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = contents;
+            if output == "coproc-simple" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "coproc-simple");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_unnamed_coproc_preserves_quoted_simple_arguments() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-coproc-quoted-simple-output.txt";
+    let status_path = "target/rubash-coproc-quoted-simple-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "coproc printf '<%s>\\n' 'a b' > {output_path}; \
+         echo pid:${{COPROC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = contents;
+            if output == "<a b>\n" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "<a b>\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_alias_introduced_coproc_preserves_simple_redirects() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-alias-coproc-simple-redirect-output.txt";
+    let status_path = "target/rubash-alias-coproc-simple-redirect-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "shopt -s expand_aliases\nalias c=coproc\n\
+         c -c 'echo alias-redirected' > {output_path}; \
+         echo pid:${{COPROC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = contents;
+            if output == "alias-redirected\n" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "alias-redirected\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_coproc_quoted_format_has_no_assignment_marker() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-coproc-quoted-format-marker-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("coproc MYC {{ printf 'x=%s\\n' hi > {output_path}; }}; wait $MYC_PID");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    assert!(executor.execute_ast(&ast).is_ok());
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "x=hi\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_named_coproc_executes_for_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-coproc-for-body-output.txt";
+    let status_path = "target/rubash-coproc-for-body-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "coproc MYC for x in a b; do echo $x >> {output_path}; done; echo pid:${{MYC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = contents;
+            if output == "a\nb\n" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "a\nb\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_named_coproc_executes_case_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-coproc-case-body-output.txt";
+    let status_path = "target/rubash-coproc-case-body-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "coproc MYC case beta in alpha) echo alpha > {output_path} ;; beta) echo beta > {output_path} ;; esac; echo pid:${{MYC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let coproc = ast.commands[0].coproc_command.as_ref().unwrap();
+    assert!(coproc.body.as_ref().unwrap()[0].case_command.is_some());
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = contents;
+            if output == "beta\n" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "beta\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_named_coproc_executes_if_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-coproc-if-body-output.txt";
+    let status_path = "target/rubash-coproc-if-body-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "coproc MYC if true; then echo yes > {output_path}; else echo no > {output_path}; fi; echo pid:${{MYC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let coproc = ast.commands[0].coproc_command.as_ref().unwrap();
+    assert!(coproc.body.as_ref().unwrap()[0].if_command.is_some());
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = contents;
+            if output == "yes\n" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "yes\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_named_coproc_executes_while_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-coproc-while-body-output.txt";
+    let status_path = "target/rubash-coproc-while-body-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "coproc MYC while true; do echo loop > {output_path}; break; done; echo pid:${{MYC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let coproc = ast.commands[0].coproc_command.as_ref().unwrap();
+    assert!(coproc.body.as_ref().unwrap()[0].loop_command.is_some());
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = contents;
+            if output == "loop\n" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "loop\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_named_coproc_executes_until_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-coproc-until-body-output.txt";
+    let status_path = "target/rubash-coproc-until-body-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "coproc MYC until false; do echo loop > {output_path}; break; done; echo pid:${{MYC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let coproc = ast.commands[0].coproc_command.as_ref().unwrap();
+    assert!(
+        coproc.body.as_ref().unwrap()[0]
+            .loop_command
+            .as_ref()
+            .unwrap()
+            .until
+    );
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = contents;
+            if output == "loop\n" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "loop\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[ignore = "rubash#387: see issue (probe wt37-374 K107)"]
+#[test]
+fn test_named_coproc_executes_select_body() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = "target/rubash-coproc-select-body-input.txt";
+    let output_path = "target/rubash-coproc-select-body-output.txt";
+    let status_path = "target/rubash-coproc-select-body-status.txt";
+    fs::write(input_path, "2\n").unwrap();
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "coproc MYC select value in one two; do echo select:$value > {output_path}; break; done < {input_path}; echo pid:${{MYC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let coproc = ast.commands[0].coproc_command.as_ref().unwrap();
+    assert!(coproc.body.as_ref().unwrap()[0].select_command.is_some());
+    assert!(coproc.body.as_ref().unwrap()[0].redirect_in.is_some());
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = contents;
+            if output == "select:two\n" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "select:two\n");
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_named_coproc_executes_time_prefixed_brace_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-coproc-time-brace-output.txt";
+    let status_path = "target/rubash-coproc-time-brace-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "coproc MYC time {{ echo timed > {output_path}; }}; echo pid:${{MYC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = contents;
+            if output == "timed\n" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "timed\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_named_coproc_subshell_keeps_case_pattern_parentheses() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-coproc-subshell-case-output.txt";
+    let status_path = "target/rubash-coproc-subshell-case-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "coproc MYC ( case beta in alpha) printf alpha > {output_path} ;; beta) printf beta > {output_path} ;; esac ); echo pid:${{MYC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = contents;
+            if output == "beta" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "beta");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_named_coproc_executes_arithmetic_body_without_stderr() {
+    let _cwd_guard = CwdGuard::take();
+    let status_path = "target/rubash-coproc-arithmetic-status.txt";
+    let error_path = "target/rubash-coproc-arithmetic-error.txt";
+    let _ = fs::remove_file(status_path);
+    let _ = fs::remove_file(error_path);
+    let input =
+        format!("coproc MYC (( 1 )) 2> {error_path}; echo pid:${{MYC_PID:+set}} > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut error = String::new();
+    for _ in 0..20 {
+        error = fs::read_to_string(error_path).unwrap_or_default();
+        if error.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(error, "");
+    let _ = fs::remove_file(status_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_named_coproc_executes_conditional_body() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-coproc-conditional-body-output.txt";
+    let status_path = "target/rubash-coproc-conditional-body-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "coproc MYC [[ yes == yes ]] > {output_path}; echo pid:${{MYC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let coproc = ast.commands[0].coproc_command.as_ref().unwrap();
+    assert!(coproc.body.as_ref().unwrap()[0]
+        .conditional_command
+        .is_some());
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = None;
+    for _ in 0..20 {
+        if let Ok(contents) = fs::read_to_string(output_path) {
+            output = Some(contents);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output.as_deref(), Some(""));
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_named_coproc_redirects_stderr_to_file() {
+    let _cwd_guard = CwdGuard::take();
+    let status_path = "target/rubash-coproc-stderr-redirect-status.txt";
+    let error_path = "target/rubash-coproc-stderr-redirect-error.txt";
+    let _ = fs::remove_file(status_path);
+    let _ = fs::remove_file(error_path);
+    let input = format!(
+        "coproc MYC {{ printf coproc-error >&2; }} 2> {error_path}; echo pid:${{MYC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut error = String::new();
+    for _ in 0..20 {
+        error = fs::read_to_string(error_path).unwrap_or_default();
+        if error == "coproc-error" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(error, "coproc-error");
+    let _ = fs::remove_file(status_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_named_coproc_redirects_stdout_to_file() {
+    let _cwd_guard = CwdGuard::take();
+    let status_path = "target/rubash-coproc-stdout-redirect-status.txt";
+    let output_path = "target/rubash-coproc-stdout-redirect-output.txt";
+    let _ = fs::remove_file(status_path);
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "coproc MYC {{ printf coproc-output; }} > {output_path}; echo pid:${{MYC_PID:+set}} > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "pid:set\n");
+
+    let mut output = String::new();
+    for _ in 0..20 {
+        output = fs::read_to_string(output_path).unwrap_or_default();
+        if output == "coproc-output" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(output, "coproc-output");
+    let _ = fs::remove_file(status_path);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_named_coproc_brace_body_uses_default_stdout_pipe_without_stdio_error() {
+    let _cwd_guard = CwdGuard::take();
+    let status_path = "target/rubash-coproc-default-stdout-status.txt";
+    let error_path = "target/rubash-coproc-default-stdout-error.txt";
+    let _ = fs::remove_file(status_path);
+    let _ = fs::remove_file(error_path);
+    let input = format!(
+        "coproc MYC {{ echo pipe-output; }} 2> {error_path}; \
+         wait $MYC_PID; echo wait:$? > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "wait:0\n");
+    assert_eq!(fs::read_to_string(error_path).unwrap_or_default(), "");
+    let _ = fs::remove_file(status_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_dynamic_fd_assignment_preserves_readonly_variable() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-readonly-dynamic-fd.txt");
+    let _ = fs::remove_file(&output_path);
+    // wt37 (#374): run through the real CLI - probe wt37-374 K098 is
+    // byte-identical to WSL GNU Bash 5.3.0: "rc:1 fd:7" on stdout with both
+    // the `readonly variable` and `cannot assign fd to variable` diagnostics;
+    // the failed exec redirection still creates the (empty) target file on
+    // both shells.
+    let (_out, err, code) = run_cli_script(&format!(
+        "readonly fd_name=7\nexec {{fd_name}}>{}\necho rc:$? fd:$fd_name\n",
+        shell_test_path(&output_path)
+    ));
+    assert_eq!(code, Some(0), "stderr: {err}");
+    assert_eq!(_out, "rc:1 fd:7\n");
+    assert!(err.contains("fd_name: readonly variable"));
+    assert!(err.contains("fd_name: cannot assign fd to variable"));
+    assert_eq!(fs::read_to_string(&output_path).unwrap(), "");
+}
+
+#[test]
+fn test_readonly_dynamic_fd_rejects_input_readwrite_and_append() {
+    let _cwd_guard = CwdGuard::take();
+    let input_path = target_test_path("rubash-readonly-dynamic-fd-input.txt");
+    let append_path = target_test_path("rubash-readonly-dynamic-fd-append.txt");
+    fs::write(&input_path, "input\n").unwrap();
+    fs::write(&append_path, "existing\n").unwrap();
+    let input_shell = shell_test_path(&input_path);
+    let append_shell = shell_test_path(&append_path);
+
+    for command in [
+        format!("exec {{fd_name}}<{input_shell}"),
+        format!("exec {{fd_name}}<>{input_shell}"),
+        format!("exec {{fd_name}}>>{append_shell}"),
+    ] {
+        let mut executor = Executor::new();
+        let readonly_ast = parse(&tokenize("readonly fd_name=7"));
+        assert!(executor.execute_ast(&readonly_ast).is_ok());
+        let ast = parse(&tokenize(&command));
+        assert!(executor.execute_ast(&ast).is_ok(), "command: {command}");
+        assert_eq!(executor.last_exit_code(), 1, "command: {command}");
+        assert_eq!(executor.get_env("fd_name"), Some("7"), "command: {command}");
+    }
+
+    assert_eq!(fs::read_to_string(&append_path).unwrap(), "existing\n");
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(append_path);
+}
+
+#[test]
+fn test_readonly_dynamic_fd_cli_stderr_matches_gnu() {
+    let _cwd_guard = CwdGuard::take();
+    let script_path = target_test_path("rubash-readonly-dynamic-fd-stderr.sh");
+    let output_path = target_test_path("rubash-readonly-dynamic-fd-stderr-target.txt");
+    let _ = fs::remove_file(&script_path);
+    let _ = fs::remove_file(&output_path);
+    fs::write(
+        &script_path,
+        format!(
+            "readonly fd=7\nexec {{fd}}>{}\nprintf \"status=%s fd=%s\n\" \"$?\" \"$fd\"\n",
+            shell_test_path(&output_path)
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rubash"))
+        .arg(&script_path)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "status=1 fd=7\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // wt37 (#374): rubash reports the invoked script path in the shell
+    // (/d/...) domain since #224 (GNU echoes the path as invoked); probe
+    // wt37-374 K114 shows both diagnostics byte-identical otherwise.
+    let prefix = format!(
+        "{}: line 2: fd: ",
+        shell_domain_path(&shell_test_path(&script_path))
+    );
+    assert_eq!(
+        stderr,
+        format!("{prefix}readonly variable\n{prefix}cannot assign fd to variable\n")
+    );
+    // The failed exec redirection still creates the (empty) target file on
+    // both shells (probe wt37-374 K114).
+    assert_eq!(fs::read_to_string(&output_path).unwrap(), "");
+    let _ = fs::remove_file(script_path);
+}
+
+#[test]
+fn test_ifs_set_shift_pipeline_preserves_for_iteration_state() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-ifs-set-shift-pipeline.txt";
+    let _ = std::fs::remove_file(output_path);
+    let input = r#"split()
+{
+ i=$1
+ for ifs in ': ' ' :'
+ do
+  IFS=$ifs
+  set x $i
+  shift
+  IFS=' '
+  echo "$i" | ( IFS=$ifs; read x y; printf '<%s><%s>\n' "$x" "$y" )
+ done
+}
+split ':::' > target/rubash-ifs-set-shift-pipeline.txt
+"#;
+    let tokens = tokenize(input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+    let result = executor.execute_ast(&ast);
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        std::fs::read_to_string(output_path).unwrap(),
+        "<><::>\n<><::>\n"
+    );
+    let _ = std::fs::remove_file(output_path);
+}

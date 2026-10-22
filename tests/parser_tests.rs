@@ -1,0 +1,4812 @@
+//! Parser Tests - TDD for Bash Parser
+//!
+//! Run with: cargo test --test parser_tests
+
+use rubash::lexer::tokenize;
+use rubash::parser::{
+    parse, CaseTerminator, CommandBodyKind, ConditionalExpressionKind, ConditionalPatternKind,
+    CoprocBodyKind, FunctionBodyKind, LoopKind, QuoteKind,
+};
+
+#[path = "parser_coproc_tests.rs"]
+mod coproc_tests;
+#[path = "parser_redirection_tests.rs"]
+mod redirection_tests;
+
+/// wt33 (#373): the parse-time extglob gate is a process-global static
+/// (src/lexer/mod.rs PARSE_EXTENDED_GLOB). Tests that tokenize an input
+/// containing a leading `shopt -s extglob` line flip it for the rest of the
+/// process, so every extglob-sensitive tokenize must be serialized through
+/// one lock — otherwise parallel test threads observe a leaked gate and the
+/// extglob-off error assertions flake. The lock lives in
+/// parser_redirection_tests.rs (dual-compiled: standalone binary and module
+/// of this binary) so both compilation units share it.
+use redirection_tests::EXTGLOB_PARSE_GATE;
+
+#[test]
+fn test_spaced_subshell_containing_arithmetic_command() {
+    let tokens = tokenize(r#"( (( a[" "]=16 )); declare -p a )"#);
+    let ast = parse(&tokens);
+
+    assert_eq!(ast.commands.len(), 1);
+    let subshell = ast.commands[0].subshell_command.as_ref().unwrap();
+    assert_eq!(subshell.body.len(), 2);
+    assert!(subshell.body[0].arithmetic_command.is_some());
+    assert_eq!(
+        subshell.body[1].words.first().map(String::as_str),
+        Some("declare")
+    );
+}
+
+// wt33 (#373): `a[\" \"]=15` no longer parse-errors in the AST — the escaped
+// quotes ride in token.value as \x18 DATA carriers and the arithmetic error
+// surfaces at execution, exactly like GNU. Probe
+// wt33-373/run/B10_escaped_sub_eof (byte-identical rubash vs GNU 5.3.0):
+//   a[\" \"]=15; echo rc=$? -> `rc=1`, stderr
+//   `<script>: line 1: " ": arithmetic syntax error: operand expected
+//   (error token is "" "")` — the assignment fails, nothing executes after.
+#[test]
+fn escaped_quote_array_subscript_is_marked_as_arithmetic_parse_error() {
+    let ast = parse(&tokenize(r#"a[\" \"]=15"#));
+
+    assert!(ast.commands[0]
+        .get_assignment("__RUBASH_PARSE_ERROR__")
+        .is_none());
+    assert_eq!(ast.commands[0].words, ["a[\u{18} \u{18}]=15"]);
+}
+
+#[test]
+fn escaped_quote_array_subscript_is_allowed_for_declare_and_let() {
+    for input in [r#"declare "a[\" \"]=14"#, r#"let a\[\" \"]=13"#] {
+        let ast = parse(&tokenize(input));
+        assert!(
+            ast.commands[0]
+                .get_assignment("__RUBASH_PARSE_ERROR__")
+                .is_none(),
+            "unexpected parse error for {input:?}"
+        );
+    }
+}
+
+mod simple_commands {
+    use super::*;
+
+    #[test]
+    fn test_empty_input() {
+        let input = "";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 0);
+    }
+
+    #[test]
+    fn test_single_command() {
+        let input = "ls -la";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(ast.commands[0].words.len(), 2);
+        assert_eq!(ast.commands[0].words[0], "ls");
+    }
+
+    #[test]
+    fn test_command_with_args() {
+        let input = "ls -la /home";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(ast.commands[0].words.len(), 3);
+    }
+}
+
+mod pipeline_tests {
+    use super::*;
+
+    #[test]
+    fn test_simple_pipeline() {
+        let input = "ls | grep foo";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.stages.len(), 2);
+        assert_eq!(pipeline.operators, ["|"]);
+        assert_eq!(pipeline.operator_metadata.len(), 1);
+        assert_eq!(pipeline.operator_metadata[0].word_index, 0);
+        assert_eq!(pipeline.operator_metadata[0].value, "|");
+        assert_eq!(pipeline.operator_metadata[0].raw, "|");
+        assert_eq!(pipeline.stages[0].words, ["ls"]);
+        assert!(pipeline.stages[0].pipe.is_some());
+        assert_eq!(pipeline.stages[1].words, ["grep", "foo"]);
+    }
+
+    #[test]
+    fn test_pipeline_allows_newline_after_operator() {
+        let input = "printf alpha |\n grep alpha";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.operators, ["|"]);
+        assert_eq!(pipeline.stages.len(), 2);
+        assert_eq!(pipeline.stages[0].words, ["printf", "alpha"]);
+        assert_eq!(pipeline.stages[1].words, ["grep", "alpha"]);
+    }
+
+    #[test]
+    fn test_stderr_pipeline_allows_newline_after_operator() {
+        let input = "cmd |&\n grep err";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.operators, ["|&"]);
+        assert_eq!(pipeline.stages.len(), 2);
+        assert_eq!(pipeline.stages[0].pipe, Some(2));
+        assert_eq!(pipeline.stages[1].words, ["grep", "err"]);
+    }
+
+    #[test]
+    fn test_stderr_pipeline_operator() {
+        let input = "cmd |& grep err";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.stages.len(), 2);
+        assert_eq!(pipeline.operators, ["|&"]);
+        assert_eq!(pipeline.operator_metadata[0].value, "|&");
+        assert_eq!(pipeline.operator_metadata[0].raw, "|&");
+        assert_eq!(pipeline.stages[0].pipe, Some(2));
+        assert_eq!(pipeline.stages[1].words, ["grep", "err"]);
+    }
+
+    #[test]
+    fn test_time_prefix_wraps_pipeline_command() {
+        let input = "time -p ! echo alpha | wc -l";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+        assert_eq!(time_command.keyword, "time");
+        assert_eq!(time_command.keyword_metadata.value, "time");
+        assert_eq!(time_command.keyword_metadata.raw, "time");
+        assert_eq!(time_command.prefix_words, ["-p", "!"]);
+        assert_eq!(time_command.prefix_word_metadata.len(), 2);
+        assert_eq!(time_command.prefix_word_metadata[0].word_index, 0);
+        assert_eq!(time_command.prefix_word_metadata[0].value, "-p");
+        assert_eq!(time_command.prefix_word_metadata[0].raw, "-p");
+        assert_eq!(time_command.prefix_word_metadata[1].word_index, 1);
+        assert_eq!(time_command.prefix_word_metadata[1].value, "!");
+        assert_eq!(time_command.prefix_word_metadata[1].raw, "!");
+        assert!(time_command.posix_format);
+        assert!(time_command.inverted);
+        let pipeline = time_command.command.pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.stages.len(), 2);
+        assert_eq!(pipeline.operators, ["|"]);
+        assert_eq!(pipeline.stages[0].words, ["echo", "alpha"]);
+        assert_eq!(pipeline.stages[1].words, ["wc", "-l"]);
+    }
+
+    #[test]
+    fn test_time_prefix_allows_pipeline_operator_newline() {
+        let input = "time printf alpha |\n wc -c";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+
+        assert_eq!(ast.commands.len(), 1);
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+        let pipeline = time_command.command.pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.operators, ["|"]);
+        assert_eq!(pipeline.stages[0].words, ["printf", "alpha"]);
+        assert_eq!(pipeline.stages[1].words, ["wc", "-c"]);
+    }
+
+    #[test]
+    fn test_time_prefix_wraps_simple_command_in_and_or_list() {
+        let input = "time -p ! false || echo fallback";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let list = ast.commands[0].and_or_list.as_ref().unwrap();
+        assert_eq!(list.operators, ["||"]);
+        let time_command = list.commands[0].time_command.as_ref().unwrap();
+        assert_eq!(time_command.keyword, "time");
+        assert_eq!(time_command.keyword_metadata.value, "time");
+        assert_eq!(time_command.prefix_words, ["-p", "!"]);
+        assert!(time_command.posix_format);
+        assert!(time_command.inverted);
+        assert_eq!(time_command.command.words, ["false"]);
+        assert_eq!(list.commands[1].words, ["echo", "fallback"]);
+    }
+
+    #[test]
+    fn test_time_prefix_wraps_null_command() {
+        let tokens = tokenize("time");
+        let ast = parse(&tokens);
+
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+        assert_eq!(time_command.keyword, "time");
+        assert!(time_command.prefix_words.is_empty());
+        assert!(!time_command.posix_format);
+        assert!(time_command.command.words.is_empty());
+    }
+
+    #[test]
+    fn test_time_prefix_with_options_wraps_null_command_before_next_command() {
+        let tokens = tokenize("time -p --; echo done");
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 2);
+
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+        assert_eq!(time_command.prefix_words, ["-p", "--"]);
+        assert!(time_command.posix_format);
+        assert!(time_command.command.words.is_empty());
+        assert_eq!(ast.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_inversion_wraps_time_simple_command() {
+        let input = "! time -p false";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let inverted = ast.commands[0].inverted_command.as_ref().unwrap();
+        let time_command = inverted.command.time_command.as_ref().unwrap();
+        assert!(time_command.posix_format);
+        assert!(!time_command.inverted);
+        assert_eq!(time_command.command.words, ["false"]);
+    }
+
+    #[test]
+    fn test_inversion_wraps_time_pipeline_command() {
+        let input = "! time echo alpha | grep beta";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let inverted = ast.commands[0].inverted_command.as_ref().unwrap();
+        let time_command = inverted.command.time_command.as_ref().unwrap();
+        let pipeline = time_command.command.pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.stages[0].words, ["echo", "alpha"]);
+        assert_eq!(pipeline.stages[1].words, ["grep", "beta"]);
+    }
+
+    #[test]
+    fn test_time_prefix_wraps_non_initial_pipeline_stage() {
+        let input = "printf alpha | time cat | wc -c";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.stages.len(), 3);
+        assert_eq!(pipeline.stages[0].words, ["printf", "alpha"]);
+        let time_command = pipeline.stages[1].time_command.as_ref().unwrap();
+        assert_eq!(time_command.keyword, "time");
+        assert_eq!(time_command.command.words, ["cat"]);
+        assert_eq!(pipeline.stages[1].pipe, Some(1));
+        assert_eq!(pipeline.stages[2].words, ["wc", "-c"]);
+    }
+
+    #[test]
+    fn test_multiple_pipeline() {
+        let input = "ls | grep foo | sort";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.stages.len(), 3);
+        assert_eq!(pipeline.operators, ["|", "|"]);
+        assert_eq!(pipeline.operator_metadata.len(), 2);
+        assert_eq!(pipeline.operator_metadata[1].word_index, 1);
+        assert_eq!(pipeline.operator_metadata[1].value, "|");
+        assert_eq!(pipeline.stages[2].words, ["sort"]);
+    }
+
+    #[test]
+    fn test_pipeline_command_preserves_connector() {
+        let input = "printf a | grep a && echo ok";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let list = ast.commands[0].and_or_list.as_ref().unwrap();
+        assert_eq!(list.connectors, [true]);
+        assert_eq!(list.operators, ["&&"]);
+        assert_eq!(list.operator_metadata[0].value, "&&");
+        assert_eq!(list.operator_metadata[0].raw, "&&");
+        assert!(list.commands[0].pipeline_command.is_some());
+        assert_eq!(list.commands[1].words, ["echo", "ok"]);
+    }
+
+    #[test]
+    fn test_compound_command_pipeline_stage() {
+        let input = "for value in a b; do echo $value; done | wc -l";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.stages.len(), 2);
+        assert_eq!(pipeline.operators, ["|"]);
+        assert!(pipeline.stages[0].pipe.is_some());
+        assert!(pipeline.stages[0].for_command.is_some());
+        assert_eq!(pipeline.stages[1].words, ["wc", "-l"]);
+    }
+
+    #[test]
+    fn test_arithmetic_for_command_pipeline_stage() {
+        let input = "for (( i = 0; i < 2; i++ )); do echo $i; done | wc -l";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.stages.len(), 2);
+        assert_eq!(pipeline.operators, ["|"]);
+        assert_eq!(pipeline.stages[0].pipe, Some(1));
+        assert!(pipeline.stages[0]
+            .for_command
+            .as_ref()
+            .and_then(|for_command| for_command.arithmetic.as_ref())
+            .is_some());
+        assert_eq!(pipeline.stages[1].words, ["wc", "-l"]);
+    }
+
+    #[test]
+    fn test_arithmetic_command_pipeline_stage() {
+        let input = "(( n += 1 )) | cat";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+
+        assert_eq!(pipeline.stages.len(), 2);
+        assert_eq!(pipeline.operators, ["|"]);
+        assert_eq!(pipeline.stages[0].pipe, Some(1));
+        assert!(pipeline.stages[0].arithmetic_command.is_some());
+        assert_eq!(pipeline.stages[1].words, ["cat"]);
+    }
+
+    #[test]
+    fn test_conditional_command_pipeline_stage() {
+        let input = "[[ $value == yes ]] | cat";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+
+        assert_eq!(pipeline.stages.len(), 2);
+        assert_eq!(pipeline.operators, ["|"]);
+        assert_eq!(pipeline.stages[0].pipe, Some(1));
+        assert!(pipeline.stages[0].conditional_command.is_some());
+        assert_eq!(pipeline.stages[1].words, ["cat"]);
+    }
+
+    // wt33 (#373) IGNORED — real semantic gap, not a stale assertion: GNU
+    // 5.3.0 accepts `case ... esac | grep yes` (probe wt33-373/run/B07:
+    // runs the pipeline, `echo no` filtered out by grep, outer rc 1);
+    // rubash rejects it with `syntax error near unexpected token \`|'` rc 2.
+    // Tracked by the wt33 case-pipeline issue. Do not flip this expectation
+    // to the error form — that would cement the divergence.
+    #[test]
+    fn test_case_command_pipeline_stage() {
+        let input = "case $word in yes) echo yes ;; *) echo no ;; esac | grep yes";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+
+        assert_eq!(pipeline.stages.len(), 2);
+        assert_eq!(pipeline.operators, ["|"]);
+        assert_eq!(pipeline.stages[0].pipe, Some(1));
+        assert!(pipeline.stages[0].case_command.is_some());
+        assert_eq!(pipeline.stages[1].words, ["grep", "yes"]);
+    }
+
+    #[test]
+    fn test_grouping_and_select_command_pipeline_stages() {
+        let subshell_ast = parse(&tokenize("( echo yes ) | cat"));
+        let select_ast = parse(&tokenize(
+            "select value in one two; do echo $value; break; done <<< 2 | cat",
+        ));
+
+        let subshell_pipeline = subshell_ast.commands[0].pipeline_command.as_ref().unwrap();
+        let select_pipeline = select_ast.commands[0].pipeline_command.as_ref().unwrap();
+
+        assert_eq!(subshell_pipeline.stages.len(), 2);
+        assert_eq!(subshell_pipeline.operators, ["|"]);
+        assert!(subshell_pipeline.stages[0].subshell_command.is_some());
+        assert_eq!(subshell_pipeline.stages[1].words, ["cat"]);
+        assert_eq!(select_pipeline.stages.len(), 2);
+        assert_eq!(select_pipeline.operators, ["|"]);
+        assert!(select_pipeline.stages[0].select_command.is_some());
+        assert_eq!(select_pipeline.stages[1].words, ["cat"]);
+    }
+
+    #[test]
+    fn test_and_or_list_command_preserves_mixed_connectors() {
+        let input = "false || echo fallback && echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let list = ast.commands[0].and_or_list.as_ref().unwrap();
+        assert_eq!(list.connectors, [false, true]);
+        assert_eq!(list.operators, ["||", "&&"]);
+        assert_eq!(list.operator_metadata.len(), 2);
+        assert_eq!(list.operator_metadata[0].word_index, 0);
+        assert_eq!(list.operator_metadata[0].value, "||");
+        assert_eq!(list.operator_metadata[1].word_index, 1);
+        assert_eq!(list.operator_metadata[1].value, "&&");
+        assert_eq!(list.commands[0].words, ["false"]);
+        assert_eq!(list.commands[1].words, ["echo", "fallback"]);
+        assert_eq!(list.commands[2].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_time_prefix_parses_for_command() {
+        let input = "time -p for x in a b; do echo $x; done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+        assert_eq!(time_command.keyword, "time");
+        assert_eq!(time_command.keyword_metadata.value, "time");
+        assert_eq!(time_command.keyword_metadata.raw, "time");
+        assert_eq!(time_command.prefix_words, ["-p"]);
+        assert_eq!(time_command.prefix_word_metadata.len(), 1);
+        assert_eq!(time_command.prefix_word_metadata[0].word_index, 0);
+        assert_eq!(time_command.prefix_word_metadata[0].value, "-p");
+        assert_eq!(time_command.prefix_word_metadata[0].raw, "-p");
+        assert!(time_command.posix_format);
+        assert!(!time_command.inverted);
+        let for_command = time_command.command.for_command.as_ref().unwrap();
+        assert_eq!(for_command.keyword, "for");
+        assert_eq!(for_command.in_keyword.as_deref(), Some("in"));
+        assert_eq!(for_command.do_keyword.as_deref(), Some("do"));
+        assert_eq!(for_command.end_keyword.as_deref(), Some("done"));
+        assert_eq!(for_command.variable, "x");
+        assert_eq!(for_command.words, ["a", "b"]);
+        assert_eq!(for_command.list_terminator.as_deref(), Some(";"));
+        assert_eq!(for_command.body_kind, CommandBodyKind::DoDone);
+        assert_eq!(for_command.body_open_delimiter.as_deref(), Some("do"));
+        assert_eq!(for_command.body_close_delimiter.as_deref(), Some("done"));
+        assert_eq!(for_command.body[0].words, ["echo", "$x"]);
+    }
+
+    #[test]
+    fn test_time_inversion_prefix_parses_for_command() {
+        let input = "time -p ! for x in a; do echo $x; done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+        assert_eq!(time_command.keyword, "time");
+        assert_eq!(time_command.prefix_words, ["-p", "!"]);
+        assert!(time_command.posix_format);
+        assert!(time_command.inverted);
+        assert!(time_command.command.for_command.is_some());
+    }
+
+    #[test]
+    fn test_time_prefix_parses_arithmetic_command() {
+        let input = "time -p (( 1 + 1 ))";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+        assert_eq!(time_command.keyword, "time");
+        assert_eq!(time_command.prefix_words, ["-p"]);
+        assert!(time_command.posix_format);
+        let arithmetic = time_command.command.arithmetic_command.as_ref().unwrap();
+        assert_eq!(arithmetic.expression, "1 + 1");
+    }
+
+    #[test]
+    fn test_time_prefix_parses_conditional_command() {
+        let input = "time -p [[ $value == ok ]]";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+        assert_eq!(time_command.keyword, "time");
+        assert_eq!(time_command.prefix_words, ["-p"]);
+        assert!(time_command.posix_format);
+        let conditional = time_command.command.conditional_command.as_ref().unwrap();
+        assert_eq!(conditional.open_delimiter, "[[");
+        assert_eq!(conditional.close_delimiter, "]]");
+        assert_eq!(conditional.args, ["$value", "==", "ok", "]]"]);
+    }
+
+    #[test]
+    fn test_time_prefix_keeps_heredoc_body() {
+        let input = "time -p cat <<EOF\nalpha\nEOF";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+
+        assert_eq!(time_command.keyword, "time");
+        assert_eq!(time_command.prefix_words, ["-p"]);
+        assert_eq!(time_command.command.words, ["cat"]);
+        assert_eq!(
+            time_command.command.heredoc_delimiter.as_deref(),
+            Some("EOF")
+        );
+        assert_eq!(time_command.command.heredoc.as_deref(), Some("alpha\n"));
+        assert_eq!(time_command.command.heredoc_redirects.len(), 1);
+        assert_eq!(
+            time_command.command.heredoc_redirects[0].body.as_deref(),
+            Some("alpha\n")
+        );
+    }
+
+    #[test]
+    fn test_time_prefix_parses_if_command_sequence() {
+        let input = "time -p if true; then echo yes; fi";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+        assert!(time_command.posix_format);
+        let if_command = time_command.command.if_command.as_ref().unwrap();
+        assert_eq!(if_command.condition[0].words, ["true"]);
+        assert_eq!(if_command.then_body[0].words, ["echo", "yes"]);
+    }
+
+    #[test]
+    fn test_time_prefix_parses_brace_group() {
+        let input = "time -p { echo one; echo two; }";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+        assert!(time_command.posix_format);
+        let brace_group = time_command.command.brace_group.as_ref().unwrap();
+        assert_eq!(brace_group.open_delimiter, "{");
+        assert_eq!(brace_group.open_delimiter_metadata.value, "{");
+        assert_eq!(brace_group.open_delimiter_metadata.raw, "{");
+        assert_eq!(brace_group.close_delimiter, "}");
+        assert_eq!(brace_group.close_delimiter_metadata.value, "}");
+        assert_eq!(brace_group.close_delimiter_metadata.raw, "}");
+        let body = &brace_group.body;
+        assert_eq!(body[0].words, ["echo", "one"]);
+        assert_eq!(body[1].words, ["echo", "two"]);
+    }
+
+    #[test]
+    fn test_time_prefix_brace_group_consumes_pipe_operator() {
+        let input = "time { echo one; } | wc -l";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.operators, ["|"]);
+        assert_eq!(pipeline.stages[0].pipe, Some(1));
+        let time_command = pipeline.stages[0].time_command.as_ref().unwrap();
+        assert_eq!(time_command.keyword_metadata.value, "time");
+        assert!(time_command.command.brace_group.is_some());
+        assert_eq!(pipeline.stages[1].words, ["wc", "-l"]);
+    }
+
+    #[test]
+    fn test_brace_group_command_consumes_redirect_and_connector() {
+        let input = "{ echo hi; } > out && echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let list = ast.commands[0].and_or_list.as_ref().unwrap();
+        let brace_group = list.commands[0].brace_group.as_ref().unwrap();
+        assert_eq!(brace_group.open_delimiter, "{");
+        assert_eq!(brace_group.open_delimiter_metadata.value, "{");
+        assert_eq!(brace_group.close_delimiter, "}");
+        assert_eq!(brace_group.close_delimiter_metadata.value, "}");
+        let body = &brace_group.body;
+        assert_eq!(body[0].words, ["echo", "hi"]);
+        assert_eq!(
+            list.commands[0].redirect_out.as_ref().unwrap().target,
+            "out"
+        );
+        assert_eq!(list.connectors, [true]);
+        assert_eq!(list.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_brace_group_inner_command_keeps_trailing_heredoc_body() {
+        let input = "{ cat <<EOF; }; echo Ok2\nOk1\nEOF\n";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 2);
+        let brace_group = ast.commands[0].brace_group.as_ref().unwrap();
+        let cat = &brace_group.body[0];
+
+        assert_eq!(cat.words, ["cat"]);
+        assert_eq!(cat.heredoc_delimiter.as_deref(), Some("EOF"));
+        assert_eq!(cat.heredoc.as_deref(), Some("Ok1\n"));
+        assert_eq!(cat.heredoc_redirects[0].body.as_deref(), Some("Ok1\n"));
+        assert_eq!(ast.commands[1].words, ["echo", "Ok2"]);
+    }
+
+    #[test]
+    fn test_brace_group_keeps_brace_arguments() {
+        let input = "{ echo } arg; echo after; }";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let brace_group = ast.commands[0].brace_group.as_ref().unwrap();
+
+        assert_eq!(brace_group.body.len(), 2);
+        assert_eq!(brace_group.body[0].words, ["echo", "}", "arg"]);
+        assert_eq!(brace_group.body[1].words, ["echo", "after"]);
+    }
+
+    // wt33 (#373): the $'...' quoting now rides in token.value as
+    // \u{E010}/\u{E401} PUA carriers instead of the decoded text; decoding
+    // happens at execution.
+    #[test]
+    fn test_brace_group_keeps_inner_ansi_c_escaped_quote_brace() {
+        let input = "{\necho $'foo\\'{\nbar'\necho after\n}";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let brace_group = ast.commands[0].brace_group.as_ref().unwrap();
+
+        assert_eq!(brace_group.body.len(), 2);
+        assert_eq!(
+            brace_group.body[0].words,
+            ["echo", "foo\u{e010}{\u{e401}\nbar"]
+        );
+        assert_eq!(brace_group.body[1].words, ["echo", "after"]);
+    }
+
+    #[test]
+    fn test_brace_group_command_consumes_pipe_stderr_operator() {
+        let input = "{ echo hi; } |& grep hi";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.operators, ["|&"]);
+        assert_eq!(pipeline.stages[0].pipe, Some(2));
+        assert!(pipeline.stages[0].brace_group.is_some());
+        assert_eq!(pipeline.stages[1].words, ["grep", "hi"]);
+    }
+
+    #[test]
+    fn test_time_prefix_parses_function_definition() {
+        let keyword_tokens = tokenize("time function greet { echo hi; }");
+        let keyword_ast = parse(&keyword_tokens);
+        let keyword_time = keyword_ast.commands[0].time_command.as_ref().unwrap();
+        let keyword_function = keyword_time.command.function_command.as_ref().unwrap();
+
+        assert!(keyword_function.keyword);
+        assert_eq!(keyword_function.name, "greet");
+        assert_eq!(keyword_function.body[0].words, ["echo", "hi"]);
+
+        let posix_tokens = tokenize("time greet() { echo hi; }");
+        let posix_ast = parse(&posix_tokens);
+        let posix_time = posix_ast.commands[0].time_command.as_ref().unwrap();
+        let posix_function = posix_time.command.function_command.as_ref().unwrap();
+
+        assert!(!posix_function.keyword);
+        assert!(posix_function.has_parentheses);
+        assert_eq!(posix_function.name, "greet");
+        assert_eq!(posix_function.body[0].words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn test_time_inversion_prefix_parses_function_definition() {
+        let tokens = tokenize("time -p ! function greet { echo hi; }");
+        let ast = parse(&tokens);
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+        let function = time_command.command.function_command.as_ref().unwrap();
+
+        assert!(time_command.posix_format);
+        assert!(time_command.inverted);
+        assert_eq!(time_command.prefix_words, ["-p", "!"]);
+        assert!(function.keyword);
+        assert_eq!(function.name, "greet");
+        assert_eq!(function.body[0].words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn test_time_prefix_parses_subshell_group() {
+        let input = "time -p ( echo one; echo two )";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let time_command = ast.commands[0].time_command.as_ref().unwrap();
+        assert!(time_command.posix_format);
+        let subshell = time_command.command.subshell_command.as_ref().unwrap();
+        assert_eq!(subshell.open_delimiter, "(");
+        assert_eq!(subshell.open_delimiter_metadata.value, "(");
+        assert_eq!(subshell.open_delimiter_metadata.raw, "(");
+        assert_eq!(subshell.close_delimiter, ")");
+        assert_eq!(subshell.close_delimiter_metadata.value, ")");
+        assert_eq!(subshell.close_delimiter_metadata.raw, ")");
+        let body = &subshell.body;
+        assert_eq!(body[0].words, ["echo", "one"]);
+        assert_eq!(body[1].words, ["echo", "two"]);
+    }
+
+    #[test]
+    fn test_subshell_command_consumes_redirect_and_connector() {
+        let input = "( echo hi ) > out && echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let list = ast.commands[0].and_or_list.as_ref().unwrap();
+        let subshell = list.commands[0].subshell_command.as_ref().unwrap();
+        assert_eq!(subshell.open_delimiter, "(");
+        assert_eq!(subshell.open_delimiter_metadata.value, "(");
+        assert_eq!(subshell.close_delimiter, ")");
+        assert_eq!(subshell.close_delimiter_metadata.value, ")");
+        let body = &subshell.body;
+        assert_eq!(body[0].words, ["echo", "hi"]);
+        assert_eq!(
+            list.commands[0].redirect_out.as_ref().unwrap().target,
+            "out"
+        );
+        assert_eq!(list.connectors, [true]);
+        assert_eq!(list.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_subshell_command_keeps_case_pattern_parentheses() {
+        let input = "( case beta in alpha) printf alpha ;; beta) printf beta ;; esac )";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let subshell = ast.commands[0].subshell_command.as_ref().unwrap();
+
+        assert_eq!(subshell.open_delimiter, "(");
+        assert_eq!(subshell.close_delimiter, ")");
+        assert_eq!(subshell.body.len(), 1);
+        assert!(subshell.body[0].case_command.is_some());
+    }
+
+    // wt33 (#373): the bare `esac` after `in` ends an empty case (rubash#381,
+    // GNU parse.y:3433-3441), the following `)` closes the enclosing
+    // SUBSHELL, and the error surfaces at the next command-start token —
+    // GNU names `printf' (probe wt33-373/run/B12_subshell_case_esac,
+    // `syntax error near unexpected token \`printf'' rc 2; matched by
+    // rubash#390: the case closes and the outer grammar owns the naming —
+    // the whole input is one error command, not a subshell+case AST).
+    #[test]
+    fn test_subshell_command_keeps_case_pattern_starting_with_esac() {
+        let input = "( case esac in\nesac) printf matched ;; esac )";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0].get_assignment("__RUBASH_PARSE_ERROR__"),
+            Some(&"unexpected token `printf'".to_string()),
+            "the subshell absorbs the `)'; the missing separator names `printf'"
+        );
+    }
+
+    #[test]
+    fn test_subshell_command_keeps_case_argument() {
+        let input = "( echo case; echo ok )";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let subshell = ast.commands[0].subshell_command.as_ref().unwrap();
+
+        assert_eq!(subshell.body[0].words, ["echo", "case"]);
+        assert_eq!(subshell.body[1].words, ["echo", "ok"]);
+    }
+}
+
+mod semicolon_tests {
+    use super::*;
+
+    #[test]
+    fn test_sequential_commands() {
+        let input = "ls; cd /";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 2);
+    }
+
+    #[test]
+    fn test_newline_list_does_not_create_empty_commands() {
+        let input = "\n\nls;\n\ncd /;\n";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+
+        assert_eq!(ast.commands.len(), 2);
+        assert_eq!(ast.commands[0].words, ["ls"]);
+        assert_eq!(ast.commands[1].words, ["cd", "/"]);
+    }
+
+    #[test]
+    fn test_background_newline_does_not_create_empty_command() {
+        let input = "sleep 0 &\necho done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+
+        assert_eq!(ast.commands.len(), 2);
+        assert!(ast.commands[0].background_command.is_some());
+        assert_eq!(ast.commands[1].words, ["echo", "done"]);
+    }
+}
+
+mod command_body_kind_tests {
+    use super::*;
+
+    #[test]
+    fn test_for_brace_body_records_body_kind() {
+        let tokens = tokenize("for x in a; { echo $x; }");
+        let ast = parse(&tokens);
+        let for_command = ast.commands[0].for_command.as_ref().unwrap();
+
+        assert_eq!(for_command.keyword, "for");
+        assert_eq!(for_command.keyword_metadata.value, "for");
+        assert_eq!(for_command.keyword_metadata.raw, "for");
+        assert_eq!(for_command.in_keyword.as_deref(), Some("in"));
+        assert_eq!(
+            for_command.in_keyword_metadata.as_ref().unwrap().value,
+            "in"
+        );
+        assert_eq!(for_command.do_keyword, None);
+        assert!(for_command.do_keyword_metadata.is_none());
+        assert_eq!(for_command.end_keyword, None);
+        assert!(for_command.end_keyword_metadata.is_none());
+        assert_eq!(for_command.list_terminator.as_deref(), Some(";"));
+        assert_eq!(
+            for_command.list_terminator_metadata.as_ref().unwrap().value,
+            ";"
+        );
+        assert_eq!(for_command.body_kind, CommandBodyKind::BraceGroup);
+        assert_eq!(for_command.body_open_delimiter.as_deref(), Some("{"));
+        assert_eq!(
+            for_command
+                .body_open_delimiter_metadata
+                .as_ref()
+                .unwrap()
+                .value,
+            "{"
+        );
+        assert_eq!(for_command.body_close_delimiter.as_deref(), Some("}"));
+        assert_eq!(
+            for_command
+                .body_close_delimiter_metadata
+                .as_ref()
+                .unwrap()
+                .raw,
+            "}"
+        );
+        assert_eq!(for_command.body[0].words, ["echo", "$x"]);
+    }
+
+    #[test]
+    fn test_arithmetic_for_brace_body_keeps_brace_arguments() {
+        let tokens = tokenize("for ((i=0; i<1; i++)); { echo } arg; echo after; }");
+        let ast = parse(&tokens);
+        let for_command = ast.commands[0].for_command.as_ref().unwrap();
+
+        assert!(for_command.arithmetic.is_some());
+        assert_eq!(for_command.body_kind, CommandBodyKind::BraceGroup);
+        assert_eq!(for_command.body.len(), 2);
+        assert_eq!(for_command.body[0].words, ["echo", "}", "arg"]);
+        assert_eq!(for_command.body[1].words, ["echo", "after"]);
+    }
+
+    #[test]
+    fn test_brace_bodies_keep_case_patterns_named_like_close_brace() {
+        let brace_tokens = tokenize("{ case brace in }) echo close ;; esac; echo after; }");
+        let brace_ast = parse(&brace_tokens);
+        let for_tokens =
+            tokenize("for x in brace; { case brace in }) echo for ;; esac; echo after; }");
+        let for_ast = parse(&for_tokens);
+        let arithmetic_for_tokens = tokenize(
+            "for ((i=0; i<1; i++)); { case brace in }) echo arithmetic ;; esac; echo after; }",
+        );
+        let arithmetic_for_ast = parse(&arithmetic_for_tokens);
+        let select_tokens =
+            tokenize("select x in brace; { case brace in }) echo select ;; esac; echo after; }");
+        let select_ast = parse(&select_tokens);
+
+        let brace_group = brace_ast.commands[0].brace_group.as_ref().unwrap();
+        let for_command = for_ast.commands[0].for_command.as_ref().unwrap();
+        let arithmetic_for_command = arithmetic_for_ast.commands[0].for_command.as_ref().unwrap();
+        let select_command = select_ast.commands[0].select_command.as_ref().unwrap();
+
+        assert_eq!(
+            brace_group.body[0].case_command.as_ref().unwrap().clauses[0].patterns,
+            ["}"]
+        );
+        assert_eq!(brace_group.body[1].words, ["echo", "after"]);
+        assert_eq!(
+            for_command.body[0].case_command.as_ref().unwrap().clauses[0].patterns,
+            ["}"]
+        );
+        assert_eq!(for_command.body[1].words, ["echo", "after"]);
+        assert_eq!(
+            arithmetic_for_command.body[0]
+                .case_command
+                .as_ref()
+                .unwrap()
+                .clauses[0]
+                .patterns,
+            ["}"]
+        );
+        assert_eq!(arithmetic_for_command.body[1].words, ["echo", "after"]);
+        assert_eq!(
+            select_command.body[0]
+                .case_command
+                .as_ref()
+                .unwrap()
+                .clauses[0]
+                .patterns,
+            ["}"]
+        );
+        assert_eq!(select_command.body[1].words, ["echo", "after"]);
+    }
+
+    // wt33 (#373): bare `esac` after `in` ends an empty case (rubash#381), so
+    // `esac)` inside a brace group is a syntax error. Probe
+    // wt33-373/run/A20_brace_case_esac: `syntax error near unexpected token
+    // \`)'` rc 2, byte-identical to GNU 5.3.0, for both the compact and the
+    // multiline form (rubash#390: the case closes at the `esac` and the
+    // outer grammar rejects the stray `)' — the error node now carries the
+    // canonical PARSE_ERROR marker instead of the old NEAR placement).
+    #[test]
+    fn test_brace_bodies_keep_esac_pattern_and_close_brace_argument() {
+        let compact_tokens = tokenize("{ case esac in esac) echo } arg ;; esac; echo after; }");
+        let compact_ast = parse(&compact_tokens);
+        let multiline_tokens = tokenize("{\ncase esac in\nesac) echo } arg ;; esac\necho after\n}");
+        let multiline_ast = parse(&multiline_tokens);
+
+        for ast in [&compact_ast, &multiline_ast] {
+            assert_eq!(ast.commands.len(), 1);
+            let brace = ast.commands[0].brace_group.as_ref().unwrap();
+            // The compact form errors on body[0]; the multiline form keeps
+            // the clean empty case as body[0] and the error lands on the
+            // following command — either way the group fails as a whole.
+            assert!(
+                brace
+                    .body
+                    .iter()
+                    .any(|command| command.get_assignment("__RUBASH_PARSE_ERROR__").is_some()),
+                "stray `)` after the empty-case esac must be a syntax error"
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_body_kind_records_do_done_and_brace_group() {
+        let do_done_tokens = tokenize("select x in a; do echo $x; done");
+        let do_done_ast = parse(&do_done_tokens);
+        let brace_tokens = tokenize("select y in b; { echo $y; }");
+        let brace_ast = parse(&brace_tokens);
+        let first = do_done_ast.commands[0].select_command.as_ref().unwrap();
+        let second = brace_ast.commands[0].select_command.as_ref().unwrap();
+
+        assert_eq!(first.body_kind, CommandBodyKind::DoDone);
+        assert_eq!(first.keyword, "select");
+        assert_eq!(first.in_keyword.as_deref(), Some("in"));
+        assert_eq!(first.do_keyword.as_deref(), Some("do"));
+        assert_eq!(first.end_keyword.as_deref(), Some("done"));
+        assert_eq!(first.list_terminator.as_deref(), Some(";"));
+        assert_eq!(first.list_terminator_metadata.as_ref().unwrap().value, ";");
+        assert_eq!(first.body_open_delimiter.as_deref(), Some("do"));
+        assert_eq!(
+            first.body_open_delimiter_metadata.as_ref().unwrap().value,
+            "do"
+        );
+        assert_eq!(first.body_close_delimiter.as_deref(), Some("done"));
+        assert_eq!(
+            first.body_close_delimiter_metadata.as_ref().unwrap().value,
+            "done"
+        );
+        assert_eq!(first.body[0].words, ["echo", "$x"]);
+        assert_eq!(second.body_kind, CommandBodyKind::BraceGroup);
+        assert_eq!(second.keyword, "select");
+        assert_eq!(second.in_keyword.as_deref(), Some("in"));
+        assert_eq!(second.do_keyword, None);
+        assert_eq!(second.end_keyword, None);
+        assert_eq!(second.list_terminator.as_deref(), Some(";"));
+        assert_eq!(second.list_terminator_metadata.as_ref().unwrap().raw, ";");
+        assert_eq!(second.body_open_delimiter.as_deref(), Some("{"));
+        assert_eq!(
+            second.body_open_delimiter_metadata.as_ref().unwrap().value,
+            "{"
+        );
+        assert_eq!(second.body_close_delimiter.as_deref(), Some("}"));
+        assert_eq!(
+            second.body_close_delimiter_metadata.as_ref().unwrap().value,
+            "}"
+        );
+        assert_eq!(second.body[0].words, ["echo", "$y"]);
+    }
+
+    #[test]
+    fn test_for_and_select_words_keep_process_substitution() {
+        let for_tokens = tokenize("for x in <(printf a) >(cat); do :; done");
+        let for_ast = parse(&for_tokens);
+        let select_tokens = tokenize("select x in <(printf a) >(cat); do :; done");
+        let select_ast = parse(&select_tokens);
+
+        let for_command = for_ast.commands[0].for_command.as_ref().unwrap();
+        let select_command = select_ast.commands[0].select_command.as_ref().unwrap();
+
+        assert_eq!(for_command.words, ["<(printf a)", ">(cat)"]);
+        assert_eq!(select_command.words, ["<(printf a)", ">(cat)"]);
+        assert_eq!(for_command.word_metadata.len(), 2);
+        assert_eq!(for_command.word_metadata[0].process_substitutions.len(), 1);
+        assert_eq!(
+            for_command.word_metadata[0].process_substitutions[0].target,
+            "<(printf a)"
+        );
+        assert_eq!(
+            for_command.word_metadata[0].process_substitutions[0]
+                .open_delimiter_metadata
+                .value,
+            "<("
+        );
+        assert_eq!(
+            for_command.word_metadata[0].process_substitutions[0]
+                .close_delimiter_metadata
+                .value,
+            ")"
+        );
+        assert_eq!(
+            for_command.word_metadata[0].process_substitutions[0].source,
+            "printf a"
+        );
+        assert!(!for_command.word_metadata[0].process_substitutions[0].output);
+        assert_eq!(
+            for_command.word_metadata[0].process_substitutions[0].word_index,
+            Some(0)
+        );
+        assert_eq!(
+            for_command.word_metadata[0].process_substitutions[0].commands[0].words,
+            ["printf", "a"]
+        );
+        assert_eq!(for_command.word_metadata[1].process_substitutions.len(), 1);
+        assert_eq!(
+            for_command.word_metadata[1].process_substitutions[0].target,
+            ">(cat)"
+        );
+        assert_eq!(
+            for_command.word_metadata[1].process_substitutions[0]
+                .open_delimiter_metadata
+                .value,
+            ">("
+        );
+        assert!(for_command.word_metadata[1].process_substitutions[0].output);
+        assert_eq!(
+            for_command.word_metadata[1].process_substitutions[0].word_index,
+            Some(1)
+        );
+        assert_eq!(select_command.word_metadata.len(), 2);
+        assert_eq!(
+            select_command.word_metadata[0].process_substitutions[0].target,
+            "<(printf a)"
+        );
+        assert_eq!(
+            select_command.word_metadata[1].process_substitutions[0].target,
+            ">(cat)"
+        );
+    }
+
+    #[test]
+    fn test_for_and_select_words_keep_reserved_words() {
+        let for_tokens = tokenize("for x in do done; do echo $x; done");
+        let for_ast = parse(&for_tokens);
+        let select_tokens = tokenize("select x in do done; do echo $x; done");
+        let select_ast = parse(&select_tokens);
+
+        let for_command = for_ast.commands[0].for_command.as_ref().unwrap();
+        let select_command = select_ast.commands[0].select_command.as_ref().unwrap();
+
+        assert_eq!(for_command.words, ["do", "done"]);
+        assert_eq!(for_command.do_keyword.as_deref(), Some("do"));
+        assert_eq!(for_command.body[0].words, ["echo", "$x"]);
+        assert_eq!(select_command.words, ["do", "done"]);
+        assert_eq!(select_command.do_keyword.as_deref(), Some("do"));
+        assert_eq!(select_command.body[0].words, ["echo", "$x"]);
+    }
+
+    #[test]
+    fn test_for_and_select_allow_newline_before_in_keyword() {
+        let for_tokens = tokenize("for x\nin a b\ndo echo $x\ndone");
+        let for_ast = parse(&for_tokens);
+        let select_tokens = tokenize("select x\nin a b\ndo echo $x\ndone");
+        let select_ast = parse(&select_tokens);
+
+        let for_command = for_ast.commands[0].for_command.as_ref().unwrap();
+        let select_command = select_ast.commands[0].select_command.as_ref().unwrap();
+
+        assert_eq!(for_command.variable, "x");
+        assert_eq!(for_command.in_keyword.as_deref(), Some("in"));
+        assert_eq!(for_command.words, ["a", "b"]);
+        assert_eq!(for_command.do_keyword.as_deref(), Some("do"));
+        assert_eq!(for_command.end_keyword.as_deref(), Some("done"));
+        assert_eq!(for_command.body[0].words, ["echo", "$x"]);
+        assert_eq!(select_command.variable, "x");
+        assert_eq!(select_command.in_keyword.as_deref(), Some("in"));
+        assert_eq!(select_command.words, ["a", "b"]);
+        assert_eq!(select_command.do_keyword.as_deref(), Some("do"));
+        assert_eq!(select_command.end_keyword.as_deref(), Some("done"));
+        assert_eq!(select_command.body[0].words, ["echo", "$x"]);
+    }
+
+    #[test]
+    fn test_case_allows_newline_for_header_inside_clause() {
+        // GNU 5.3 parses `for x\nin x\ndo ...` inside a case clause like
+        // the top level does — no syntax error, the loop runs.
+        let input = "case x in x)\nfor x\nin x\ndo echo x; done\nesac";
+        let ast = parse(&tokenize(input));
+        assert!(ast
+            .commands
+            .iter()
+            .all(|command| command.get_assignment("__RUBASH_PARSE_ERROR__").is_none()));
+        assert!(ast.commands[0].case_command.is_some());
+    }
+
+    #[test]
+    fn test_top_level_for_still_allows_newline_before_in() {
+        let input = "for x\nin x\ndo echo x; done";
+        let ast = parse(&tokenize(input));
+        assert!(ast.commands[0].for_command.is_some());
+    }
+
+    #[test]
+    fn test_for_and_select_preserve_invalid_variables_for_execution_check() {
+        let invalid_for_ast = parse(&tokenize("for 1bad in a; do echo $x; done"));
+        let variable_for_ast = parse(&tokenize("for $name in a; do echo $name; done"));
+        let invalid_select_ast = parse(&tokenize("select 1bad in a; do echo $x; done"));
+        let variable_select_ast = parse(&tokenize("select $name in a; do echo $name; done"));
+
+        assert_eq!(
+            invalid_for_ast.commands[0]
+                .for_command
+                .as_ref()
+                .unwrap()
+                .variable,
+            "1bad"
+        );
+        assert_eq!(
+            variable_for_ast.commands[0]
+                .for_command
+                .as_ref()
+                .unwrap()
+                .variable,
+            "$name"
+        );
+        assert_eq!(
+            invalid_select_ast.commands[0]
+                .select_command
+                .as_ref()
+                .unwrap()
+                .variable,
+            "1bad"
+        );
+        assert_eq!(
+            variable_select_ast.commands[0]
+                .select_command
+                .as_ref()
+                .unwrap()
+                .variable,
+            "$name"
+        );
+    }
+
+    #[test]
+    fn test_for_and_select_default_positional_without_semicolon() {
+        let for_ast = parse(&tokenize("for x do echo $x; done"));
+        let select_ast = parse(&tokenize("select x do echo $x; done"));
+
+        let for_command = for_ast.commands[0].for_command.as_ref().unwrap();
+        assert_eq!(for_command.variable, "x");
+        assert!(for_command.default_positional);
+        assert_eq!(for_command.in_keyword, None);
+        assert_eq!(for_command.list_terminator, None);
+        assert_eq!(for_command.do_keyword.as_deref(), Some("do"));
+        assert_eq!(for_command.body[0].words, ["echo", "$x"]);
+
+        let select_command = select_ast.commands[0].select_command.as_ref().unwrap();
+        assert_eq!(select_command.variable, "x");
+        assert!(select_command.default_positional);
+        assert_eq!(select_command.in_keyword, None);
+        assert_eq!(select_command.list_terminator, None);
+        assert_eq!(select_command.do_keyword.as_deref(), Some("do"));
+        assert_eq!(select_command.body[0].words, ["echo", "$x"]);
+    }
+
+    #[test]
+    fn test_arithmetic_for_records_empty_expression_slots() {
+        let tokens = tokenize("for (( ; ; i++ )); do echo $i; done");
+        let ast = parse(&tokens);
+        let for_command = ast.commands[0].for_command.as_ref().unwrap();
+        let arithmetic = for_command.arithmetic.as_ref().unwrap();
+
+        assert_eq!(arithmetic.init, "");
+        assert_eq!(arithmetic.test, "");
+        // Verbatim capture keeps the trailing blank before `))` (GNU
+        // make_cmd.c:254-261 substring contract, issue #548).
+        assert_eq!(arithmetic.update, "i++ ");
+        assert_eq!(for_command.do_keyword.as_deref(), Some("do"));
+        assert_eq!(for_command.body[0].words, ["echo", "$i"]);
+    }
+
+    #[test]
+    fn test_arithmetic_for_records_all_empty_expression_slots() {
+        let tokens = tokenize("for (( ; ; )); do :; done");
+        let ast = parse(&tokens);
+        let for_command = ast.commands[0].for_command.as_ref().unwrap();
+        let arithmetic = for_command.arithmetic.as_ref().unwrap();
+
+        assert_eq!(arithmetic.init, "");
+        assert_eq!(arithmetic.test, "");
+        assert_eq!(arithmetic.update, "");
+        assert_eq!(for_command.body[0].words, [":"]);
+    }
+
+    // wt33 (#373): `((X=([))]` — GNU 5.3.0 probe
+    // wt33-373/run/B11_arith_unclosed reports `unexpected EOF while looking
+    // for matching \`)'` rc 1; rubash reports `syntax error: unexpected end
+    // of file from \`(' command on line 1` rc 2 (message/rc divergence
+    // tracked by rubash#390). What must hold on both: the incomplete
+    // arithmetic command does not leak a tail command — the AST stays a
+    // single command carrying the error marker.
+    // rubash#413: the dparen verdict is now the char-level P_ARITH scan, so
+    // this shape parses as the nested-subshell reinterpretation and the
+    // marker is the compound-assignment EOF one (parse.y:7140-7152) — the
+    // exact marker GNU's diagnostic is built from (issue390
+    // q1_dparen_subshell_reparse_compound_eof_rc1 pins the wording+rc).
+    #[test]
+    fn test_unclosed_arithmetic_subscript_does_not_leak_tail_command() {
+        let ast = parse(&tokenize("((X=([))]"));
+
+        assert_eq!(ast.commands.len(), 1);
+        assert!(ast.commands[0]
+            .get_assignment("__RUBASH_PARSE_ERROR_EOF_PAREN__")
+            .is_some());
+        assert!(ast.commands[0].arithmetic_command.is_none());
+    }
+
+    // wt33 (#373): for-word `"*.rs"` now carries the \x11 CTLESC carrier in
+    // token.value (execution strips it — probe
+    // wt33-373/run/A13_for_words_quoted_glob, byte-identical to GNU 5.3.0:
+    // `<prea><preb>` for the brace word, literal `<*.rs>` for the quoted
+    // one). The select extglob word requires the extglob shopt at parse
+    // time (GNU parse.y:5466); WITH extglob off GNU rejects it (probe
+    // wt33-373/run/B08 — rubash wrongly accepts, tracked by the wt33
+    // select-extglob-gate issue), so this test enables the gate first and
+    // the select command sits at commands[1].
+    #[test]
+    fn test_for_and_select_words_record_metadata() {
+        let _extglob_gate = EXTGLOB_PARSE_GATE.lock().unwrap();
+        let for_tokens = tokenize("for x in ${one:-1} pre{a,b} src/[ab]? \"*.rs\"; do :; done");
+        let for_ast = parse(&for_tokens);
+        let select_tokens = tokenize(
+            "shopt -s extglob\nselect x in $((i+1)) @(yes|no) ~+/bin; do echo $x; done\nshopt -u extglob",
+        );
+        let select_ast = parse(&select_tokens);
+
+        let for_command = for_ast.commands[0].for_command.as_ref().unwrap();
+        assert_eq!(
+            for_command.words,
+            ["${one:-1}", "pre{a,b}", "src/[ab]?", "\u{11}*.rs"]
+        );
+        assert_eq!(for_command.keyword_metadata.value, "for");
+        assert_eq!(for_command.keyword_metadata.raw, "for");
+        assert_eq!(
+            for_command.in_keyword_metadata.as_ref().unwrap().value,
+            "in"
+        );
+        assert_eq!(
+            for_command.do_keyword_metadata.as_ref().unwrap().value,
+            "do"
+        );
+        assert_eq!(
+            for_command.end_keyword_metadata.as_ref().unwrap().value,
+            "done"
+        );
+        assert_eq!(for_command.variable, "x");
+        assert_eq!(for_command.variable_metadata.word_index, 0);
+        assert_eq!(for_command.variable_metadata.value, "x");
+        assert_eq!(for_command.variable_metadata.raw, "x");
+        assert_eq!(for_command.word_metadata.len(), 4);
+        assert_eq!(for_command.word_metadata[0].word_index, 0);
+        // wt44/parse4: parameter / arithmetic / brace / tilde records are no
+        // longer populated at parse time (zero readers; the executor
+        // re-derives them from the word text).
+        assert_eq!(
+            for_command.word_metadata[2].pathname_patterns[0].operators,
+            ["[ab]", "?"]
+        );
+        assert!(for_command.word_metadata[3].pathname_patterns.is_empty());
+        // wt44/parse4: word-quote records re-derive at the consumer.
+
+        let select_command = select_ast.commands[1].select_command.as_ref().unwrap();
+        assert_eq!(select_command.words, ["$((i+1))", "@(yes|no)", "~+/bin"]);
+        assert_eq!(select_command.keyword_metadata.value, "select");
+        assert_eq!(select_command.keyword_metadata.raw, "select");
+        assert_eq!(
+            select_command.in_keyword_metadata.as_ref().unwrap().value,
+            "in"
+        );
+        assert_eq!(
+            select_command.do_keyword_metadata.as_ref().unwrap().value,
+            "do"
+        );
+        assert_eq!(
+            select_command.end_keyword_metadata.as_ref().unwrap().value,
+            "done"
+        );
+        assert_eq!(select_command.variable, "x");
+        assert_eq!(select_command.variable_metadata.word_index, 0);
+        assert_eq!(select_command.variable_metadata.value, "x");
+        assert_eq!(select_command.variable_metadata.raw, "x");
+        assert_eq!(select_command.word_metadata.len(), 3);
+        assert_eq!(
+            select_command.word_metadata[1].extglob_patterns[0].operator,
+            '@'
+        );
+        assert_eq!(
+            select_command.word_metadata[1].extglob_patterns[0].alternatives,
+            ["yes", "no"]
+        );
+    }
+
+    #[test]
+    fn test_for_word_metadata_records_command_substitution() {
+        let tokens = tokenize("for x in $(printf a) `printf b`; do :; done");
+        let ast = parse(&tokens);
+        let for_command = ast.commands[0].for_command.as_ref().unwrap();
+
+        assert_eq!(for_command.words, ["$(printf a)", "`printf b`"]);
+        assert_eq!(for_command.word_metadata.len(), 2);
+        assert_eq!(
+            rubash::parser::command_substitutions_in_word_public(&for_command.words[0]).len(),
+            1
+        );
+        let dollar =
+            &rubash::parser::command_substitutions_in_word_public(&for_command.words[0])[0];
+        assert_eq!(dollar.text, "$(printf a)");
+        assert_eq!(dollar.source, "printf a");
+        assert!(!dollar.backtick);
+        assert_eq!(dollar.commands[0].words, ["printf", "a"]);
+
+        assert_eq!(
+            rubash::parser::command_substitutions_in_word_public(&for_command.words[1]).len(),
+            1
+        );
+        let backtick =
+            &rubash::parser::command_substitutions_in_word_public(&for_command.words[1])[0];
+        assert_eq!(backtick.text, "`printf b`");
+        assert_eq!(backtick.source, "printf b");
+        assert!(backtick.backtick);
+        assert_eq!(backtick.commands[0].words, ["printf", "b"]);
+    }
+
+    #[test]
+    fn test_loop_bodies_keep_case_patterns_named_like_delimiters() {
+        let for_tokens = tokenize("for x in one; do case done in done) echo for ;; esac; done");
+        let for_ast = parse(&for_tokens);
+        let while_tokens = tokenize("while true; do case done in done) echo while ;; esac; done");
+        let while_ast = parse(&while_tokens);
+        let select_tokens =
+            tokenize("select x in one; do case done in done) echo select ;; esac; done");
+        let select_ast = parse(&select_tokens);
+
+        let for_command = for_ast.commands[0].for_command.as_ref().unwrap();
+        let while_command = while_ast.commands[0].loop_command.as_ref().unwrap();
+        let select_command = select_ast.commands[0].select_command.as_ref().unwrap();
+
+        assert!(for_command.body[0].case_command.is_some());
+        assert_eq!(
+            for_command.body[0].case_command.as_ref().unwrap().clauses[0].patterns,
+            ["done"]
+        );
+        assert!(while_command.body[0].case_command.is_some());
+        assert_eq!(
+            while_command.body[0].case_command.as_ref().unwrap().clauses[0].patterns,
+            ["done"]
+        );
+        assert!(select_command.body[0].case_command.is_some());
+        assert_eq!(
+            select_command.body[0]
+                .case_command
+                .as_ref()
+                .unwrap()
+                .clauses[0]
+                .patterns,
+            ["done"]
+        );
+    }
+
+    #[test]
+    fn test_compound_scanners_keep_reserved_word_arguments() {
+        let if_tokens = tokenize("if echo then; then echo else; else echo fi; fi");
+        let if_ast = parse(&if_tokens);
+        let while_tokens = tokenize("while echo do; do echo done; break; done");
+        let while_ast = parse(&while_tokens);
+        let for_tokens = tokenize("for x in one; do echo done; done");
+        let for_ast = parse(&for_tokens);
+        let select_tokens = tokenize("select x in one; do echo done; done");
+        let select_ast = parse(&select_tokens);
+
+        let if_command = if_ast.commands[0].if_command.as_ref().unwrap();
+        let while_command = while_ast.commands[0].loop_command.as_ref().unwrap();
+        let for_command = for_ast.commands[0].for_command.as_ref().unwrap();
+        let select_command = select_ast.commands[0].select_command.as_ref().unwrap();
+
+        assert_eq!(if_command.condition[0].words, ["echo", "then"]);
+        assert_eq!(if_command.then_body[0].words, ["echo", "else"]);
+        assert_eq!(
+            if_command.else_body.as_ref().unwrap()[0].words,
+            ["echo", "fi"]
+        );
+        assert_eq!(while_command.condition[0].words, ["echo", "do"]);
+        assert_eq!(while_command.body[0].words, ["echo", "done"]);
+        assert_eq!(for_command.body[0].words, ["echo", "done"]);
+        assert_eq!(select_command.body[0].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_for_do_done_body_accepts_brace_group_before_done() {
+        let tokens = tokenize("for x in one; do { echo $x; } done");
+        let ast = parse(&tokens);
+        let for_command = ast.commands[0].for_command.as_ref().unwrap();
+
+        assert!(for_command
+            .body
+            .iter()
+            .any(|command| command.brace_group.is_some()));
+        assert_eq!(for_command.end_keyword.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn test_loop_body_delimiters_record_do_done() {
+        let while_tokens = tokenize("while false; do echo bad; done");
+        let while_ast = parse(&while_tokens);
+        let until_tokens = tokenize("until true; do echo ok; done");
+        let until_ast = parse(&until_tokens);
+        let while_command = while_ast.commands[0].loop_command.as_ref().unwrap();
+        let until_command = until_ast.commands[0].loop_command.as_ref().unwrap();
+
+        assert_eq!(while_command.kind, LoopKind::While);
+        assert_eq!(while_command.keyword, "while");
+        assert_eq!(while_command.keyword_metadata.value, "while");
+        assert_eq!(while_command.keyword_metadata.raw, "while");
+        assert_eq!(while_command.do_keyword, "do");
+        assert_eq!(while_command.do_keyword_metadata.value, "do");
+        assert_eq!(while_command.do_keyword_metadata.raw, "do");
+        assert_eq!(while_command.end_keyword, "done");
+        assert_eq!(while_command.end_keyword_metadata.value, "done");
+        assert_eq!(while_command.end_keyword_metadata.raw, "done");
+        assert_eq!(while_command.body_open_delimiter, "do");
+        assert_eq!(while_command.body_open_delimiter_metadata.value, "do");
+        assert_eq!(while_command.body_open_delimiter_metadata.raw, "do");
+        assert_eq!(while_command.body_close_delimiter, "done");
+        assert_eq!(while_command.body_close_delimiter_metadata.value, "done");
+        assert_eq!(while_command.body_close_delimiter_metadata.raw, "done");
+        assert_eq!(while_command.condition_terminator.as_deref(), Some(";"));
+        assert_eq!(
+            while_command
+                .condition_terminator_metadata
+                .as_ref()
+                .unwrap()
+                .value,
+            ";"
+        );
+        assert_eq!(
+            while_command
+                .condition_terminator_metadata
+                .as_ref()
+                .unwrap()
+                .raw,
+            ";"
+        );
+        assert_eq!(while_command.condition[0].words, ["false"]);
+        assert_eq!(while_command.body[0].words, ["echo", "bad"]);
+        assert_eq!(until_command.kind, LoopKind::Until);
+        assert_eq!(until_command.keyword, "until");
+        assert_eq!(until_command.keyword_metadata.value, "until");
+        assert_eq!(until_command.keyword_metadata.raw, "until");
+        assert_eq!(until_command.body_open_delimiter, "do");
+        assert_eq!(until_command.body_open_delimiter_metadata.value, "do");
+        assert_eq!(until_command.body_close_delimiter, "done");
+        assert_eq!(until_command.body_close_delimiter_metadata.value, "done");
+        assert_eq!(until_command.condition_terminator.as_deref(), Some(";"));
+        assert_eq!(
+            until_command
+                .condition_terminator_metadata
+                .as_ref()
+                .unwrap()
+                .value,
+            ";"
+        );
+        assert_eq!(until_command.condition[0].words, ["true"]);
+        assert_eq!(until_command.body[0].words, ["echo", "ok"]);
+    }
+}
+
+mod if_tests {
+    use super::*;
+
+    #[test]
+    fn test_if_command_parses_then_body() {
+        let input = "if true; then echo yes; fi";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let if_command = ast.commands[0].if_command.as_ref().unwrap();
+        assert_eq!(if_command.keyword, "if");
+        assert_eq!(if_command.keyword_metadata.value, "if");
+        assert_eq!(if_command.keyword_metadata.raw, "if");
+        assert_eq!(if_command.then_keyword, "then");
+        assert_eq!(if_command.then_keyword_metadata.value, "then");
+        assert_eq!(if_command.then_keyword_metadata.raw, "then");
+        assert_eq!(if_command.end_keyword, "fi");
+        assert_eq!(if_command.end_keyword_metadata.value, "fi");
+        assert_eq!(if_command.end_keyword_metadata.raw, "fi");
+        assert_eq!(if_command.condition_terminator.as_deref(), Some(";"));
+        assert_eq!(
+            if_command
+                .condition_terminator_metadata
+                .as_ref()
+                .unwrap()
+                .value,
+            ";"
+        );
+        assert_eq!(
+            if_command
+                .condition_terminator_metadata
+                .as_ref()
+                .unwrap()
+                .raw,
+            ";"
+        );
+        assert_eq!(if_command.condition[0].words, ["true"]);
+        assert_eq!(if_command.then_body[0].words, ["echo", "yes"]);
+        assert!(if_command.elif_branches.is_empty());
+        assert_eq!(if_command.else_keyword, None);
+        assert!(if_command.else_keyword_metadata.is_none());
+        assert!(if_command.else_body.is_none());
+    }
+
+    #[test]
+    fn test_if_command_parses_elif_and_else() {
+        let input = "if false; then echo no; elif true; then echo yes; else echo bad; fi";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let if_command = ast.commands[0].if_command.as_ref().unwrap();
+        assert_eq!(if_command.condition[0].words, ["false"]);
+        assert_eq!(if_command.condition_terminator.as_deref(), Some(";"));
+        assert_eq!(if_command.then_body[0].words, ["echo", "no"]);
+        assert_eq!(if_command.elif_branches.len(), 1);
+        assert_eq!(if_command.elif_branches[0].keyword, "elif");
+        assert_eq!(if_command.elif_branches[0].keyword_metadata.value, "elif");
+        assert_eq!(if_command.elif_branches[0].keyword_metadata.raw, "elif");
+        assert_eq!(if_command.elif_branches[0].then_keyword, "then");
+        assert_eq!(
+            if_command.elif_branches[0].then_keyword_metadata.value,
+            "then"
+        );
+        assert_eq!(
+            if_command.elif_branches[0].then_keyword_metadata.raw,
+            "then"
+        );
+        assert_eq!(
+            if_command.elif_branches[0].condition_terminator.as_deref(),
+            Some(";")
+        );
+        assert_eq!(
+            if_command.elif_branches[0]
+                .condition_terminator_metadata
+                .as_ref()
+                .unwrap()
+                .value,
+            ";"
+        );
+        assert_eq!(if_command.elif_branches[0].condition[0].words, ["true"]);
+        assert_eq!(if_command.elif_branches[0].body[0].words, ["echo", "yes"]);
+        assert_eq!(if_command.else_keyword.as_deref(), Some("else"));
+        let else_keyword_metadata = if_command.else_keyword_metadata.as_ref().unwrap();
+        assert_eq!(else_keyword_metadata.value, "else");
+        assert_eq!(else_keyword_metadata.raw, "else");
+        assert_eq!(if_command.end_keyword, "fi");
+        assert_eq!(
+            if_command.else_body.as_ref().unwrap()[0].words,
+            ["echo", "bad"]
+        );
+    }
+
+    #[test]
+    fn test_if_command_consumes_trailing_redirects() {
+        let input = "if true; then echo yes; fi > out";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert!(ast.commands[0].if_command.is_some());
+        assert_eq!(ast.commands[0].redirect_out.as_ref().unwrap().target, "out");
+    }
+}
+
+mod function_tests {
+    use super::*;
+
+    #[test]
+    fn test_function_keyword_definition() {
+        let input = "function greet { echo hi; }";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        assert_eq!(function.name, "greet");
+        assert_eq!(function.name_metadata.word_index, 0);
+        assert_eq!(function.name_metadata.value, "greet");
+        assert_eq!(function.name_metadata.raw, "greet");
+        assert!(function.name_metadata.word_quotes.is_empty());
+        assert!(function.keyword);
+        assert_eq!(function.keyword_text.as_deref(), Some("function"));
+        assert_eq!(
+            function.keyword_metadata.as_ref().unwrap().value,
+            "function"
+        );
+        assert_eq!(function.keyword_metadata.as_ref().unwrap().raw, "function");
+        assert!(!function.has_parentheses);
+        assert_eq!(function.open_paren, None);
+        assert!(function.open_paren_metadata.is_none());
+        assert_eq!(function.close_paren, None);
+        assert!(function.close_paren_metadata.is_none());
+        assert_eq!(function.body_kind, FunctionBodyKind::BraceGroup);
+        assert_eq!(function.body_open_delimiter.as_deref(), Some("{"));
+        assert_eq!(
+            function
+                .body_open_delimiter_metadata
+                .as_ref()
+                .unwrap()
+                .value,
+            "{"
+        );
+        assert_eq!(function.body_close_delimiter.as_deref(), Some("}"));
+        assert_eq!(
+            function
+                .body_close_delimiter_metadata
+                .as_ref()
+                .unwrap()
+                .value,
+            "}"
+        );
+        assert!(function.body_start.is_some());
+        assert!(function.body_end.is_some());
+        assert_eq!(function.body.len(), 1);
+        assert_eq!(function.body[0].words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn test_function_body_keeps_brace_arguments() {
+        let input = "function greet { echo } arg; echo after; }";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+
+        assert_eq!(function.body.len(), 2);
+        assert_eq!(function.body[0].words, ["echo", "}", "arg"]);
+        assert_eq!(function.body[1].words, ["echo", "after"]);
+    }
+
+    #[test]
+    fn test_function_brace_body_keeps_case_pattern_named_like_close_brace() {
+        let input = "function greet { case brace in }) echo close ;; esac; echo after; }";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+
+        assert_eq!(
+            function.body[0].case_command.as_ref().unwrap().clauses[0].patterns,
+            ["}"]
+        );
+        assert_eq!(function.body[1].words, ["echo", "after"]);
+    }
+
+    #[test]
+    fn test_multiline_function_brace_body_keeps_case_pattern_named_like_close_brace() {
+        let input = "greet()\n{\ncase brace in }) echo close ;; esac\necho after\n}";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+
+        assert_eq!(
+            function.body[0].case_command.as_ref().unwrap().clauses[0].patterns,
+            ["}"]
+        );
+        assert_eq!(function.body[1].words, ["echo", "after"]);
+    }
+
+    #[test]
+    fn test_function_keyword_with_parentheses() {
+        let input = "function greet() { echo hi; }";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        assert_eq!(function.name, "greet");
+        assert!(function.keyword);
+        assert_eq!(function.keyword_text.as_deref(), Some("function"));
+        assert_eq!(
+            function.keyword_metadata.as_ref().unwrap().value,
+            "function"
+        );
+        assert!(function.has_parentheses);
+        assert_eq!(function.open_paren.as_deref(), Some("("));
+        assert_eq!(function.open_paren_metadata.as_ref().unwrap().value, "(");
+        assert_eq!(function.close_paren.as_deref(), Some(")"));
+        assert_eq!(function.close_paren_metadata.as_ref().unwrap().value, ")");
+        assert_eq!(function.body_kind, FunctionBodyKind::BraceGroup);
+        assert_eq!(function.body_open_delimiter.as_deref(), Some("{"));
+        assert_eq!(function.body_close_delimiter.as_deref(), Some("}"));
+        assert_eq!(function.body[0].words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn test_bash_function_name_can_contain_hyphen() {
+        let input = "foo-a() { echo hi; }";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        assert_eq!(function.name, "foo-a");
+        assert_eq!(function.name_metadata.value, "foo-a");
+        assert_eq!(function.name_metadata.raw, "foo-a");
+        assert!(function.name_metadata.pathname_patterns.is_empty());
+        assert!(!function.keyword);
+        assert_eq!(function.keyword_text, None);
+        assert!(function.has_parentheses);
+        assert_eq!(function.open_paren.as_deref(), Some("("));
+        assert_eq!(function.close_paren.as_deref(), Some(")"));
+        assert_eq!(function.body_kind, FunctionBodyKind::BraceGroup);
+        assert_eq!(function.body_open_delimiter.as_deref(), Some("{"));
+        assert_eq!(function.body_close_delimiter.as_deref(), Some("}"));
+        assert_eq!(function.body[0].words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn test_function_definition_consumes_trailing_redirects() {
+        let input = "foo() { echo hi; } 2> err; echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 2);
+        assert!(ast.commands[0].function_command.is_some());
+        assert_eq!(ast.commands[0].redirect_err.as_ref().unwrap().target, "err");
+        assert_eq!(ast.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_function_definition_keeps_trailing_heredoc_body() {
+        let input = "foo() { read line; echo $line; } <<EOF\nbody\nEOF\nfoo";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 2);
+        let command = &ast.commands[0];
+
+        assert!(command.function_command.is_some());
+        assert_eq!(command.heredoc_delimiter.as_deref(), Some("EOF"));
+        assert_eq!(command.heredoc.as_deref(), Some("body\n"));
+        assert_eq!(command.heredoc_redirects.len(), 1);
+        assert_eq!(command.heredoc_redirects[0].body.as_deref(), Some("body\n"));
+        assert_eq!(ast.commands[1].words, ["foo"]);
+    }
+
+    #[test]
+    fn test_function_definition_consumes_and_or_connector() {
+        let input = "foo() { echo hi; } && echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let list = ast.commands[0].and_or_list.as_ref().unwrap();
+        assert_eq!(list.connectors, [true]);
+        assert!(list.commands[0].function_command.is_some());
+        assert_eq!(list.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_function_definition_consumes_pipe_operator() {
+        let input = "foo() { echo hi; } | cat";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.operators, ["|"]);
+        assert_eq!(pipeline.stages[0].pipe, Some(1));
+        assert!(pipeline.stages[0].function_command.is_some());
+        assert_eq!(pipeline.stages[1].words, ["cat"]);
+    }
+
+    #[test]
+    fn test_compact_function_definition_consumes_trailing_redirects() {
+        let input = "foo(){ echo hi; } > out; echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 2);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        assert_eq!(function.body_kind, FunctionBodyKind::BraceGroup);
+        assert_eq!(function.body_open_delimiter.as_deref(), Some("{"));
+        assert!(function.keyword_metadata.is_none());
+        assert_eq!(function.open_paren_metadata.as_ref().unwrap().value, "(");
+        assert_eq!(function.close_paren_metadata.as_ref().unwrap().value, ")");
+        assert_eq!(function.body_close_delimiter.as_deref(), Some("}"));
+        assert_eq!(ast.commands[0].redirect_out.as_ref().unwrap().target, "out");
+        assert_eq!(ast.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_parenthesized_function_body_records_subshell_metadata() {
+        let input = "foo() (echo hi)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+
+        assert_eq!(function.name, "foo");
+        assert!(!function.keyword);
+        assert!(function.has_parentheses);
+        assert_eq!(function.body_kind, FunctionBodyKind::Subshell);
+        assert_eq!(function.body_open_delimiter.as_deref(), Some("("));
+        assert_eq!(
+            function
+                .body_open_delimiter_metadata
+                .as_ref()
+                .unwrap()
+                .value,
+            "("
+        );
+        assert_eq!(function.body_close_delimiter.as_deref(), Some(")"));
+        assert_eq!(
+            function
+                .body_close_delimiter_metadata
+                .as_ref()
+                .unwrap()
+                .value,
+            ")"
+        );
+        assert!(function.body_start.is_some());
+        assert!(function.body_end.is_some());
+        assert_eq!(function.body[0].words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn test_function_keyword_can_use_subshell_body_without_signature_parentheses() {
+        let input = "function foo ( echo hi )";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+
+        assert_eq!(function.name, "foo");
+        assert!(function.keyword);
+        assert!(!function.has_parentheses);
+        assert_eq!(function.body_kind, FunctionBodyKind::Subshell);
+        assert_eq!(function.body_open_delimiter.as_deref(), Some("("));
+        assert_eq!(function.body_close_delimiter.as_deref(), Some(")"));
+        assert_eq!(function.body[0].words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn test_function_keyword_with_parentheses_can_use_subshell_body() {
+        let input = "function foo () ( echo hi )";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+
+        assert_eq!(function.name, "foo");
+        assert!(function.keyword);
+        assert!(function.has_parentheses);
+        assert_eq!(function.open_paren.as_deref(), Some("("));
+        assert_eq!(function.close_paren.as_deref(), Some(")"));
+        assert_eq!(function.body_kind, FunctionBodyKind::Subshell);
+        assert_eq!(function.body_open_delimiter.as_deref(), Some("("));
+        assert_eq!(function.body_close_delimiter.as_deref(), Some(")"));
+        assert_eq!(function.body[0].words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn test_parenthesized_function_body_keeps_case_pattern_parentheses() {
+        let input = "foo() ( case beta in alpha) printf alpha ;; beta) printf beta ;; esac )";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+
+        assert_eq!(function.body_kind, FunctionBodyKind::Subshell);
+        assert_eq!(function.body_open_delimiter.as_deref(), Some("("));
+        assert_eq!(function.body_close_delimiter.as_deref(), Some(")"));
+        assert_eq!(function.body.len(), 1);
+        assert!(function.body[0].case_command.is_some());
+    }
+
+    #[test]
+    fn test_parenthesized_function_body_keeps_case_argument() {
+        let input = "foo() ( echo case; echo ok )";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+
+        assert_eq!(function.body_kind, FunctionBodyKind::Subshell);
+        assert_eq!(function.body[0].words, ["echo", "case"]);
+        assert_eq!(function.body[1].words, ["echo", "ok"]);
+    }
+
+    #[test]
+    fn test_function_keyword_name_can_look_like_assignment() {
+        let input = "function foo=bar { echo hi; }";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        assert_eq!(function.name, "foo=bar");
+        assert!(function.keyword);
+        assert!(!function.has_parentheses);
+        assert_eq!(function.body[0].words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn test_reserved_word_parentheses_do_not_parse_as_function_name() {
+        let input = "for() { echo invalid; }";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+
+        assert!(ast
+            .commands
+            .iter()
+            .all(|command| command.function_command.is_none()));
+    }
+
+    #[test]
+    fn test_function_body_can_be_for_command() {
+        let input = "foo() for x in a b; do echo $x; done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        assert_eq!(function.name, "foo");
+        let for_command = function.body[0].for_command.as_ref().unwrap();
+        assert_eq!(function.body_kind, FunctionBodyKind::CompoundCommand);
+        assert_eq!(function.body_open_delimiter, None);
+        assert_eq!(function.body_close_delimiter, None);
+        assert_eq!(for_command.keyword, "for");
+        assert_eq!(for_command.in_keyword.as_deref(), Some("in"));
+        assert_eq!(for_command.do_keyword.as_deref(), Some("do"));
+        assert_eq!(for_command.end_keyword.as_deref(), Some("done"));
+        assert_eq!(for_command.variable, "x");
+        assert_eq!(for_command.words, ["a", "b"]);
+        assert_eq!(for_command.body_kind, CommandBodyKind::DoDone);
+        assert_eq!(for_command.body[0].words, ["echo", "$x"]);
+    }
+
+    #[test]
+    fn test_function_body_can_be_arithmetic_command() {
+        let input = "foo() (( 1 + 1 ))";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        assert_eq!(function.name, "foo");
+        assert_eq!(function.body_kind, FunctionBodyKind::CompoundCommand);
+        assert_eq!(function.body_open_delimiter, None);
+        assert_eq!(function.body_close_delimiter, None);
+        let arithmetic = function.body[0].arithmetic_command.as_ref().unwrap();
+        assert_eq!(arithmetic.open_delimiter, "((");
+        assert_eq!(arithmetic.close_delimiter, "))");
+        assert_eq!(arithmetic.expression, "1 + 1");
+    }
+
+    #[test]
+    fn test_function_body_can_be_case_command() {
+        let input = "foo() case $1 in a) echo alpha ;; *) echo other ;; esac";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        assert_eq!(function.name, "foo");
+        let case_command = function.body[0].case_command.as_ref().unwrap();
+        assert_eq!(case_command.word, "$1");
+        assert_eq!(case_command.clauses.len(), 2);
+        assert_eq!(case_command.clauses[0].pattern_nodes[0].text, "a");
+        assert!(!case_command.clauses[0].pattern_nodes[0].has_glob);
+        assert_eq!(case_command.clauses[1].pattern_nodes[0].text, "*");
+        assert!(case_command.clauses[1].pattern_nodes[0].has_glob);
+    }
+
+    #[test]
+    fn test_function_body_can_be_select_command() {
+        let input = "foo() select choice in alpha beta; do echo $choice; break; done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        let select_command = function.body[0].select_command.as_ref().unwrap();
+
+        assert_eq!(function.name, "foo");
+        assert_eq!(function.body_kind, FunctionBodyKind::CompoundCommand);
+        assert_eq!(select_command.variable, "choice");
+        assert_eq!(select_command.words, ["alpha", "beta"]);
+        assert_eq!(select_command.body[0].words, ["echo", "$choice"]);
+    }
+
+    #[test]
+    fn test_function_body_can_be_coproc_command() {
+        let input = "foo() coproc worker { echo ready; }";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        let coproc = function.body[0].coproc_command.as_ref().unwrap();
+
+        assert_eq!(function.name, "foo");
+        assert_eq!(function.body_kind, FunctionBodyKind::CompoundCommand);
+        assert_eq!(coproc.name.as_deref(), Some("worker"));
+        assert_eq!(coproc.body_kind, CoprocBodyKind::BraceGroup);
+        assert_eq!(coproc.body_open_delimiter.as_deref(), Some("{"));
+        assert_eq!(coproc.body_close_delimiter.as_deref(), Some("}"));
+        assert_eq!(coproc.body.as_ref().unwrap()[0].words, ["echo", "ready"]);
+    }
+
+    #[test]
+    fn test_function_body_can_be_if_command() {
+        let input = "foo() if true; then echo yes; else echo no; fi";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        assert_eq!(function.name, "foo");
+        assert_eq!(function.body_kind, FunctionBodyKind::CompoundCommand);
+        let if_command = function.body[0].if_command.as_ref().unwrap();
+        assert_eq!(if_command.condition[0].words, ["true"]);
+        assert_eq!(if_command.then_body[0].words, ["echo", "yes"]);
+        assert_eq!(
+            if_command.else_body.as_ref().unwrap()[0].words,
+            ["echo", "no"]
+        );
+    }
+
+    #[test]
+    fn test_function_body_can_be_while_command() {
+        let input = "foo() while false; do echo bad; done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        assert_eq!(function.name, "foo");
+        let loop_command = function.body[0].loop_command.as_ref().unwrap();
+        assert_eq!(function.body_kind, FunctionBodyKind::CompoundCommand);
+        assert_eq!(function.body_open_delimiter, None);
+        assert_eq!(function.body_close_delimiter, None);
+        assert!(!loop_command.until);
+        assert_eq!(loop_command.kind, LoopKind::While);
+        assert_eq!(loop_command.keyword, "while");
+        assert_eq!(loop_command.do_keyword, "do");
+        assert_eq!(loop_command.end_keyword, "done");
+        assert_eq!(loop_command.condition[0].words, ["false"]);
+        assert_eq!(loop_command.body[0].words, ["echo", "bad"]);
+    }
+
+    #[test]
+    fn test_function_body_can_be_until_command() {
+        let input = "foo() until true; do echo never; done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        let loop_command = function.body[0].loop_command.as_ref().unwrap();
+
+        assert_eq!(function.body_kind, FunctionBodyKind::CompoundCommand);
+        assert_eq!(loop_command.kind, LoopKind::Until);
+        assert!(loop_command.until);
+        assert_eq!(loop_command.keyword, "until");
+        assert_eq!(loop_command.condition[0].words, ["true"]);
+        assert_eq!(loop_command.body[0].words, ["echo", "never"]);
+    }
+
+    #[test]
+    fn test_function_body_can_be_conditional_command() {
+        let input = "foo() [[ $1 == a* && $2 -gt 1 ]]";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        assert_eq!(function.name, "foo");
+        let conditional = function.body[0].conditional_command.as_ref().unwrap();
+        assert_eq!(function.body_kind, FunctionBodyKind::CompoundCommand);
+        assert_eq!(
+            conditional.args,
+            ["$1", "==", "a*", "&&", "$2", "-gt", "1", "]]"]
+        );
+        assert_eq!(
+            function.body[0].words,
+            ["[[", "$1", "==", "a*", "&&", "$2", "-gt", "1", "]]"]
+        );
+    }
+
+    #[test]
+    fn test_function_body_can_be_time_command() {
+        let simple_tokens = tokenize("foo() time -p echo hi");
+        let simple_ast = parse(&simple_tokens);
+        let simple_function = simple_ast.commands[0].function_command.as_ref().unwrap();
+        let simple_time = simple_function.body[0].time_command.as_ref().unwrap();
+
+        assert_eq!(simple_function.body_kind, FunctionBodyKind::CompoundCommand);
+        assert!(simple_time.posix_format);
+        assert_eq!(simple_time.prefix_words, ["-p"]);
+        assert_eq!(simple_time.command.words, ["echo", "hi"]);
+
+        let brace_tokens = tokenize("bar() time { echo one; echo two; }");
+        let brace_ast = parse(&brace_tokens);
+        let brace_function = brace_ast.commands[0].function_command.as_ref().unwrap();
+        let brace_time = brace_function.body[0].time_command.as_ref().unwrap();
+
+        assert_eq!(brace_function.body_kind, FunctionBodyKind::CompoundCommand);
+        assert!(brace_time.command.brace_group.is_some());
+        assert_eq!(
+            brace_time.command.brace_group.as_ref().unwrap().body[0].words,
+            ["echo", "one"]
+        );
+    }
+
+    #[test]
+    fn test_function_conditional_body_keeps_quoted_closing_delimiter_word() {
+        let input = "foo() [[ value == \"]]\" ]]";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let function = ast.commands[0].function_command.as_ref().unwrap();
+        let conditional = function.body[0].conditional_command.as_ref().unwrap();
+
+        assert_eq!(function.body_kind, FunctionBodyKind::CompoundCommand);
+        assert_eq!(conditional.args, ["value", "==", "]]", "]]"]);
+        assert_eq!(conditional.expression.operands, ["value", "]]"]);
+    }
+
+    #[test]
+    fn test_function_sequence_body_keeps_reserved_word_arguments() {
+        let if_tokens = tokenize("foo() if echo then; then echo fi; fi");
+        let if_ast = parse(&if_tokens);
+        let if_function = if_ast.commands[0].function_command.as_ref().unwrap();
+        let if_command = if_function.body[0].if_command.as_ref().unwrap();
+
+        let loop_tokens = tokenize("bar() while echo do; do echo done; break; done");
+        let loop_ast = parse(&loop_tokens);
+        let loop_function = loop_ast.commands[0].function_command.as_ref().unwrap();
+        let loop_command = loop_function.body[0].loop_command.as_ref().unwrap();
+
+        assert_eq!(if_function.body_kind, FunctionBodyKind::CompoundCommand);
+        assert_eq!(if_command.condition[0].words, ["echo", "then"]);
+        assert_eq!(if_command.then_body[0].words, ["echo", "fi"]);
+        assert_eq!(loop_function.body_kind, FunctionBodyKind::CompoundCommand);
+        assert_eq!(loop_command.condition[0].words, ["echo", "do"]);
+        assert_eq!(loop_command.body[0].words, ["echo", "done"]);
+    }
+}
+
+mod conditional_tests {
+    use super::*;
+
+    #[test]
+    fn test_conditional_command_parses_args() {
+        let input = "[[ $value == a* && -n $other ]]";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let conditional = ast.commands[0].conditional_command.as_ref().unwrap();
+        assert_eq!(conditional.open_delimiter, "[[");
+        assert_eq!(conditional.open_delimiter_metadata.value, "[[");
+        assert_eq!(conditional.open_delimiter_metadata.raw, "[[");
+        assert_eq!(conditional.close_delimiter, "]]");
+        assert_eq!(conditional.close_delimiter_metadata.value, "]]");
+        assert_eq!(conditional.close_delimiter_metadata.raw, "]]");
+        assert_eq!(
+            conditional.args,
+            ["$value", "==", "a*", "&&", "-n", "$other", "]]"]
+        );
+        assert_eq!(
+            ast.commands[0].words,
+            ["[[", "$value", "==", "a*", "&&", "-n", "$other", "]]"]
+        );
+        assert_eq!(
+            conditional.expression.kind,
+            ConditionalExpressionKind::Logical
+        );
+        assert_eq!(conditional.expression.open_delimiter, None);
+        assert!(conditional.expression.open_delimiter_metadata.is_none());
+        assert_eq!(conditional.expression.close_delimiter, None);
+        assert!(conditional.expression.close_delimiter_metadata.is_none());
+        assert_eq!(conditional.expression.operator.as_deref(), Some("&&"));
+        assert_eq!(conditional.expression.children.len(), 2);
+        assert_eq!(
+            conditional.expression.children[0].kind,
+            ConditionalExpressionKind::Binary
+        );
+        assert_eq!(
+            conditional.expression.children[0].operator.as_deref(),
+            Some("==")
+        );
+        assert_eq!(
+            conditional.expression.children[0].operands,
+            ["$value", "a*"]
+        );
+        assert_eq!(
+            conditional.expression.children[0]
+                .pattern_operand
+                .as_ref()
+                .unwrap()
+                .kind,
+            ConditionalPatternKind::Glob
+        );
+        assert_eq!(
+            conditional.expression.children[0]
+                .pattern_operand
+                .as_ref()
+                .unwrap()
+                .text,
+            "a*"
+        );
+        assert_eq!(
+            conditional.expression.children[0]
+                .pattern_operand
+                .as_ref()
+                .unwrap()
+                .operators,
+            ["*"]
+        );
+        assert!(
+            conditional.expression.children[0]
+                .pattern_operand
+                .as_ref()
+                .unwrap()
+                .has_glob
+        );
+        assert_eq!(
+            conditional.expression.children[1].kind,
+            ConditionalExpressionKind::Unary
+        );
+        assert_eq!(
+            conditional.expression.children[1].operator.as_deref(),
+            Some("-n")
+        );
+        assert_eq!(conditional.expression.children[1].operands, ["$other"]);
+    }
+
+    // wt33 (#373): the conditional parse error moved to the dedicated
+    // `__RUBASH_PARSE_ERROR_COND__` marker (composed `near\x1eTOKEN\x1eLINE
+    // \x1eCOL\x1eMESSAGE`). Execution is GNU-verified — probe
+    // wt33-373/run/A06_cond_extra_operand (byte-identical):
+    //   [[ a = b c ]] -> rc 2, `syntax error in conditional expression` +
+    //   `syntax error near unexpected token \`c'`
+    #[test]
+    fn test_conditional_extra_binary_operand_is_parse_error() {
+        for input in ["[[ a = b c ]]", "[[ a < b c ]]"] {
+            let ast = parse(&tokenize(input));
+            let marker = ast.commands[0]
+                .get_assignment("__RUBASH_PARSE_ERROR_COND__")
+                .map(|value| value.contains("syntax error in conditional expression"));
+            assert_eq!(
+                marker,
+                Some(true),
+                "expected Bash-style parse error for {input}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_conditional_command_records_group_and_negation_expression() {
+        let input = "[[ ! ( -z $empty || $value =~ ^a ) ]]";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let conditional = ast.commands[0].conditional_command.as_ref().unwrap();
+
+        assert_eq!(conditional.open_delimiter, "[[");
+        assert_eq!(conditional.close_delimiter, "]]");
+        assert_eq!(
+            conditional.expression.kind,
+            ConditionalExpressionKind::Negation
+        );
+        let group = &conditional.expression.children[0];
+        assert_eq!(group.kind, ConditionalExpressionKind::Group);
+        assert_eq!(group.open_delimiter.as_deref(), Some("("));
+        assert_eq!(group.open_delimiter_metadata.as_ref().unwrap().value, "(");
+        assert_eq!(group.open_delimiter_metadata.as_ref().unwrap().raw, "(");
+        assert_eq!(group.close_delimiter.as_deref(), Some(")"));
+        assert_eq!(group.close_delimiter_metadata.as_ref().unwrap().value, ")");
+        assert_eq!(group.close_delimiter_metadata.as_ref().unwrap().raw, ")");
+        let logical = &group.children[0];
+        assert_eq!(logical.kind, ConditionalExpressionKind::Logical);
+        assert_eq!(logical.operator.as_deref(), Some("||"));
+        assert_eq!(logical.children[0].kind, ConditionalExpressionKind::Unary);
+        assert_eq!(logical.children[0].operator.as_deref(), Some("-z"));
+        assert_eq!(logical.children[1].kind, ConditionalExpressionKind::Binary);
+        assert_eq!(logical.children[1].operator.as_deref(), Some("=~"));
+    }
+
+    #[test]
+    fn test_conditional_command_joins_pattern_rhs_fragments() {
+        let extglob_tokens = tokenize("[[ foo == @(foo|bar) ]]");
+        let extglob_ast = parse(&extglob_tokens);
+        let regex_tokens = tokenize("[[ shellmath_add =~ shellmath_(add|subtract|multiply)$ ]]");
+        let regex_ast = parse(&regex_tokens);
+        let capture_tokens = tokenize("[[ '2:bad' =~ ^([0-9]+):(.*) ]]");
+        let capture_ast = parse(&capture_tokens);
+
+        let extglob = extglob_ast.commands[0]
+            .conditional_command
+            .as_ref()
+            .unwrap();
+        let regex = regex_ast.commands[0].conditional_command.as_ref().unwrap();
+        let capture = capture_ast.commands[0]
+            .conditional_command
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(extglob.expression.kind, ConditionalExpressionKind::Binary);
+        assert_eq!(extglob.expression.operator.as_deref(), Some("=="));
+        assert_eq!(extglob.expression.operands, ["foo", "@(foo|bar)"]);
+        assert_eq!(
+            extglob
+                .expression
+                .pattern_operand
+                .as_ref()
+                .unwrap()
+                .operators,
+            ["@(", "|"]
+        );
+        assert_eq!(
+            extglob
+                .expression
+                .pattern_operand
+                .as_ref()
+                .unwrap()
+                .extglob_patterns
+                .len(),
+            1
+        );
+        assert_eq!(
+            extglob
+                .expression
+                .pattern_operand
+                .as_ref()
+                .unwrap()
+                .extglob_patterns[0]
+                .alternatives,
+            ["foo", "bar"]
+        );
+        assert!(
+            extglob
+                .expression
+                .pattern_operand
+                .as_ref()
+                .unwrap()
+                .has_extglob
+        );
+        assert_eq!(regex.expression.kind, ConditionalExpressionKind::Binary);
+        assert_eq!(regex.expression.operator.as_deref(), Some("=~"));
+        assert_eq!(
+            regex.expression.operands,
+            ["shellmath_add", "shellmath_(add|subtract|multiply)$"]
+        );
+        assert_eq!(
+            regex.expression.pattern_operand.as_ref().unwrap().kind,
+            ConditionalPatternKind::Regex
+        );
+        assert_eq!(
+            regex.expression.pattern_operand.as_ref().unwrap().text,
+            "shellmath_(add|subtract|multiply)$"
+        );
+        assert!(regex
+            .expression
+            .pattern_operand
+            .as_ref()
+            .unwrap()
+            .operators
+            .is_empty());
+        assert!(regex
+            .expression
+            .pattern_operand
+            .as_ref()
+            .unwrap()
+            .extglob_patterns
+            .is_empty());
+        assert!(regex
+            .expression
+            .pattern_operand
+            .as_ref()
+            .unwrap()
+            .brace_expansions
+            .is_empty());
+        assert_eq!(capture.expression.kind, ConditionalExpressionKind::Binary);
+        assert_eq!(capture.expression.operator.as_deref(), Some("=~"));
+        assert_eq!(capture.expression.operands, ["2:bad", "^([0-9]+):(.*)"]);
+        assert_eq!(
+            capture.expression.pattern_operand.as_ref().unwrap().kind,
+            ConditionalPatternKind::Regex
+        );
+    }
+
+    #[test]
+    fn test_conditional_command_records_nested_extglob_pattern_operand() {
+        let input = "[[ name == @(src|+(test|bench)) ]]";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let conditional = ast.commands[0].conditional_command.as_ref().unwrap();
+        let pattern = conditional.expression.pattern_operand.as_ref().unwrap();
+
+        assert_eq!(pattern.kind, ConditionalPatternKind::Glob);
+        assert_eq!(pattern.text, "@(src|+(test|bench))");
+        assert_eq!(pattern.operators, ["@(", "|", "+(", "|"]);
+        assert_eq!(pattern.extglob_patterns.len(), 2);
+        assert_eq!(pattern.extglob_patterns[0].text, "@(src|+(test|bench))");
+        assert_eq!(
+            pattern.extglob_patterns[0].alternatives,
+            ["src", "+(test|bench)"]
+        );
+        assert_eq!(pattern.extglob_patterns[1].text, "+(test|bench)");
+        assert_eq!(pattern.extglob_patterns[1].alternatives, ["test", "bench"]);
+        assert!(pattern.has_extglob);
+    }
+
+    #[test]
+    fn test_conditional_command_ignores_quoted_pattern_operators() {
+        let input = "[[ file == \"*.rs\" || name == '@(src|tests)' ]]";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let conditional = ast.commands[0].conditional_command.as_ref().unwrap();
+
+        let first = conditional.expression.children[0]
+            .pattern_operand
+            .as_ref()
+            .unwrap();
+        assert_eq!(first.text, "*.rs");
+        assert!(first.operators.is_empty());
+        assert!(first.extglob_patterns.is_empty());
+        assert!(!first.has_glob);
+        assert!(!first.has_extglob);
+
+        let second = conditional.expression.children[1]
+            .pattern_operand
+            .as_ref()
+            .unwrap();
+        assert_eq!(second.text, "@(src|tests)");
+        assert!(second.operators.is_empty());
+        assert!(second.extglob_patterns.is_empty());
+        assert!(!second.has_extglob);
+    }
+
+    #[test]
+    fn test_conditional_command_records_readonly_unary_expression() {
+        let input = "[[ -R UID ]]";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let conditional = ast.commands[0].conditional_command.as_ref().unwrap();
+
+        assert_eq!(
+            conditional.expression.kind,
+            ConditionalExpressionKind::Unary
+        );
+        assert_eq!(conditional.expression.operator.as_deref(), Some("-R"));
+        assert_eq!(conditional.expression.operands, ["UID"]);
+    }
+
+    #[test]
+    fn test_conditional_command_records_file_ownership_unary_expressions() {
+        let input = "[[ -G file || -N file ]]";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let conditional = ast.commands[0].conditional_command.as_ref().unwrap();
+
+        assert_eq!(
+            conditional.expression.kind,
+            ConditionalExpressionKind::Logical
+        );
+        assert_eq!(conditional.expression.operator.as_deref(), Some("||"));
+        assert_eq!(
+            conditional.expression.children[0].kind,
+            ConditionalExpressionKind::Unary
+        );
+        assert_eq!(
+            conditional.expression.children[0].operator.as_deref(),
+            Some("-G")
+        );
+        assert_eq!(
+            conditional.expression.children[1].kind,
+            ConditionalExpressionKind::Unary
+        );
+        assert_eq!(
+            conditional.expression.children[1].operator.as_deref(),
+            Some("-N")
+        );
+    }
+
+    #[test]
+    fn test_conditional_command_keeps_process_substitution_operand() {
+        let input = "[[ -e <(:) ]]";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let conditional = ast.commands[0].conditional_command.as_ref().unwrap();
+
+        assert_eq!(conditional.args, ["-e", "<(:)", "]]"]);
+        assert_eq!(ast.commands[0].words, ["[[", "-e", "<(:)", "]]"]);
+        assert_eq!(
+            conditional.expression.kind,
+            ConditionalExpressionKind::Unary
+        );
+        assert_eq!(conditional.expression.operator.as_deref(), Some("-e"));
+        assert_eq!(conditional.expression.operands, ["<(:)"]);
+    }
+
+    #[test]
+    fn test_conditional_command_keeps_output_process_substitution_operand() {
+        let input = "[[ -w >(:) ]]; echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let conditional = ast.commands[0].conditional_command.as_ref().unwrap();
+
+        assert_eq!(conditional.args, ["-w", ">(:)", "]]"]);
+        assert_eq!(ast.commands[0].words, ["[[", "-w", ">(:)", "]]"]);
+        assert!(ast.commands[0].redirect_out.is_none());
+        assert_eq!(ast.commands[1].words, ["echo", "done"]);
+        assert_eq!(
+            conditional.expression.kind,
+            ConditionalExpressionKind::Unary
+        );
+        assert_eq!(conditional.expression.operator.as_deref(), Some("-w"));
+        assert_eq!(conditional.expression.operands, [">(:)"]);
+    }
+
+    #[test]
+    fn test_conditional_command_keeps_quoted_closing_delimiter_word() {
+        let input = "[[ value == \"]]\" ]]";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let conditional = ast.commands[0].conditional_command.as_ref().unwrap();
+
+        assert_eq!(conditional.args, ["value", "==", "]]", "]]"]);
+        assert_eq!(conditional.close_delimiter, "]]");
+        assert_eq!(
+            conditional.expression.kind,
+            ConditionalExpressionKind::Binary
+        );
+        assert_eq!(conditional.expression.operator.as_deref(), Some("=="));
+        assert_eq!(conditional.expression.operands, ["value", "]]"]);
+    }
+
+    #[test]
+    fn test_conditional_command_records_arg_metadata() {
+        let input = "[[ $value == \"*.rs\" && $((count+1)) -gt 2 ]]";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let conditional = ast.commands[0].conditional_command.as_ref().unwrap();
+
+        assert_eq!(
+            conditional.args,
+            [
+                "$value",
+                "==",
+                "*.rs",
+                "&&",
+                "$((count+1))",
+                "-gt",
+                "2",
+                "]]"
+            ]
+        );
+        assert_eq!(conditional.arg_metadata.len(), conditional.args.len());
+        assert_eq!(conditional.arg_metadata[0].word_index, 0);
+        assert_eq!(conditional.arg_metadata[0].value, "$value");
+        // wt44/parse4: parameter-expansion records are no longer populated
+        // at parse time (zero readers; executor re-derives from text).
+
+        assert_eq!(conditional.arg_metadata[2].value, "*.rs");
+        assert_eq!(conditional.arg_metadata[2].raw, "\"*.rs\"");
+        assert!(conditional.arg_metadata[2].pathname_patterns.is_empty());
+        // wt44/parse4: word-quote records re-derive at the =~ consumer.
+        assert_eq!(
+            rubash::parser::word_quotes_in_raw_public(&conditional.arg_metadata[2].raw).len(),
+            1
+        );
+
+        assert_eq!(conditional.arg_metadata[7].value, "]]");
+    }
+
+    #[test]
+    fn test_conditional_command_consumes_trailing_redirects() {
+        let input = "[[ -n $value ]] > out && echo ok";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let list = ast.commands[0].and_or_list.as_ref().unwrap();
+        assert!(list.commands[0].conditional_command.is_some());
+        assert!(list.commands[0].redirect_out.is_some());
+        assert_eq!(list.connectors, [true]);
+        assert_eq!(list.commands[1].words, ["echo", "ok"]);
+    }
+}
+
+mod case_tests {
+    use super::*;
+
+    #[test]
+    fn test_case_patterns_record_structured_metadata() {
+        let _extglob_gate = EXTGLOB_PARSE_GATE.lock().unwrap();
+        // wt33 (#373): extglob operators require the extglob shopt at parse
+        // time (GNU parse.y:5466). Probe wt33-373/run/A01 (off) /
+        // A02_case_extglob_on (on), both byte-identical rubash vs GNU 5.3.0:
+        // off -> `syntax error near unexpected token \`('` rc 2; on -> runs
+        // `hit` then `rest`, rc 0. The shopt prefix mirrors GNU's
+        // parse-execute cadence, so the case command is commands[1].
+        let input =
+            "shopt -s extglob\ncase $word in (x|@(foo|bar)|!(tmp)) echo hit ;& *) echo rest ;; esac\nshopt -u extglob";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let case_command = ast.commands[1].case_command.as_ref().unwrap();
+
+        assert_eq!(case_command.keyword, "case");
+        assert_eq!(case_command.keyword_metadata.value, "case");
+        assert_eq!(case_command.keyword_metadata.raw, "case");
+        assert_eq!(case_command.word, "$word");
+        assert_eq!(case_command.word_metadata.value, "$word");
+        assert_eq!(case_command.word_metadata.word_index, 0);
+        // wt44/parse4: parameter-expansion records are no longer populated
+        // at parse time (zero readers; executor re-derives from text).
+        assert_eq!(case_command.in_keyword, "in");
+        assert_eq!(case_command.in_keyword_metadata.value, "in");
+        assert_eq!(case_command.in_keyword_metadata.raw, "in");
+        assert_eq!(case_command.end_keyword, "esac");
+        assert_eq!(case_command.end_keyword_metadata.value, "esac");
+        assert_eq!(case_command.end_keyword_metadata.raw, "esac");
+        assert_eq!(case_command.clauses.len(), 2);
+        assert_eq!(
+            case_command.clauses[0].terminator,
+            CaseTerminator::FallThrough
+        );
+        assert_eq!(
+            case_command.clauses[0].terminator_text.as_deref(),
+            Some(";&")
+        );
+        assert_eq!(
+            case_command.clauses[0]
+                .terminator_metadata
+                .as_ref()
+                .unwrap()
+                .value,
+            ";&"
+        );
+        assert_eq!(
+            case_command.clauses[0].pattern_open_delimiter.as_deref(),
+            Some("(")
+        );
+        assert_eq!(
+            case_command.clauses[0]
+                .pattern_open_delimiter_metadata
+                .as_ref()
+                .unwrap()
+                .value,
+            "("
+        );
+        assert_eq!(
+            case_command.clauses[0].patterns,
+            ["x", "@(foo|bar)", "!(tmp)"]
+        );
+        assert_eq!(case_command.clauses[0].pattern_separators, ["|", "|"]);
+        assert_eq!(case_command.clauses[0].pattern_separator_metadata.len(), 2);
+        assert_eq!(
+            case_command.clauses[0].pattern_separator_metadata[0].value,
+            "|"
+        );
+        assert_eq!(
+            case_command.clauses[0].pattern_separator_metadata[1].word_index,
+            1
+        );
+        assert_eq!(case_command.clauses[0].pattern_close_delimiter, ")");
+        assert_eq!(
+            case_command.clauses[0]
+                .pattern_close_delimiter_metadata
+                .value,
+            ")"
+        );
+
+        let patterns = &case_command.clauses[0].pattern_nodes;
+        assert_eq!(patterns.len(), 3);
+        assert_eq!(patterns[0].text, "x");
+        assert_eq!(patterns[0].clause_index, 0);
+        assert_eq!(patterns[0].pattern_index, 0);
+        assert!(patterns[0].operators.is_empty());
+        assert!(!patterns[0].has_glob);
+        assert!(!patterns[0].has_extglob);
+        assert_eq!(patterns[1].text, "@(foo|bar)");
+        assert_eq!(patterns[1].operators, ["@(", "|"]);
+        assert_eq!(patterns[1].operator_metadata[0].value, "@(");
+        assert_eq!(patterns[1].operator_metadata[0].raw, "@(");
+        assert_eq!(patterns[1].operator_metadata[1].value, "|");
+        assert_eq!(patterns[1].operator_metadata[1].raw, "|");
+        assert_eq!(patterns[1].extglob_patterns.len(), 1);
+        assert_eq!(patterns[1].extglob_patterns[0].text, "@(foo|bar)");
+        assert_eq!(patterns[1].extglob_patterns[0].alternatives, ["foo", "bar"]);
+        assert!(patterns[1].has_extglob);
+        assert!(!patterns[1].negated_extglob);
+        assert_eq!(patterns[2].text, "!(tmp)");
+        assert_eq!(patterns[2].operators, ["!("]);
+        assert_eq!(patterns[2].extglob_patterns.len(), 1);
+        assert_eq!(patterns[2].extglob_patterns[0].operator, '!');
+        assert_eq!(patterns[2].extglob_patterns[0].pattern, "tmp");
+        assert!(patterns[2].has_extglob);
+        assert!(patterns[2].negated_extglob);
+
+        let fallback = &case_command.clauses[1].pattern_nodes[0];
+        assert_eq!(fallback.text, "*");
+        assert_eq!(fallback.clause_index, 1);
+        assert_eq!(fallback.pattern_index, 0);
+        assert_eq!(fallback.operators, ["*"]);
+        assert_eq!(fallback.operator_metadata[0].value, "*");
+        assert_eq!(fallback.operator_metadata[0].raw, "*");
+        assert!(fallback.has_glob);
+        assert_eq!(case_command.clauses[1].pattern_open_delimiter, None);
+        assert!(case_command.clauses[1]
+            .pattern_open_delimiter_metadata
+            .is_none());
+        assert!(case_command.clauses[1].pattern_separators.is_empty());
+        assert_eq!(case_command.clauses[1].pattern_close_delimiter, ")");
+        assert_eq!(
+            case_command.clauses[1].pattern_close_delimiter_metadata.raw,
+            ")"
+        );
+        assert_eq!(
+            case_command.clauses[1].terminator_text.as_deref(),
+            Some(";;")
+        );
+        assert_eq!(
+            case_command.clauses[1]
+                .terminator_metadata
+                .as_ref()
+                .unwrap()
+                .raw,
+            ";;"
+        );
+    }
+
+    #[test]
+    fn test_case_clause_records_absent_terminator() {
+        let input = "case $word in x) echo hit; esac";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let clause = &ast.commands[0].case_command.as_ref().unwrap().clauses[0];
+
+        assert_eq!(clause.terminator, CaseTerminator::Break);
+        assert_eq!(clause.terminator_text, None);
+        assert!(clause.terminator_metadata.is_none());
+    }
+
+    #[test]
+    fn test_empty_case_command_consumes_trailing_redirect() {
+        let input = "case $word in esac > out.txt";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let command = &ast.commands[0];
+        let case_command = command.case_command.as_ref().unwrap();
+
+        assert_eq!(case_command.word, "$word");
+        assert_eq!(case_command.in_keyword, "in");
+        assert!(case_command.clauses.is_empty());
+        assert_eq!(case_command.end_keyword, "esac");
+        assert_eq!(command.redirect_out.as_ref().unwrap().target, "out.txt");
+    }
+
+    #[test]
+    fn test_case_word_keeps_process_substitution() {
+        let input = "case <(:) in /dev/*) echo hit ;; esac";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let case_command = ast.commands[0].case_command.as_ref().unwrap();
+
+        assert_eq!(case_command.word, "<(:)");
+        assert_eq!(case_command.in_keyword, "in");
+        assert_eq!(case_command.clauses.len(), 1);
+    }
+
+    #[test]
+    fn test_case_word_records_quote_metadata() {
+        let input = "case \"*.rs\" in *.rs) echo hit ;; esac";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let case_command = ast.commands[0].case_command.as_ref().unwrap();
+
+        assert_eq!(case_command.word, "*.rs");
+        assert_eq!(case_command.word_metadata.value, "*.rs");
+        assert_eq!(case_command.word_metadata.raw, "\"*.rs\"");
+        assert!(case_command.word_metadata.pathname_patterns.is_empty());
+        // wt44/parse4: word-quote records re-derive at the consumer; the
+        // public scan is the same oracle.
+        let quotes = rubash::parser::word_quotes_in_raw_public(&case_command.word_metadata.raw);
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].text, "\"*.rs\"");
+        assert_eq!(quotes[0].body, "*.rs");
+        assert_eq!(quotes[0].kind, QuoteKind::Double);
+    }
+
+    #[test]
+    fn test_case_pattern_records_glob_operators() {
+        let input = "case $word in src/[ab]??.rs) echo hit ;; **/*.sh) echo shell ;; esac";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let case_command = ast.commands[0].case_command.as_ref().unwrap();
+
+        let first = &case_command.clauses[0].pattern_nodes[0];
+        assert_eq!(first.text, "src/[ab]??.rs");
+        assert_eq!(first.operators, ["[ab]", "?", "?"]);
+        assert_eq!(first.operator_metadata[0].value, "[ab]");
+        assert_eq!(first.operator_metadata[0].raw, "[ab]");
+        assert_eq!(first.operator_metadata[1].value, "?");
+        assert_eq!(first.operator_metadata[2].value, "?");
+        assert!(first.has_glob);
+        assert!(!first.has_extglob);
+
+        let second = &case_command.clauses[1].pattern_nodes[0];
+        assert_eq!(second.text, "**/*.sh");
+        assert_eq!(second.operators, ["**", "*"]);
+        assert_eq!(second.operator_metadata[0].value, "**");
+        assert_eq!(second.operator_metadata[0].raw, "**");
+        assert_eq!(second.operator_metadata[1].value, "*");
+        assert!(second.has_glob);
+    }
+
+    #[test]
+    fn test_case_pattern_ignores_quoted_glob_operators() {
+        let input = "case $word in \"*\"|'?'|$'[ab]'|plain\"*\"?.rs) echo hit ;; esac";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let case_command = ast.commands[0].case_command.as_ref().unwrap();
+        let patterns = &case_command.clauses[0].pattern_nodes;
+
+        assert_eq!(patterns[0].text, "*");
+        assert_eq!(patterns[0].raw_text, "\"*\"");
+        assert!(patterns[0].operators.is_empty());
+        assert!(!patterns[0].has_glob);
+        assert_eq!(patterns[1].text, "?");
+        assert!(patterns[1].operators.is_empty());
+        assert!(!patterns[1].has_glob);
+        assert_eq!(patterns[2].text, "[ab]");
+        assert!(patterns[2].operators.is_empty());
+        assert!(!patterns[2].has_glob);
+        assert_eq!(patterns[3].text, "plain*?.rs");
+        assert_eq!(patterns[3].operators, ["?"]);
+        assert!(patterns[3].has_glob);
+    }
+
+    #[test]
+    fn test_case_pattern_records_nested_extglob_nodes() {
+        let _extglob_gate = EXTGLOB_PARSE_GATE.lock().unwrap();
+        // wt33 (#373): extglob operators are gated on the extglob shopt at
+        // PARSE time (GNU parse.y:5466 `extended_glob && PATTERN_CHAR`,
+        // synced from the shopt flag by reset_parser parse.y:3502). With
+        // extglob off (the GNU default) this input is `syntax error near
+        // unexpected token \`('` on both shells (probe
+        // wt33-373/run/A01_case_extglob_off, byte-identical); the leading
+        // `shopt -s extglob` line opens the gate for the following lines,
+        // mirroring GNU's parse-execute cadence, so the case command is
+        // commands[1].
+        let input =
+            "shopt -s extglob\ncase $word in @(a|+(b|c))) echo hit ;; esac\nshopt -u extglob";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let case_command = ast.commands[1].case_command.as_ref().unwrap();
+
+        let pattern = &case_command.clauses[0].pattern_nodes[0];
+        assert_eq!(pattern.text, "@(a|+(b|c))");
+        assert_eq!(pattern.operators, ["@(", "|", "+(", "|"]);
+        assert_eq!(pattern.operator_metadata[0].value, "@(");
+        assert_eq!(pattern.operator_metadata[1].value, "|");
+        assert_eq!(pattern.operator_metadata[2].value, "+(");
+        assert_eq!(pattern.operator_metadata[3].value, "|");
+        assert_eq!(pattern.extglob_patterns.len(), 2);
+        assert_eq!(pattern.extglob_patterns[0].text, "@(a|+(b|c))");
+        assert_eq!(pattern.extglob_patterns[0].alternatives, ["a", "+(b|c)"]);
+        assert_eq!(pattern.extglob_patterns[1].text, "+(b|c)");
+        assert_eq!(pattern.extglob_patterns[1].alternatives, ["b", "c"]);
+        assert!(pattern.has_extglob);
+    }
+
+    #[test]
+    fn test_case_pattern_keeps_command_substitution_and_brace_expansion() {
+        let input = "case $word in $(printf x)|{a,b}) echo hit ;; esac";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let case_command = ast.commands[0].case_command.as_ref().unwrap();
+
+        let clause = &case_command.clauses[0];
+        assert_eq!(clause.patterns, ["$(printf x)", "{a,b}"]);
+        assert_eq!(clause.pattern_separators, ["|"]);
+        assert_eq!(clause.pattern_nodes[0].text, "$(printf x)");
+        assert_eq!(clause.pattern_nodes[1].text, "{a,b}");
+        // wt44/parse4: brace-expansion records are no longer populated at
+        // parse time (zero readers; executor re-derives from text).
+    }
+
+    #[test]
+    fn test_case_pattern_keeps_reserved_word_text() {
+        let input = "case done in done|fi|esac) echo hit ;; esac";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let case_command = ast.commands[0].case_command.as_ref().unwrap();
+        let clause = &case_command.clauses[0];
+
+        assert_eq!(case_command.word, "done");
+        assert_eq!(clause.patterns, ["done", "fi", "esac"]);
+        assert_eq!(clause.pattern_separators, ["|", "|"]);
+    }
+
+    // wt33 (#373): a bare `esac` right after `in` terminates an EMPTY case
+    // (GNU parse.y:3433-3441 special_case_tokens; rubash#381) — it can never
+    // be a pattern of its own. rubash#390: the case CLOSES at the `esac`
+    // and the outer grammar owns the rejection, so `esac)` / `esac|fi)` are
+    // syntax errors named by the token the yacc parser chokes on:
+    //   probe wt33-373/run/E01: `case esac in esac) echo single ;; esac`
+    //     -> `syntax error near unexpected token `)'` rc 2 (byte-identical)
+    //   probe E02: `case esac in esac|fi) ...` -> names `fi' (now matched)
+    // A pattern that merely STARTS with the text `esac` is fine:
+    //   probe E03: `case esac in esac-text) echo prefixed ;; esac` -> rc 0
+    //   on both shells (clause does not match, nothing echoed).
+    #[test]
+    fn test_case_pattern_can_start_with_esac_text() {
+        let tokens = tokenize("case esac in esac-text) echo prefixed ;; esac");
+        let ast = parse(&tokens);
+        let case_command = ast.commands[0].case_command.as_ref().unwrap();
+
+        assert_eq!(case_command.word, "esac");
+        assert_eq!(case_command.clauses.len(), 1);
+        assert_eq!(case_command.clauses[0].patterns, ["esac-text"]);
+        assert_eq!(case_command.clauses[0].body[0].words, ["echo", "prefixed"]);
+
+        // The stray `)` after the empty-case esac reaches the OUTER grammar
+        // (wt39 cases13/a1: `syntax error near unexpected token `)'' at the
+        // `)'s line, byte-identical to WSL GNU 5.3.0).
+        let error_ast = parse(&tokenize("case esac in esac) echo single ;; esac"));
+        assert!(
+            error_ast.commands[0]
+                .get_assignment("__RUBASH_PARSE_ERROR__")
+                .is_some(),
+            "bare esac pattern must be a syntax error"
+        );
+    }
+
+    #[test]
+    fn test_case_body_keeps_reserved_word_arguments() {
+        let input = "case x in x) echo if for done ;; esac";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let case_command = ast.commands[0].case_command.as_ref().unwrap();
+        let clause = &case_command.clauses[0];
+
+        assert_eq!(clause.body.len(), 1);
+        assert_eq!(clause.body[0].words, ["echo", "if", "for", "done"]);
+        assert_eq!(clause.terminator_text.as_deref(), Some(";;"));
+    }
+
+    #[test]
+    fn test_case_body_keeps_quoted_terminator_words() {
+        let input = "case $x in x) echo \";;\"; echo after ;; esac";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let case_command = ast.commands[0].case_command.as_ref().unwrap();
+        let clause = &case_command.clauses[0];
+
+        assert_eq!(case_command.clauses.len(), 1);
+        assert_eq!(clause.terminator, CaseTerminator::Break);
+        assert_eq!(clause.body.len(), 2);
+        assert_eq!(clause.body[0].words, ["echo", ";;"]);
+        assert_eq!(clause.body[1].words, ["echo", "after"]);
+    }
+
+    #[test]
+    fn test_case_body_keeps_esac_after_quoted_terminator_word() {
+        let input = "case $x in x) echo \";;\" esac; echo after ;; esac";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let case_command = ast.commands[0].case_command.as_ref().unwrap();
+        let clause = &case_command.clauses[0];
+
+        assert_eq!(case_command.clauses.len(), 1);
+        assert_eq!(clause.body.len(), 2);
+        assert_eq!(clause.body[0].words, ["echo", ";;", "esac"]);
+        assert_eq!(clause.body[1].words, ["echo", "after"]);
+        assert_eq!(clause.terminator_text.as_deref(), Some(";;"));
+    }
+
+    #[test]
+    fn test_case_body_keeps_nested_select_command() {
+        let input =
+            "case $word in x) select choice in a; do echo $choice; break; done <<< 1 ;; esac";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let case_command = ast.commands[0].case_command.as_ref().unwrap();
+
+        assert_eq!(case_command.clauses.len(), 1);
+        assert!(case_command.clauses[0]
+            .body
+            .iter()
+            .any(|command| command.select_command.is_some()));
+        assert_eq!(
+            case_command.clauses[0].terminator_text.as_deref(),
+            Some(";;")
+        );
+    }
+}
+
+mod arithmetic_command_tests {
+    use super::*;
+
+    #[test]
+    fn test_arithmetic_command_parses_expression() {
+        let input = "(( n += 2 ))";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let arithmetic = ast.commands[0].arithmetic_command.as_ref().unwrap();
+        assert_eq!(arithmetic.open_delimiter, "((");
+        assert_eq!(arithmetic.open_delimiter_metadata.value, "((");
+        assert_eq!(arithmetic.open_delimiter_metadata.raw, "((");
+        assert_eq!(arithmetic.close_delimiter, "))");
+        assert_eq!(arithmetic.close_delimiter_metadata.value, "))");
+        assert_eq!(arithmetic.close_delimiter_metadata.raw, "))");
+        assert_eq!(arithmetic.expression, "n += 2");
+        assert_eq!(arithmetic.variables, ["n"]);
+        assert!(arithmetic.has_assignment);
+        assert!(!arithmetic.has_comparison);
+        assert!(!arithmetic.has_logical);
+        assert!(!arithmetic.has_update);
+        assert_eq!(arithmetic.operators.len(), 1);
+        assert_eq!(arithmetic.operators[0].text, "+=");
+        assert_eq!(ast.commands[0].words, ["((", "n += 2", "))"]);
+    }
+
+    #[test]
+    fn test_arithmetic_command_preserves_and_or_connector() {
+        let input = "(( n++ )) && echo ok";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let list = ast.commands[0].and_or_list.as_ref().unwrap();
+        assert_eq!(
+            list.commands[0]
+                .arithmetic_command
+                .as_ref()
+                .unwrap()
+                .expression,
+            "n++"
+        );
+        assert_eq!(list.connectors, [true]);
+        assert_eq!(list.commands[1].words, ["echo", "ok"]);
+        let arithmetic = list.commands[0].arithmetic_command.as_ref().unwrap();
+        assert_eq!(arithmetic.variables, ["n"]);
+        assert!(arithmetic.has_update);
+        assert_eq!(arithmetic.operators[0].text, "++");
+    }
+
+    #[test]
+    fn test_arithmetic_command_consumes_trailing_redirect() {
+        let input = "(( n++ )) > out && echo ok";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let list = ast.commands[0].and_or_list.as_ref().unwrap();
+        let arithmetic_command = &list.commands[0];
+
+        assert_eq!(
+            arithmetic_command
+                .arithmetic_command
+                .as_ref()
+                .unwrap()
+                .expression,
+            "n++"
+        );
+        assert_eq!(
+            arithmetic_command.redirect_out.as_ref().unwrap().target,
+            "out"
+        );
+        assert_eq!(list.connectors, [true]);
+        assert_eq!(list.commands[1].words, ["echo", "ok"]);
+    }
+
+    #[test]
+    fn test_arithmetic_command_consumes_pipe_stderr_operator() {
+        let input = "(( n++ )) |& wc -l";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let pipeline = ast.commands[0].pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.operators, ["|&"]);
+        assert_eq!(pipeline.stages[0].pipe, Some(2));
+        assert_eq!(
+            pipeline.stages[0]
+                .arithmetic_command
+                .as_ref()
+                .unwrap()
+                .expression,
+            "n++"
+        );
+        assert_eq!(pipeline.stages[1].words, ["wc", "-l"]);
+    }
+
+    #[test]
+    fn test_arithmetic_command_records_operator_metadata() {
+        let input = "(( (a += 1) > b && ! done ))";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let arithmetic = ast.commands[0].arithmetic_command.as_ref().unwrap();
+
+        assert_eq!(arithmetic.open_delimiter, "((");
+        assert_eq!(arithmetic.open_delimiter_metadata.value, "((");
+        assert_eq!(arithmetic.close_delimiter, "))");
+        assert_eq!(arithmetic.close_delimiter_metadata.value, "))");
+        assert_eq!(arithmetic.variables, ["a", "b", "done"]);
+        assert!(arithmetic.has_assignment);
+        assert!(arithmetic.has_comparison);
+        assert!(arithmetic.has_logical);
+        assert!(!arithmetic.has_update);
+        let operators = arithmetic
+            .operators
+            .iter()
+            .map(|operator| operator.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(operators.contains(&"+="));
+        assert!(operators.contains(&">"));
+        assert!(operators.contains(&"&&"));
+        assert!(operators.contains(&"!"));
+    }
+
+    #[test]
+    fn test_arithmetic_command_records_comma_operator() {
+        let input = "(( i = 0, j = i + 1 ))";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let arithmetic = ast.commands[0].arithmetic_command.as_ref().unwrap();
+
+        assert_eq!(arithmetic.expression, "i = 0, j = i + 1");
+        assert_eq!(arithmetic.variables, ["i", "j"]);
+        assert!(arithmetic.has_assignment);
+        let operators = arithmetic
+            .operators
+            .iter()
+            .map(|operator| operator.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(operators, ["=", ",", "=", "+"]);
+    }
+
+    #[test]
+    fn test_arithmetic_command_records_exponent_assignment_operator() {
+        let input = "(( n **= 3 ))";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let arithmetic = ast.commands[0].arithmetic_command.as_ref().unwrap();
+
+        assert_eq!(arithmetic.expression, "n **= 3");
+        assert_eq!(arithmetic.variables, ["n"]);
+        assert!(arithmetic.has_assignment);
+        assert_eq!(arithmetic.operators.len(), 1);
+        assert_eq!(arithmetic.operators[0].text, "**=");
+    }
+
+    #[test]
+    fn test_arithmetic_and_or_list_skips_connector_newline() {
+        let input =
+            "if (( integerPart2 == 0 )) &&\n  (( fractionalPart2 == 0 ))\nthen echo bad; fi";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let if_command = ast.commands[0].if_command.as_ref().unwrap();
+        assert_eq!(if_command.condition.len(), 1);
+        let list = if_command.condition[0].and_or_list.as_ref().unwrap();
+        assert_eq!(list.connectors, [true]);
+        assert_eq!(list.commands.len(), 2);
+        assert_eq!(
+            list.commands[0]
+                .arithmetic_command
+                .as_ref()
+                .unwrap()
+                .expression,
+            "integerPart2 == 0"
+        );
+        assert_eq!(
+            list.commands[1]
+                .arithmetic_command
+                .as_ref()
+                .unwrap()
+                .expression,
+            "fractionalPart2 == 0"
+        );
+    }
+}
+
+mod assignment_tests {
+    use super::*;
+
+    #[test]
+    fn test_variable_assignment() {
+        let input = "VAR=value";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert!(ast.commands[0].has_assignment("VAR"));
+        assert_eq!(
+            ast.commands[0].get_assignment("VAR"),
+            Some(&"value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_command_with_assignment() {
+        let input = "X=5 echo hello";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert!(ast.commands[0].has_assignment("X"));
+    }
+
+    // wt33 (#373): the lexer now emits `name=(...)` as ONE atomic Assignment
+    // token, so the AST records compound assignments via the assignment map
+    // under the `__RUBASH_CA1__` marker (executor/markers.rs
+    // COMPOUND_ASSIGNMENT_MARKER) instead of the compound_assignments vec.
+    // Behavior is GNU-verified: WSL GNU Bash 5.3.0 script-file probe
+    // target/issue-suites/results/wt33-373/run/A09_compound_array:
+    //   arr=(one "two words")  -> a0=[one] a1=[two words] len=2
+    //   arr+=(three four)      -> a2=[three] len=3
+    // (byte-identical rubash vs GNU, including stderr).
+    #[test]
+    fn test_compound_assignment_records_structured_ast() {
+        let input = "arr=(one \"two words\")";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__(one \"two words\")"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_append_assignment_records_structured_ast() {
+        let input = "arr+=(three four)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0].get_assignment("arr+").unwrap(),
+            "__RUBASH_CA1__(three four)"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_records_indexed_elements() {
+        let input = "arr=([2]=two [name]+=more plain)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        // Atomic compound token (see test_compound_assignment_records_structured_ast):
+        // GNU probe wt33-373/run/C04 line 1: `arr=([2]=two [name]+=more plain)`
+        // -> `<more><plain><two>` on both shells (a[2]=two lands at index 2).
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__([2]=two [name]+=more plain)"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_records_empty_indexed_elements() {
+        let input = "arr=([empty]= [more]+=)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__([empty]= [more]+=)"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_ignores_quoted_subscript_operators() {
+        let input = "arr=([\"a]=b\"]=value [\"c]+=d\"]+=more)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        // The raw RHS keeps the quoted subscripts verbatim; the executor's
+        // element parser honors the quoting (issue #369 regression suite).
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__([\"a]=b\"]=value [\"c]+=d\"]+=more)"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_records_spaced_subscript_elements() {
+        let input = "arr=([ \"a]=b\" ] = value [ \"c]+=d\" ] += more [ empty ] =)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        // wt33 (#373): GNU 5.3.0 does NOT treat `[ "sub" ] = value` (spaces
+        // around the subscript text) as an indexed element — the spaced words
+        // are separate literal/glob elements (probe wt33-373/run/C04 line 5:
+        // `arr=([ "a]=b" ] = value [ empty ] =)` -> literal elements on both
+        // shells; GNU additionally glob-expands `[ empty ]`, tracked
+        // separately as a compound-element glob gap). The AST therefore only
+        // records the raw RHS behind the marker.
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__([ \"a]=b\" ] = value [ \"c]+=d\" ] += more [ empty ] =)"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_keeps_reserved_word_elements() {
+        let input = "arr=(if done [case]=esac [then]+=fi)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__(if done [case]=esac [then]+=fi)"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_keeps_brace_expansion_element() {
+        let input = "arr=(pre{a,b})";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__(pre{a,b})"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    // wt33 (#373): with extglob OFF (the GNU default), an unquoted extglob
+    // operator inside a compound-assignment element is a parse error in GNU
+    // 5.3.0 — probe wt33-373/run/C01_compound_extglob_off and
+    // C02_compound_mixed_quotes, byte-identical on rubash:
+    //   `arr=(@(foo|bar) [name]=+(test|bench))`
+    //     -> `syntax error near unexpected token `('`, rc 1 (line 1), then
+    //        `declare: arr: not found` on the following line
+    //   `arr=("{a,b}" '@(x|y)' {c,d} @(one|two))` -> same error at the first
+    //     unquoted `@(one|two)`.
+    // The old expectations asserted a pre-extglob-gate parser that accepted
+    // `@(` words with extglob off. (With extglob ON, GNU parses these; that
+    // admission is a known rubash gap tracked separately — see the C03
+    // probe.)
+    #[test]
+    fn test_compound_assignment_records_extglob_elements() {
+        let _extglob_gate = EXTGLOB_PARSE_GATE.lock().unwrap();
+        let input = "arr=(@(foo|bar) [name]=+(test|bench))";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        // The atomic-compound path records the rejection under the
+        // compound-syntax marker while keeping the raw RHS for diagnostics.
+        assert_eq!(
+            ast.commands[0]
+                .get_assignment("__RUBASH_COMPOUND_SYNTAX_ERROR__")
+                .map(String::as_str),
+            Some("unexpected token `('")
+        );
+    }
+
+    #[test]
+    fn test_compound_assignment_ignores_quoted_brace_and_extglob_elements() {
+        let _extglob_gate = EXTGLOB_PARSE_GATE.lock().unwrap();
+        let input = "arr=(\"{a,b}\" '@(x|y)' {c,d} @(one|two))";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        // The atomic-compound path records the rejection under the
+        // compound-syntax marker while keeping the raw RHS for diagnostics.
+        assert_eq!(
+            ast.commands[0]
+                .get_assignment("__RUBASH_COMPOUND_SYNTAX_ERROR__")
+                .map(String::as_str),
+            Some("unexpected token `('")
+        );
+    }
+
+    #[test]
+    fn test_compound_assignment_records_pathname_pattern_elements() {
+        let input = "arr=(*.rs [src]=src/[ab]? **/*.txt)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__(*.rs [src]=src/[ab]? **/*.txt)"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_records_tilde_and_quote_elements() {
+        let input = "arr=(~/src [home]=~+/bin \"two words\" 'line two')";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        // Raw RHS is preserved verbatim (single quotes stay single-quoted);
+        // execution behavior probed GNU-identical in wt33-373/run/C04 line 2
+        // (`arr=(~/x "two words" 'line two')` -> `<$HOME/x><two words><line
+        // two>`; the $HOME prefix itself differs by platform, which is
+        // environment noise, not parser behavior).
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__(~/src [home]=~+/bin \"two words\" 'line two')"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_records_subscript_expansions() {
+        let input = "arr=([${key:-fallback}]=value [$((i+1))]+=next [pre{a,b}]=brace plain)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        // GNU probe wt33-373/run/C04 line 3 (k=key):
+        //   arr=([${k:-fallback}]=value [$((1+1))]+=next plain)
+        //   -> <value><next><plain> on both shells.
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__([${key:-fallback}]=value [$((i+1))]+=next [pre{a,b}]=brace plain)"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_ignores_quoted_subscript_brace_expansions() {
+        let input =
+            "arr=([\"{a,b}\"]=quoted [{c,d}]=plain [ \"{e,f}\" ] = spaced [ {g,h} ] = open)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__([\"{a,b}\"]=quoted [{c,d}]=plain [ \"{e,f}\" ] = spaced [ {g,h} ] = open)"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_keeps_process_substitution_elements() {
+        let input = "arr=(<(:) >(:) [two]=<(:))";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        // #339 established that GNU accepts `<(`/`>(` procsub words inside
+        // compound assignments; the raw RHS keeps them verbatim.
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__(<(:) >(:) [two]=<(:))"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_preserves_single_quoted_elements_and_subscripts() {
+        let input = "arr=('one two' [key]='value here' plain)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        // GNU probe wt33-373/run/C04 line 4:
+        //   arr=('one two' [key]='value here' plain) -> <one two><value here><plain>
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__('one two' [key]='value here' plain)"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_preserves_nested_expansion_elements() {
+        let input = "arr=($(printf \"a b\") ${value:-five six} $[count + 1])";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0].get_assignment("arr").unwrap(),
+            "__RUBASH_CA1__($(printf \"a b\") ${value:-five six} $[count + 1])"
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_array_element_assignment_records_structured_ast() {
+        let input = "arr[0]=zero arr[i+1]+=more";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(ast.commands[0].words, ["arr[0]=zero", "arr[i+1]+=more"]);
+
+        let elements = ast.commands[0].array_element_assignments.as_slice();
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements[0].name, "arr");
+        assert_eq!(elements[0].name_metadata.value, "arr");
+        assert_eq!(elements[0].open_delimiter, "[");
+        assert_eq!(elements[0].open_delimiter_metadata.raw, "[");
+        assert_eq!(elements[0].subscript, "0");
+        assert_eq!(elements[0].subscript_metadata.value, "0");
+        assert_eq!(elements[0].close_delimiter, "]");
+        assert_eq!(elements[0].close_delimiter_metadata.value, "]");
+        assert_eq!(elements[0].value, "zero");
+        assert_eq!(elements[0].operator, "=");
+        assert_eq!(elements[0].operator_metadata.value, "=");
+        assert!(!elements[0].append);
+        assert_eq!(elements[0].word_index, Some(0));
+        assert_eq!(elements[1].name, "arr");
+        assert_eq!(elements[1].name_metadata.raw, "arr");
+        assert_eq!(elements[1].subscript, "i+1");
+        assert_eq!(elements[1].subscript_metadata.value, "i+1");
+        assert_eq!(elements[1].value, "more");
+        assert_eq!(elements[1].operator, "+=");
+        assert_eq!(elements[1].operator_metadata.raw, "+=");
+        assert!(elements[1].append);
+        assert_eq!(elements[1].word_index, Some(1));
+    }
+
+    // wt33 (#373): in word position (after `echo`), `name[sub]=value` is a
+    // plain WORD, not an assignment — GNU 5.3.0 probe
+    // wt33-373/run/D01_array_element_word_position (byte-identical):
+    //   echo arr[${key:-fallback}]=$value arr[$((i+1))]+=pre{a,b} nums[0]=$((n+1))
+    //   -> `arr[fallback]= arr[1]+=prea arr[1]+=preb nums[0]=1`
+    // The old expectations asserted an array_element_assignments recording
+    // layer that only applies in assignment position (see
+    // test_array_element_assignment_records_structured_ast, still green).
+    #[test]
+    fn test_array_element_assignment_records_expansions() {
+        let input = "echo arr[${key:-fallback}]=$value arr[$((i+1))]+=pre{a,b} nums[0]=$((n+1))";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert!(ast.commands[0].array_element_assignments.is_empty());
+        assert_eq!(
+            ast.commands[0].words,
+            [
+                "echo",
+                "arr[${key:-fallback}]=$value",
+                "arr[$((i+1))]+=pre{a,b}",
+                "nums[0]=$((n+1))"
+            ]
+        );
+    }
+
+    // wt33 (#373): the unquoted extglob element `ext[2]=@(src|tests)` is a
+    // parse error with extglob off — GNU probe D01 line 2 (byte-identical):
+    // `syntax error near unexpected token `('`, rc 2.
+    #[test]
+    fn test_array_element_assignment_records_pattern_and_quote_metadata() {
+        let _extglob_gate = EXTGLOB_PARSE_GATE.lock().unwrap();
+        let input = "echo home[0]=~+/bin glob[1]=src/[ab]? ext[2]=@(src|tests) quoted[3]=\"*.rs\"";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0]
+                .get_assignment("__RUBASH_PARSE_ERROR__")
+                .map(String::as_str),
+            Some("unexpected token `('")
+        );
+    }
+
+    // wt33 (#373): GNU probe D02_array_element_extglob_word (byte-identical):
+    // word-position `arr[3]=@(one|two)` with extglob off is a parse error.
+    #[test]
+    fn test_array_element_assignment_ignores_quoted_brace_and_extglob_metadata() {
+        let _extglob_gate = EXTGLOB_PARSE_GATE.lock().unwrap();
+        let input = "echo arr[0]=\"{a,b}\" arr[1]='@(x|y)' arr[2]={c,d} arr[3]=@(one|two)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0]
+                .get_assignment("__RUBASH_PARSE_ERROR__")
+                .map(String::as_str),
+            Some("unexpected token `('")
+        );
+    }
+
+    // wt33 (#373): GNU probe D03_declare_array_element line 1
+    // (byte-identical): `echo arr["{a,b}"]=quoted arr[{c,d}]=plain` expands
+    // braces and prints the words — no subscript metadata involved.
+    #[test]
+    fn test_array_element_assignment_ignores_quoted_subscript_brace_expansions() {
+        let input = "echo arr[\"{a,b}\"]=quoted arr[{c,d}]=plain";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert!(ast.commands[0].array_element_assignments.is_empty());
+        // token.value de-quotes the (escaped) subscript text.
+        assert_eq!(
+            ast.commands[0].words,
+            ["echo", "arr[{a,b}]=quoted", "arr[{c,d}]=plain"]
+        );
+    }
+
+    // wt33 (#373): the AST no longer pre-records builtin-argument element
+    // assignments; the declare builtin itself performs the assignment —
+    // GNU probe D03 line 2-3 (byte-identical): `declare BASH_ARGV1[1]=foo;
+    // declare -p BASH_ARGV1` -> `declare -a BASH_ARGV1=([1]="foo")`.
+    #[test]
+    fn test_builtin_array_element_assignment_argument_records_word_index() {
+        let input = "declare BASH_ARGV[1]=foo";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(ast.commands[0].words, ["declare", "BASH_ARGV[1]=foo"]);
+        assert!(ast.commands[0].array_element_assignments.is_empty());
+    }
+
+    // wt33 (#373): token.value now carries the \x11 CTLESC carrier for the
+    // escaped `=` (quote state rides in-band; stripped at execution — probe
+    // wt33-373/run/A10_escaped_equals_word: `printf '<%s>\n' foo\=bar` ->
+    // `<foo=bar>` byte-identical to GNU 5.3.0).
+    #[test]
+    fn test_escaped_equals_is_command_word_not_assignment() {
+        let input = "foo\\=bar > out.txt";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert!(ast.commands[0].assignments.is_empty());
+        assert_eq!(ast.commands[0].words, ["foo\u{11}=bar"]);
+        assert_eq!(ast.commands[0].redirects.len(), 1);
+    }
+}
+
+mod command_substitution_tests {
+    use super::*;
+
+    /// wt44/parse4: the parse-time command-substitution store is gone (the
+    /// executor parses comsub bodies at execution; pretty-print and
+    /// print_comsub re-derive via the same scan). Derive the records the
+    /// tests assert against using the public scan, so the span-extraction
+    /// coverage (the #380-family case/heredoc/nested shapes) keeps testing
+    /// the live code path.
+    fn comsubs_for_words(
+        cmd: &rubash::parser::CommandNode,
+    ) -> Vec<rubash::parser::CommandSubstitutionNode> {
+        cmd.words
+            .iter()
+            .flat_map(|word| rubash::parser::command_substitutions_in_word_public(word))
+            .collect()
+    }
+
+    fn comsubs_for_assignment_values(
+        cmd: &rubash::parser::CommandNode,
+    ) -> Vec<rubash::parser::CommandSubstitutionNode> {
+        cmd.assignments
+            .iter()
+            .flat_map(|(name, value)| {
+                rubash::parser::command_substitutions_in_word_public(value)
+                    .into_iter()
+                    .map(|mut substitution| {
+                        substitution.assignment_name = Some(name.clone());
+                        substitution
+                    })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_command_substitution_records_structured_ast_for_words() {
+        let input = "echo $(printf hi) pre$(date)post `whoami`";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0].words,
+            ["echo", "$(printf hi)", "pre$(date)post", "`whoami`"]
+        );
+
+        let substitutions = comsubs_for_words(&ast.commands[0]);
+        assert_eq!(substitutions.len(), 3);
+        assert_eq!(substitutions[0].text, "$(printf hi)");
+        assert_eq!(substitutions[0].open_delimiter, "$(");
+        assert_eq!(substitutions[0].open_delimiter_metadata.value, "$(");
+        assert_eq!(substitutions[0].open_delimiter_metadata.raw, "$(");
+        assert_eq!(substitutions[0].operator, "$");
+        assert_eq!(substitutions[0].operator_metadata.value, "$");
+        assert_eq!(substitutions[0].operator_metadata.raw, "$");
+        assert_eq!(substitutions[0].close_delimiter, ")");
+        assert_eq!(substitutions[0].close_delimiter_metadata.value, ")");
+        assert_eq!(substitutions[0].close_delimiter_metadata.raw, ")");
+        assert_eq!(substitutions[0].source, "printf hi");
+        assert_eq!(substitutions[0].commands.len(), 1);
+        assert_eq!(substitutions[0].commands[0].words, ["printf", "hi"]);
+        assert!(!substitutions[0].backtick);
+        assert_eq!(substitutions[0].assignment_name, None);
+        assert_eq!(substitutions[1].text, "$(date)");
+        assert_eq!(substitutions[1].open_delimiter, "$(");
+        assert_eq!(substitutions[1].operator, "$");
+        assert_eq!(substitutions[1].close_delimiter, ")");
+        assert_eq!(substitutions[1].source, "date");
+        assert_eq!(substitutions[1].commands[0].words, ["date"]);
+        assert_eq!(substitutions[2].text, "`whoami`");
+        assert_eq!(substitutions[2].open_delimiter, "`");
+        assert_eq!(substitutions[2].open_delimiter_metadata.value, "`");
+        assert_eq!(substitutions[2].operator, "`");
+        assert_eq!(substitutions[2].operator_metadata.value, "`");
+        assert_eq!(substitutions[2].operator_metadata.raw, "`");
+        assert_eq!(substitutions[2].close_delimiter, "`");
+        assert_eq!(substitutions[2].close_delimiter_metadata.value, "`");
+        assert_eq!(substitutions[2].source, "whoami");
+        assert_eq!(substitutions[2].commands[0].words, ["whoami"]);
+        assert!(substitutions[2].backtick);
+    }
+
+    #[test]
+    fn test_assignment_command_substitution_records_structured_ast() {
+        let input = "value=$(printf hi) echo ok";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(
+            ast.commands[0].get_assignment("value").unwrap(),
+            "$(printf hi)"
+        );
+
+        let substitutions = comsubs_for_assignment_values(&ast.commands[0]);
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(substitutions[0].text, "$(printf hi)");
+        assert_eq!(substitutions[0].open_delimiter, "$(");
+        assert_eq!(substitutions[0].operator, "$");
+        assert_eq!(substitutions[0].close_delimiter, ")");
+        assert_eq!(substitutions[0].source, "printf hi");
+        assert_eq!(substitutions[0].commands[0].words, ["printf", "hi"]);
+        assert_eq!(substitutions[0].assignment_name.as_deref(), Some("value"));
+        assert_eq!(substitutions[0].word_index, None);
+    }
+
+    #[test]
+    fn test_command_substitution_records_nested_body_ast() {
+        let input = "echo $(echo $(date); printf done)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let substitutions = comsubs_for_words(&ast.commands[0]);
+
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(substitutions[0].source, "echo $(date); printf done");
+        assert_eq!(substitutions[0].commands.len(), 2);
+        assert_eq!(substitutions[0].commands[0].words, ["echo", "$(date)"]);
+        assert_eq!(substitutions[0].commands[1].words, ["printf", "done"]);
+        // wt44/parse4: the inner body's comsub store is gone; the public
+        // scan is the same oracle pretty-print uses.
+        assert_eq!(
+            rubash::parser::command_substitutions_in_word_public("$(date)")[0].source,
+            "date"
+        );
+    }
+
+    // wt33 (#373): the inner command's token.value now carries the
+    // \u{E010}/\u{E401} PUA carriers encoding the $'...' quoting instead of
+    // the decoded text; decoding happens at execution. NOTE: execution of an
+    // ansi-c quote INSIDE a command substitution currently diverges from GNU
+    // (probe wt33-373/run/B05: `echo "$(echo foo$'\''bar)"` -> GNU
+    // `foo'bar` rc 0; rubash reports `unexpected EOF while looking for
+    // matching \`)'` rc 1) — tracked by the wt33 comsub-ansi-c issue.
+    #[test]
+    fn test_command_substitution_keeps_inner_ansi_c_escaped_quote() {
+        let input = "echo \"$(printf $'foo\\'\nbar')\"";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let substitutions = comsubs_for_words(&ast.commands[0]);
+
+        assert_eq!(ast.commands[0].words, ["echo", "$(printf $'foo\\'\nbar')"]);
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(substitutions[0].text, "$(printf $'foo\\'\nbar')");
+        assert_eq!(substitutions[0].source, "printf $'foo\\'\nbar'");
+        assert_eq!(
+            substitutions[0].commands[0].words,
+            ["printf", "foo\u{e010}\u{e401}\nbar"]
+        );
+    }
+
+    #[test]
+    fn test_empty_command_substitution_records_null_body() {
+        let input = "echo before$()after";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let substitutions = comsubs_for_words(&ast.commands[0]);
+
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(substitutions[0].text, "$()");
+        assert_eq!(substitutions[0].open_delimiter, "$(");
+        assert_eq!(substitutions[0].operator, "$");
+        assert_eq!(substitutions[0].close_delimiter, ")");
+        assert_eq!(substitutions[0].source, "");
+        assert!(substitutions[0].commands.is_empty());
+        assert_eq!(substitutions[0].assignment_name, None);
+    }
+
+    #[test]
+    fn test_command_substitution_keeps_case_pattern_parentheses() {
+        let input = "echo $(case beta in alpha) printf alpha ;; beta) printf beta ;; esac)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let substitutions = comsubs_for_words(&ast.commands[0]);
+
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(
+            substitutions[0].source,
+            "case beta in alpha) printf alpha ;; beta) printf beta ;; esac"
+        );
+        assert_eq!(substitutions[0].commands.len(), 1);
+        assert!(substitutions[0].commands[0].case_command.is_some());
+    }
+
+    #[test]
+    fn test_command_substitution_keeps_case_clause_without_terminator_after_if() {
+        let input = "echo $(case x in x) if ((1)); then printf ok; fi esac)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let substitutions = comsubs_for_words(&ast.commands[0]);
+
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(
+            substitutions[0].source,
+            "case x in x) if ((1)); then printf ok; fi esac"
+        );
+        let case_command = substitutions[0].commands[0].case_command.as_ref().unwrap();
+        assert_eq!(case_command.clauses.len(), 1);
+        assert!(case_command.clauses[0].terminator_text.is_none());
+        assert!(case_command.clauses[0].body[0].if_command.is_some());
+    }
+
+    #[test]
+    fn test_command_substitution_keeps_nested_case_without_outer_terminator() {
+        let input = "echo $(case x in x) case y in y) printf a;; esac esac)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let substitutions = comsubs_for_words(&ast.commands[0]);
+
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(
+            substitutions[0].source,
+            "case x in x) case y in y) printf a;; esac esac"
+        );
+        let case_command = substitutions[0].commands[0].case_command.as_ref().unwrap();
+        assert_eq!(case_command.clauses.len(), 1);
+        assert!(case_command.clauses[0].terminator_text.is_none());
+        assert!(case_command.clauses[0].body[0].case_command.is_some());
+    }
+
+    #[test]
+    fn test_command_substitution_keeps_reserved_case_patterns_before_for() {
+        let input = "echo $(case k in else|done|time|esac) for f in 1 2 3; do printf x; done esac)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let substitutions = comsubs_for_words(&ast.commands[0]);
+
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(
+            substitutions[0].source,
+            "case k in else|done|time|esac) for f in 1 2 3; do printf x; done esac"
+        );
+        let case_command = substitutions[0].commands[0].case_command.as_ref().unwrap();
+        assert_eq!(
+            case_command.clauses[0].patterns,
+            ["else", "done", "time", "esac"]
+        );
+        assert!(case_command.clauses[0].body[0].for_command.is_some());
+    }
+
+    #[test]
+    fn test_command_substitution_keeps_case_esac_after_comment() {
+        let input = "echo $(case a in a) printf ok ;; # comment\nesac)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let substitutions = comsubs_for_words(&ast.commands[0]);
+
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(
+            substitutions[0].source,
+            "case a in a) printf ok ;; # comment\nesac"
+        );
+        let case_command = substitutions[0].commands[0].case_command.as_ref().unwrap();
+        assert_eq!(case_command.clauses.len(), 1);
+        assert_eq!(
+            case_command.clauses[0].terminator_text.as_deref(),
+            Some(";;")
+        );
+    }
+
+    #[test]
+    fn test_command_substitution_keeps_sequential_heredoc_commands() {
+        let input = "echo $(cat <<A; cat <<B\none\nA\ntwo\nB\n)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let substitutions = comsubs_for_words(&ast.commands[0]);
+
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(substitutions[0].commands.len(), 2);
+        assert_eq!(
+            substitutions[0].commands[0].heredoc.as_deref(),
+            Some("one\n")
+        );
+        assert_eq!(
+            substitutions[0].commands[1].heredoc.as_deref(),
+            Some("two\n")
+        );
+    }
+
+    #[test]
+    fn test_command_substitution_keeps_case_pattern_starting_with_esac() {
+        let input = "echo $(case esac in\nesac) printf matched ;; esac)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let substitutions = comsubs_for_words(&ast.commands[0]);
+
+        // wt33 (#373): the comsub text scan closes at the FIRST `)` — the
+        // bare `esac` before it ends an empty case (rubash#381), and the
+        // remaining text stays in the outer word. GNU probe
+        // wt33-373/run/A12_comsub_case_esac (byte-identical):
+        //   echo "comsub=[$(case esac in esac) printf matched ;; esac)]"
+        //   -> `comsub=[ printf matched ;; esac)]`, rc 0 (the inner empty
+        //   case produces no output; nothing is a parse error).
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(substitutions[0].source, "case esac in\nesac");
+        assert!(
+            substitutions[0].commands[0]
+                .get_assignment("__RUBASH_PARSE_ERROR_NEAR__")
+                .is_none(),
+            "empty case inside comsub must parse cleanly"
+        );
+        assert!(substitutions[0].commands[0].case_command.is_some());
+    }
+
+    #[test]
+    fn test_command_substitution_keeps_case_argument() {
+        let input = "echo $(echo case; echo ok)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let substitutions = comsubs_for_words(&ast.commands[0]);
+
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(substitutions[0].source, "echo case; echo ok");
+        assert_eq!(substitutions[0].commands.len(), 2);
+        assert_eq!(substitutions[0].commands[0].words, ["echo", "case"]);
+        assert_eq!(substitutions[0].commands[1].words, ["echo", "ok"]);
+    }
+
+    #[test]
+    fn test_braced_command_substitution_records_current_shell_ast() {
+        let input = "echo ${ echo hi; }";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let command = &ast.commands[0];
+        let substitutions = comsubs_for_words(command);
+
+        assert_eq!(command.words, ["echo", "${ echo hi; }"]);
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(substitutions[0].text, "${ echo hi; }");
+        assert_eq!(substitutions[0].open_delimiter, "${");
+        assert_eq!(substitutions[0].operator, "${");
+        assert_eq!(substitutions[0].operator_metadata.value, "${");
+        assert_eq!(substitutions[0].operator_metadata.raw, "${");
+        assert_eq!(substitutions[0].close_delimiter, "}");
+        assert_eq!(substitutions[0].source, " echo hi; ");
+        assert!(!substitutions[0].backtick);
+        assert!(substitutions[0].current_shell);
+        assert!(!substitutions[0].pipe_output);
+        assert_eq!(substitutions[0].commands[0].words, ["echo", "hi"]);
+        assert!(command.parameter_expansions.is_empty());
+    }
+
+    #[test]
+    fn test_pipe_braced_command_substitution_records_operator() {
+        let input = "echo ${| REPLY=hi; } ${USER:-guest}";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        let command = &ast.commands[0];
+        let substitutions = comsubs_for_words(command);
+
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(substitutions[0].text, "${| REPLY=hi; }");
+        assert_eq!(substitutions[0].open_delimiter, "${");
+        assert_eq!(substitutions[0].operator, "${|");
+        assert_eq!(substitutions[0].operator_metadata.value, "${|");
+        assert_eq!(substitutions[0].operator_metadata.raw, "${|");
+        assert_eq!(substitutions[0].close_delimiter, "}");
+        assert_eq!(substitutions[0].source, " REPLY=hi; ");
+        assert!(substitutions[0].current_shell);
+        assert!(substitutions[0].pipe_output);
+        assert_eq!(
+            substitutions[0].commands[0]
+                .get_assignment("REPLY")
+                .map(String::as_str),
+            Some("hi")
+        );
+        // wt44/parse4: parameter-expansion records are no longer populated
+        // at parse time (zero readers; executor re-derives from text).
+    }
+
+    #[test]
+    fn test_assignment_word_command_substitution_records_word_index() {
+        let input = "echo value=`printf hi`";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(ast.commands[0].words, ["echo", "value=`printf hi`"]);
+
+        // wt44/parse4: the old record tagged the assignment name; the
+        // public scan finds the same span in the word's RHS.
+        let (assignment_name, rhs) = ast.commands[0].words[1].split_once('=').unwrap();
+        let substitutions = rubash::parser::command_substitutions_in_word_public(rhs);
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(substitutions[0].text, "`printf hi`");
+        assert_eq!(substitutions[0].open_delimiter, "`");
+        assert_eq!(substitutions[0].operator, "`");
+        assert_eq!(substitutions[0].close_delimiter, "`");
+        assert_eq!(substitutions[0].source, "printf hi");
+        assert!(substitutions[0].backtick);
+        assert_eq!(assignment_name, "value");
+    }
+}
+
+mod extglob_pattern_tests {
+    use super::*;
+
+    #[test]
+    // wt33 (#373): extglob words require the extglob shopt at parse time
+    // (GNU parse.y:5466); with it off this input is `syntax error near
+    // unexpected token \`('` on BOTH shells (probe
+    // wt33-373/run/A04_echo_extglob_word_off, byte-identical). The shopt
+    // prefix mirrors GNU's parse-execute cadence; the command under test is
+    // commands[1].
+    fn test_extglob_pattern_records_structured_ast_for_words() {
+        let _extglob_gate = EXTGLOB_PARSE_GATE.lock().unwrap();
+        let input = "shopt -s extglob
+echo @(alpha|beta) file!(.tmp) nested@(a|+(b|c))
+shopt -u extglob";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 3);
+        assert_eq!(
+            ast.commands[1].words,
+            ["echo", "@(alpha|beta)", "file!(.tmp)", "nested@(a|+(b|c))"]
+        );
+
+        let patterns = ast.commands[1].extglob_patterns.as_slice();
+        assert_eq!(patterns.len(), 4);
+        assert_eq!(patterns[0].text, "@(alpha|beta)");
+        assert_eq!(patterns[0].open_delimiter, "@(");
+        assert_eq!(patterns[0].open_delimiter_metadata.value, "@(");
+        assert_eq!(patterns[0].open_delimiter_metadata.raw, "@(");
+        assert_eq!(patterns[0].close_delimiter, ")");
+        assert_eq!(patterns[0].close_delimiter_metadata.value, ")");
+        assert_eq!(patterns[0].close_delimiter_metadata.raw, ")");
+        assert_eq!(patterns[0].operator, '@');
+        assert_eq!(patterns[0].operator_metadata.value, "@");
+        assert_eq!(patterns[0].operator_metadata.raw, "@");
+        assert_eq!(patterns[0].pattern, "alpha|beta");
+        assert_eq!(patterns[0].operators, ["|"]);
+        assert_eq!(patterns[0].alternative_operator_metadata[0].value, "|");
+        assert_eq!(patterns[0].alternative_operator_metadata[0].raw, "|");
+        assert_eq!(patterns[0].alternatives, ["alpha", "beta"]);
+        assert_eq!(patterns[0].word_index, Some(1));
+        assert_eq!(patterns[1].text, "!(.tmp)");
+        assert_eq!(patterns[1].open_delimiter, "!(");
+        assert_eq!(patterns[1].open_delimiter_metadata.value, "!(");
+        assert_eq!(patterns[1].open_delimiter_metadata.raw, "!(");
+        assert_eq!(patterns[1].close_delimiter, ")");
+        assert_eq!(patterns[1].close_delimiter_metadata.value, ")");
+        assert_eq!(patterns[1].close_delimiter_metadata.raw, ")");
+        assert_eq!(patterns[1].operator, '!');
+        assert_eq!(patterns[1].operator_metadata.value, "!");
+        assert_eq!(patterns[1].operator_metadata.raw, "!");
+        assert!(patterns[1].operators.is_empty());
+        assert_eq!(patterns[1].alternatives, [".tmp"]);
+        assert_eq!(patterns[1].word_index, Some(2));
+        assert_eq!(patterns[2].text, "@(a|+(b|c))");
+        assert_eq!(patterns[2].pattern, "a|+(b|c)");
+        assert_eq!(patterns[2].operators, ["|"]);
+        assert_eq!(patterns[2].alternative_operator_metadata[0].value, "|");
+        assert_eq!(patterns[2].alternative_operator_metadata[0].raw, "|");
+        assert_eq!(patterns[2].alternatives, ["a", "+(b|c)"]);
+        assert_eq!(patterns[2].word_index, Some(3));
+        assert_eq!(patterns[3].text, "+(b|c)");
+        assert_eq!(patterns[3].pattern, "b|c");
+        assert_eq!(patterns[3].operators, ["|"]);
+        assert_eq!(patterns[3].alternatives, ["b", "c"]);
+        assert_eq!(patterns[3].word_index, Some(3));
+    }
+
+    #[test]
+    fn test_extglob_pattern_records_repeated_alternative_operators() {
+        let _extglob_gate = EXTGLOB_PARSE_GATE.lock().unwrap();
+        let input = "shopt -s extglob
+echo @(a|b|c) @(a[|]b|c)
+shopt -u extglob";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 3);
+
+        let patterns = ast.commands[1].extglob_patterns.as_slice();
+        assert_eq!(patterns.len(), 2);
+        assert_eq!(patterns[0].text, "@(a|b|c)");
+        assert_eq!(patterns[0].operators, ["|", "|"]);
+        assert_eq!(patterns[0].alternative_operator_metadata[0].value, "|");
+        assert_eq!(patterns[0].alternative_operator_metadata[1].value, "|");
+        assert_eq!(patterns[0].alternatives, ["a", "b", "c"]);
+        assert_eq!(patterns[1].text, "@(a[|]b|c)");
+        assert_eq!(patterns[1].operators, ["|"]);
+        assert_eq!(patterns[1].alternatives, ["a[|]b", "c"]);
+    }
+
+    #[test]
+    fn test_extglob_pattern_skips_command_substitution_source() {
+        let _extglob_gate = EXTGLOB_PARSE_GATE.lock().unwrap();
+        let input = "shopt -s extglob
+echo $(echo @(hidden|source)) ?(visible)
+shopt -u extglob";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 3);
+
+        let patterns = ast.commands[1].extglob_patterns.as_slice();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].text, "?(visible)");
+        assert_eq!(patterns[0].operator, '?');
+        assert_eq!(patterns[0].word_index, Some(2));
+    }
+
+    #[test]
+    fn test_quoted_extglob_pattern_text_is_not_recorded() {
+        let _extglob_gate = EXTGLOB_PARSE_GATE.lock().unwrap();
+        let input = "shopt -s extglob
+echo @(plain|pattern) '@(single|quoted)' \"!(double|quoted)\" $'+(ansi|quoted)'
+shopt -u extglob";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 3);
+
+        let patterns = ast.commands[1].extglob_patterns.as_slice();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].text, "@(plain|pattern)");
+        assert_eq!(patterns[0].word_index, Some(1));
+    }
+
+    #[test]
+    // wt33 (#373): with extglob OFF, GNU rejects `echo pattern=*(src|tests)`
+    // (probe wt33-373/run/A05_extglob_assign_off, byte-identical: `syntax
+    // error near unexpected token \`('` rc 2); enable the gate first.
+    fn test_assignment_word_extglob_pattern_records_word_index() {
+        let _extglob_gate = EXTGLOB_PARSE_GATE.lock().unwrap();
+        let input = "shopt -s extglob
+echo pattern=*(src|tests)
+shopt -u extglob";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 3);
+        assert_eq!(ast.commands[1].words, ["echo", "pattern=*(src|tests)"]);
+
+        let patterns = ast.commands[1].extglob_patterns.as_slice();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].text, "*(src|tests)");
+        assert_eq!(patterns[0].open_delimiter, "*(");
+        assert_eq!(patterns[0].close_delimiter, ")");
+        assert_eq!(patterns[0].operator, '*');
+        assert_eq!(patterns[0].pattern, "src|tests");
+        assert_eq!(patterns[0].operators, ["|"]);
+        assert_eq!(patterns[0].assignment_name.as_deref(), Some("pattern"));
+        assert_eq!(patterns[0].word_index, Some(1));
+    }
+}
+
+mod pathname_pattern_tests {
+    use super::*;
+
+    #[test]
+    fn test_pathname_patterns_record_structured_ast_for_words() {
+        let input = "echo *.rs src/[mp]*.rs docs/??.md src/**/mod.rs literal";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+
+        let patterns = ast.commands[0].pathname_patterns.as_slice();
+        assert_eq!(patterns.len(), 4);
+        assert_eq!(patterns[0].text, "*.rs");
+        assert_eq!(patterns[0].operators, ["*"]);
+        assert_eq!(patterns[0].operator_metadata[0].value, "*");
+        assert_eq!(patterns[0].operator_metadata[0].raw, "*");
+        assert!(patterns[0].has_star);
+        assert!(!patterns[0].has_question);
+        assert!(!patterns[0].has_bracket);
+        assert!(!patterns[0].globstar);
+        assert_eq!(patterns[0].word_index, Some(1));
+        assert_eq!(patterns[1].text, "src/[mp]*.rs");
+        assert_eq!(patterns[1].operators, ["[mp]", "*"]);
+        assert_eq!(patterns[1].operator_metadata[0].value, "[mp]");
+        assert_eq!(patterns[1].operator_metadata[0].raw, "[mp]");
+        assert_eq!(patterns[1].operator_metadata[1].value, "*");
+        assert_eq!(patterns[1].operator_metadata[1].raw, "*");
+        assert!(patterns[1].has_star);
+        assert!(patterns[1].has_bracket);
+        assert_eq!(patterns[1].word_index, Some(2));
+        assert_eq!(patterns[2].text, "docs/??.md");
+        assert_eq!(patterns[2].operators, ["?", "?"]);
+        assert_eq!(patterns[2].operator_metadata[0].value, "?");
+        assert_eq!(patterns[2].operator_metadata[0].raw, "?");
+        assert_eq!(patterns[2].operator_metadata[1].value, "?");
+        assert_eq!(patterns[2].operator_metadata[1].raw, "?");
+        assert!(patterns[2].has_question);
+        assert_eq!(patterns[2].word_index, Some(3));
+        assert_eq!(patterns[3].text, "src/**/mod.rs");
+        assert_eq!(patterns[3].operators, ["**"]);
+        assert_eq!(patterns[3].operator_metadata[0].value, "**");
+        assert_eq!(patterns[3].operator_metadata[0].raw, "**");
+        assert!(patterns[3].has_star);
+        assert!(patterns[3].globstar);
+        assert_eq!(patterns[3].word_index, Some(4));
+    }
+
+    #[test]
+    fn test_pathname_pattern_skips_command_substitution_source() {
+        let input = "echo $(echo *.rs) visible?.rs";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+
+        let patterns = ast.commands[0].pathname_patterns.as_slice();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].text, "visible?.rs");
+        assert!(patterns[0].has_question);
+        assert_eq!(patterns[0].word_index, Some(2));
+    }
+
+    #[test]
+    fn test_assignment_like_word_does_not_record_pathname_pattern() {
+        let input = "echo target=*.rs plain*.rs";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+
+        let patterns = ast.commands[0].pathname_patterns.as_slice();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].text, "plain*.rs");
+        assert_eq!(patterns[0].word_index, Some(2));
+    }
+
+    #[test]
+    fn test_quoted_pathname_operators_are_not_recorded() {
+        let input = "echo \"*.rs\" '\\?' $'[*]' $\"**\" plain*.rs";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+
+        let patterns = ast.commands[0].pathname_patterns.as_slice();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].text, "plain*.rs");
+        assert_eq!(patterns[0].operators, ["*"]);
+        assert_eq!(patterns[0].word_index, Some(5));
+    }
+
+    // wt33 (#373): token.value carries the \x11 CTLESC carrier on the quoted
+    // `*` (probe wt33-373/run/A25_quoted_glob_word: `set -f; printf '[%s]\n'
+    // "*.rs"` prints the literal text on both shells — execution strips the
+    // carrier; the pathname metadata still records only the unquoted `?`).
+    #[test]
+    fn test_only_unquoted_pathname_operators_are_recorded() {
+        let input = "echo prefix\"*\"?.rs";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        assert_eq!(ast.commands[0].words, ["echo", "prefix\u{11}*?.rs"]);
+
+        let patterns = ast.commands[0].pathname_patterns.as_slice();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].text, "prefix\u{11}*?.rs");
+        assert_eq!(patterns[0].operators, ["?"]);
+        assert!(!patterns[0].has_star);
+        assert!(patterns[0].has_question);
+        assert_eq!(patterns[0].word_index, Some(1));
+    }
+}
+
+mod word_quote_tests {
+    use super::*;
+
+    /// wt44/parse4: the parse-time word-quote store is gone; derive via
+    /// the public scan (the =~ consumer's oracle) over the raw spellings.
+    fn quotes_for_raws(cmd: &rubash::parser::CommandNode) -> Vec<rubash::parser::WordQuote> {
+        // The old store recorded assignment RHS quotes before word quotes
+        // (the assignment branch ran first); keep that order.
+        cmd.assignment_raws
+            .iter()
+            .map(String::as_str)
+            .chain(
+                cmd.word_metadata
+                    .iter()
+                    .map(|metadata| metadata.raw.as_str()),
+            )
+            .flat_map(|raw| rubash::parser::word_quotes_in_raw_public(raw))
+            .collect()
+    }
+
+    #[test]
+    fn test_word_quotes_record_structured_ast_for_words() {
+        let input = "printf 'one two' \"three $HOME\" $'line\\n' $\"locale\"";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+
+        let quotes = quotes_for_raws(&ast.commands[0]);
+        assert_eq!(quotes.len(), 4);
+        assert_eq!(quotes[0].text, "'one two'");
+        assert_eq!(quotes[0].open_delimiter, "'");
+        assert_eq!(quotes[0].open_delimiter_metadata.value, "'");
+        assert_eq!(quotes[0].open_delimiter_metadata.raw, "'");
+        assert_eq!(quotes[0].body, "one two");
+        assert_eq!(quotes[0].close_delimiter, "'");
+        assert_eq!(quotes[0].close_delimiter_metadata.value, "'");
+        assert_eq!(quotes[0].close_delimiter_metadata.raw, "'");
+        assert_eq!(quotes[0].kind, QuoteKind::Single);
+        assert_eq!(quotes[1].text, "\"three $HOME\"");
+        assert_eq!(quotes[1].open_delimiter, "\"");
+        assert_eq!(quotes[1].body, "three $HOME");
+        assert_eq!(quotes[1].close_delimiter, "\"");
+        assert_eq!(quotes[1].kind, QuoteKind::Double);
+        assert_eq!(quotes[2].text, "$'line\\n'");
+        assert_eq!(quotes[2].open_delimiter, "$'");
+        assert_eq!(quotes[2].open_delimiter_metadata.value, "$'");
+        assert_eq!(quotes[2].open_delimiter_metadata.raw, "$'");
+        assert_eq!(quotes[2].body, "line\\n");
+        assert_eq!(quotes[2].close_delimiter, "'");
+        assert_eq!(quotes[2].close_delimiter_metadata.value, "'");
+        assert_eq!(quotes[2].close_delimiter_metadata.raw, "'");
+        assert_eq!(quotes[2].kind, QuoteKind::AnsiC);
+        assert_eq!(quotes[3].text, "$\"locale\"");
+        assert_eq!(quotes[3].open_delimiter, "$\"");
+        assert_eq!(quotes[3].body, "locale");
+        assert_eq!(quotes[3].close_delimiter, "\"");
+        assert_eq!(quotes[3].kind, QuoteKind::Locale);
+    }
+
+    #[test]
+    fn test_assignment_word_quotes_record_assignment_metadata() {
+        let input = "name='value one' echo target=\"two words\"";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+
+        let quotes = quotes_for_raws(&ast.commands[0]);
+        assert_eq!(quotes.len(), 2);
+        assert_eq!(quotes[0].text, "'value one'");
+        assert_eq!(quotes[0].open_delimiter, "'");
+        assert_eq!(quotes[0].body, "value one");
+        assert_eq!(quotes[0].close_delimiter, "'");
+        assert_eq!(quotes[0].kind, QuoteKind::Single);
+        assert_eq!(quotes[1].text, "\"two words\"");
+        assert_eq!(quotes[1].open_delimiter, "\"");
+        assert_eq!(quotes[1].body, "two words");
+        assert_eq!(quotes[1].close_delimiter, "\"");
+        assert_eq!(quotes[1].kind, QuoteKind::Double);
+    }
+}
+
+mod background_tests {
+    use super::*;
+
+    #[test]
+    fn test_background_command_wraps_simple_command() {
+        let input = "false & echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 2);
+        let background = ast.commands[0].background_command.as_ref().unwrap();
+        assert_eq!(background.operator, "&");
+        assert_eq!(background.operator_metadata.value, "&");
+        assert_eq!(background.operator_metadata.raw, "&");
+        assert_eq!(background.command.words, ["false"]);
+        assert_eq!(ast.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_background_command_wraps_pipeline() {
+        let input = "printf hi | cat & echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 2);
+        let background = ast.commands[0].background_command.as_ref().unwrap();
+        assert_eq!(background.operator, "&");
+        assert_eq!(background.operator_metadata.value, "&");
+        let pipeline = background.command.pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.stages.len(), 2);
+        assert_eq!(ast.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_background_command_wraps_compound_command() {
+        let input = "if true; then echo yes; fi & echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 2);
+        let background = ast.commands[0].background_command.as_ref().unwrap();
+        let if_command = background.command.if_command.as_ref().unwrap();
+
+        assert_eq!(background.operator, "&");
+        assert_eq!(background.operator_metadata.value, "&");
+        assert_eq!(if_command.then_body[0].words, ["echo", "yes"]);
+        assert_eq!(ast.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_background_command_wraps_function_definition() {
+        let input = "foo() { echo hi; } & echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 2);
+        let background = ast.commands[0].background_command.as_ref().unwrap();
+        let function = background.command.function_command.as_ref().unwrap();
+
+        assert_eq!(background.operator, "&");
+        assert_eq!(background.operator_metadata.value, "&");
+        assert_eq!(function.name, "foo");
+        assert!(function.has_parentheses);
+        assert_eq!(function.body_kind, FunctionBodyKind::BraceGroup);
+        assert_eq!(function.body[0].words, ["echo", "hi"]);
+        assert_eq!(ast.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_background_command_wraps_time_prefix() {
+        let input = "time -p true & echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 2);
+        let background = ast.commands[0].background_command.as_ref().unwrap();
+        let time_command = background.command.time_command.as_ref().unwrap();
+
+        assert_eq!(background.operator, "&");
+        assert_eq!(time_command.keyword, "time");
+        assert_eq!(time_command.prefix_words, ["-p"]);
+        assert!(time_command.posix_format);
+        assert_eq!(time_command.command.words, ["true"]);
+        assert_eq!(ast.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_background_command_wraps_case_command() {
+        let input = "case yes in yes) echo yes ;; *) echo no ;; esac & echo done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 2);
+        let background = ast.commands[0].background_command.as_ref().unwrap();
+        let case_command = background.command.case_command.as_ref().unwrap();
+
+        assert_eq!(background.operator, "&");
+        assert_eq!(case_command.word, "yes");
+        assert_eq!(case_command.clauses.len(), 2);
+        assert_eq!(case_command.clauses[0].patterns, ["yes"]);
+        assert_eq!(case_command.clauses[0].body[0].words, ["echo", "yes"]);
+        assert_eq!(ast.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_background_command_wraps_loop_commands() {
+        let while_ast = parse(&tokenize(
+            "while true; do echo loop; break; done & echo done",
+        ));
+        let until_ast = parse(&tokenize("until true; do echo loop; done & echo done"));
+
+        let while_background = while_ast.commands[0].background_command.as_ref().unwrap();
+        let while_command = while_background.command.loop_command.as_ref().unwrap();
+        let until_background = until_ast.commands[0].background_command.as_ref().unwrap();
+        let until_command = until_background.command.loop_command.as_ref().unwrap();
+
+        assert_eq!(while_background.operator, "&");
+        assert_eq!(while_command.kind, LoopKind::While);
+        assert_eq!(while_command.body[0].words, ["echo", "loop"]);
+        assert_eq!(while_ast.commands[1].words, ["echo", "done"]);
+        assert_eq!(until_background.operator, "&");
+        assert_eq!(until_command.kind, LoopKind::Until);
+        assert_eq!(until_command.condition[0].words, ["true"]);
+        assert_eq!(until_ast.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_background_command_wraps_iteration_commands() {
+        let for_ast = parse(&tokenize(
+            "for value in one two; do echo $value; done & echo done",
+        ));
+        let select_ast = parse(&tokenize(
+            "select value in one two; do echo $value; break; done & echo done",
+        ));
+
+        let for_background = for_ast.commands[0].background_command.as_ref().unwrap();
+        let for_command = for_background.command.for_command.as_ref().unwrap();
+        let select_background = select_ast.commands[0].background_command.as_ref().unwrap();
+        let select_command = select_background.command.select_command.as_ref().unwrap();
+
+        assert_eq!(for_background.operator, "&");
+        assert_eq!(for_command.variable, "value");
+        assert_eq!(for_command.words, ["one", "two"]);
+        assert_eq!(for_command.body[0].words, ["echo", "$value"]);
+        assert_eq!(for_ast.commands[1].words, ["echo", "done"]);
+        assert_eq!(select_background.operator, "&");
+        assert_eq!(select_command.variable, "value");
+        assert_eq!(select_command.words, ["one", "two"]);
+        assert_eq!(select_command.body[0].words, ["echo", "$value"]);
+        assert_eq!(select_ast.commands[1].words, ["echo", "done"]);
+    }
+
+    #[test]
+    fn test_background_command_wraps_test_commands() {
+        let arithmetic_ast = parse(&tokenize("(( count += 1 )) & echo done"));
+        let conditional_ast = parse(&tokenize("[[ $value == yes ]] & echo done"));
+
+        let arithmetic_background = arithmetic_ast.commands[0]
+            .background_command
+            .as_ref()
+            .unwrap();
+        let arithmetic = arithmetic_background
+            .command
+            .arithmetic_command
+            .as_ref()
+            .unwrap();
+        let conditional_background = conditional_ast.commands[0]
+            .background_command
+            .as_ref()
+            .unwrap();
+        let conditional = conditional_background
+            .command
+            .conditional_command
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(arithmetic_background.operator, "&");
+        assert_eq!(arithmetic.expression, "count += 1");
+        assert_eq!(arithmetic_ast.commands[1].words, ["echo", "done"]);
+        assert_eq!(conditional_background.operator, "&");
+        assert_eq!(conditional.args, ["$value", "==", "yes", "]]"]);
+        assert_eq!(
+            conditional.expression.kind,
+            ConditionalExpressionKind::Binary
+        );
+        assert_eq!(conditional.expression.operator.as_deref(), Some("=="));
+        assert_eq!(conditional.expression.operands, ["$value", "yes"]);
+        assert_eq!(conditional_ast.commands[1].words, ["echo", "done"]);
+    }
+}
+
+mod inverted_tests {
+    use super::*;
+
+    #[test]
+    fn test_inverted_command_wraps_simple_command() {
+        let input = "! false";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let inverted = ast.commands[0].inverted_command.as_ref().unwrap();
+        assert_eq!(inverted.operator, "!");
+        assert_eq!(inverted.operator_metadata.value, "!");
+        assert_eq!(inverted.operator_metadata.raw, "!");
+        assert_eq!(inverted.command.words, ["false"]);
+    }
+
+    #[test]
+    fn test_inverted_command_wraps_pipeline() {
+        let input = "! false | true";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let inverted = ast.commands[0].inverted_command.as_ref().unwrap();
+        assert_eq!(inverted.operator, "!");
+        assert_eq!(inverted.operator_metadata.value, "!");
+        let pipeline = inverted.command.pipeline_command.as_ref().unwrap();
+        assert_eq!(pipeline.stages.len(), 2);
+        assert_eq!(pipeline.stages[0].words, ["false"]);
+        assert_eq!(pipeline.stages[1].words, ["true"]);
+    }
+
+    #[test]
+    fn test_inverted_command_wraps_compound_command() {
+        let input = "! for value in one; do false; done";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands.len(), 1);
+        let inverted = ast.commands[0].inverted_command.as_ref().unwrap();
+        assert_eq!(inverted.operator, "!");
+        let for_command = inverted.command.for_command.as_ref().unwrap();
+        assert_eq!(for_command.keyword, "for");
+        assert_eq!(for_command.variable, "value");
+        assert_eq!(for_command.words, ["one"]);
+        assert_eq!(for_command.body[0].words, ["false"]);
+    }
+
+    #[test]
+    fn test_inverted_command_wraps_function_definition() {
+        let keyword_tokens = tokenize("! function f { echo hi; }");
+        let keyword_ast = parse(&keyword_tokens);
+        let keyword_inverted = keyword_ast.commands[0].inverted_command.as_ref().unwrap();
+        let keyword_function = keyword_inverted.command.function_command.as_ref().unwrap();
+
+        assert_eq!(keyword_inverted.operator, "!");
+        assert!(keyword_function.keyword);
+        assert_eq!(keyword_function.name, "f");
+        assert_eq!(keyword_function.body[0].words, ["echo", "hi"]);
+
+        let posix_tokens = tokenize("! f() { echo hi; }");
+        let posix_ast = parse(&posix_tokens);
+        let posix_inverted = posix_ast.commands[0].inverted_command.as_ref().unwrap();
+        let posix_function = posix_inverted.command.function_command.as_ref().unwrap();
+
+        assert_eq!(posix_inverted.operator, "!");
+        assert!(!posix_function.keyword);
+        assert!(posix_function.has_parentheses);
+        assert_eq!(posix_function.name, "f");
+        assert_eq!(posix_function.body[0].words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn test_inverted_command_wraps_case_and_test_commands() {
+        let case_ast = parse(&tokenize("! case yes in yes) true ;; esac"));
+        let arithmetic_ast = parse(&tokenize("! (( count += 1 ))"));
+        let conditional_ast = parse(&tokenize("! [[ $value == yes ]]"));
+
+        let case_inverted = case_ast.commands[0].inverted_command.as_ref().unwrap();
+        let case_command = case_inverted.command.case_command.as_ref().unwrap();
+        let arithmetic_inverted = arithmetic_ast.commands[0]
+            .inverted_command
+            .as_ref()
+            .unwrap();
+        let arithmetic = arithmetic_inverted
+            .command
+            .arithmetic_command
+            .as_ref()
+            .unwrap();
+        let conditional_inverted = conditional_ast.commands[0]
+            .inverted_command
+            .as_ref()
+            .unwrap();
+        let conditional = conditional_inverted
+            .command
+            .conditional_command
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(case_inverted.operator, "!");
+        assert_eq!(case_command.word, "yes");
+        assert_eq!(case_command.clauses[0].patterns, ["yes"]);
+        assert_eq!(arithmetic_inverted.operator, "!");
+        assert_eq!(arithmetic.expression, "count += 1");
+        assert_eq!(conditional_inverted.operator, "!");
+        assert_eq!(
+            conditional.expression.kind,
+            ConditionalExpressionKind::Binary
+        );
+        assert_eq!(conditional.expression.operator.as_deref(), Some("=="));
+        assert_eq!(conditional.expression.operands, ["$value", "yes"]);
+    }
+
+    #[test]
+    fn test_inverted_command_wraps_grouping_and_select_commands() {
+        let brace_ast = parse(&tokenize("! { true; }"));
+        let subshell_ast = parse(&tokenize("! ( false )"));
+        let select_ast = parse(&tokenize(
+            "! select value in one two; do echo $value; break; done",
+        ));
+
+        let brace_inverted = brace_ast.commands[0].inverted_command.as_ref().unwrap();
+        let brace_group = brace_inverted.command.brace_group.as_ref().unwrap();
+        let subshell_inverted = subshell_ast.commands[0].inverted_command.as_ref().unwrap();
+        let subshell = subshell_inverted.command.subshell_command.as_ref().unwrap();
+        let select_inverted = select_ast.commands[0].inverted_command.as_ref().unwrap();
+        let select_command = select_inverted.command.select_command.as_ref().unwrap();
+
+        assert_eq!(brace_inverted.operator, "!");
+        assert_eq!(brace_group.body[0].words, ["true"]);
+        assert_eq!(subshell_inverted.operator, "!");
+        assert_eq!(subshell.body[0].words, ["false"]);
+        assert_eq!(select_inverted.operator, "!");
+        assert_eq!(select_command.variable, "value");
+        assert_eq!(select_command.words, ["one", "two"]);
+        assert_eq!(select_command.body[0].words, ["echo", "$value"]);
+    }
+}
+
+mod variable_tests {
+    use super::*;
+
+    #[test]
+    fn test_variable_words_are_preserved_for_expansion() {
+        let input = "echo alias: $?";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands[0].words, vec!["echo", "alias:", "$?"]);
+    }
+
+    #[test]
+    fn test_braced_variable_can_be_command_word() {
+        let input = "${THIS_SH} ./script";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands[0].words, vec!["${THIS_SH}", "./script"]);
+    }
+}
+
+mod quote_removal {
+    use super::*;
+
+    #[test]
+    fn test_single_quotes_removed() {
+        let input = "echo 'hello world'";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands[0].words[1], "hello world");
+    }
+
+    #[test]
+    fn test_double_quotes_removed() {
+        let input = "echo \"hello world\"";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands[0].words[1], "hello world");
+    }
+
+    #[test]
+    fn test_assignment_after_command_is_word() {
+        let input = "alias foo='echo '";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(ast.commands[0].words, vec!["alias", "foo=\x1cecho "]);
+        assert!(ast.commands[0].assignments.is_empty());
+    }
+
+    // wt33 (#373): atomic compound token — the quoted word boundaries are
+    // preserved verbatim in the marker value (execution splits on them;
+    // behavior probed GNU-identical in wt33-373/run/A09_compound_array).
+    #[test]
+    fn test_declare_compound_assignment_preserves_quoted_word_boundaries() {
+        let input = "declare -A assoc=(one \"two words\" three \"four words\")";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(
+            ast.commands[0].words,
+            vec![
+                "declare",
+                "-A",
+                "assoc=__RUBASH_CA1__(one \"two words\" three \"four words\")"
+            ]
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+
+    #[test]
+    fn test_compound_assignment_preserves_quoted_subscript_boundaries() {
+        let input = "declare -A assoc=([\"two words\"]=\"value here\")";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(
+            ast.commands[0].words,
+            vec![
+                "declare",
+                "-A",
+                "assoc=__RUBASH_CA1__([\"two words\"]=\"value here\")"
+            ]
+        );
+    }
+
+    // wt33 (#373): the old \x1e compound carrier was replaced by the
+    // `__RUBASH_CA1__` marker; the bracket words without assignment
+    // operators stay verbatim in the raw RHS.
+    #[test]
+    fn test_declare_assoc_compound_keeps_bracket_words_without_assignment_operator() {
+        let input = "declare -A assoc=([x] one [y] two)";
+        let tokens = tokenize(input);
+        let ast = parse(&tokens);
+        assert_eq!(
+            ast.commands[0].words,
+            vec!["declare", "-A", "assoc=__RUBASH_CA1__([x] one [y] two)"]
+        );
+        assert!(ast.commands[0].compound_assignments.is_empty());
+    }
+}

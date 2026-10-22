@@ -1,0 +1,28 @@
+./test-glue-functions: line 2: $'\r': command not found
+./test-glue-functions: line 4: syntax error near unexpected token `$'\r''
+./test-glue-functions: line 4: `_intl_normalize_spaces()'
+test1
+foo
+test2
+test4
+/bashtest-procsub-15253: line 1: _cut_leading_spaces: command not found
+test5
+test6
+test7
+test8
+test8a
+test9
+hi
+bye
+l8r
+::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+intern
+./procsub.tests: line 98: _cut_leading_spaces: command not found
+extern
+./procsub.tests: line 112: _cut_leading_spaces: command not found
+123
+bar1
+ouch
+bar2
+foo
+subshell

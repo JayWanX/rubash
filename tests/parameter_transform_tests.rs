@@ -1,0 +1,359 @@
+use rubash::executor::Executor;
+use rubash::lexer::tokenize;
+use rubash::parser::parse;
+use std::fs;
+
+#[path = "parameter_transform_tests/arrays.rs"]
+mod arrays;
+
+/// Account name and root marker as THIS engine renders them: `\u` is the
+/// passwd account and `\$` is `#` for euid 0 (GNU variables.c:984 uidset)
+/// — both environment-dependent, so tests that pin prompt-expansion
+/// machinery (not identity) calibrate from a throwaway Executor instead
+/// of pinning the author's account. `\u` itself is pinned by the
+/// issue421 tests.
+fn prompt_identity() -> (String, String) {
+    fn probe(ps: &str) -> String {
+        let path = "target/rubash-param-transform-identity-probe.txt";
+        let _ = fs::remove_file(path);
+        let input = format!("PS='{ps}'; printf '%s' \"${{PS@P}}\" > {path}");
+        let tokens = tokenize(&input);
+        let ast = parse(&tokens);
+        let mut executor = Executor::new();
+        let result = executor.execute_ast(&ast);
+        assert!(result.is_ok());
+        let out = fs::read_to_string(path).unwrap();
+        let _ = fs::remove_file(path);
+        out
+    }
+    (probe("\\u"), probe("\\$"))
+}
+
+#[test]
+fn test_parameter_transform_quotes_value() {
+    let output_path = "target/rubash-param-transform-quote-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("v='two words'; echo ${{v@Q}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "'two words'\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_indirect_parameter_transform_applies_to_target_value() {
+    let output_path = "target/rubash-param-transform-indirect-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "USER=alice; export value='two words'; ref=value; arr=(alpha beta); elem='arr[1]'; \
+         PS='\\u'; psref=PS; \
+         printf '<%s>\\n' \"${{!ref@Q}}\" \"${{!ref@U}}\" \"${{!elem@Q}}\" \
+         \"${{!ref@A}}\" \"${{!ref@a}}\" \"${{!elem@A}}\" \"${{!psref@P}}\" > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let (user, _) = prompt_identity();
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        format!("<'two words'>\n<TWO WORDS>\n<'beta'>\n<declare -x value='two words'>\n<x>\n<declare -a arr='beta'>\n<{user}>\n")
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_transform_expands_ansi_c_escapes() {
+    let output_path = "target/rubash-param-transform-escape-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "v='a\\nb'; printf '<%s>' \"${{v@E}}\" > {output_path}; v='\\141\\x42'; printf '<%s>' \"${{v@E}}\" >> {output_path}; v='a\\qb'; printf '<%s>\\n' \"${{v@E}}\" >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "<a\nb><aB><a\\qb>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_transform_prints_assignment() {
+    let output_path = "target/rubash-param-transform-assignment-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("v=\"two words\"; printf '<%s>\\n' \"${{v@A}}\" > {output_path}; v=\"a'b\"; printf '<%s>\\n' \"${{v@A}}\" >> {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "<v='two words'>\n<v='a'\\''b'>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_transform_assignment_includes_attributes() {
+    let output_path = "target/rubash-param-transform-assignment-attrs-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("export x=value; readonly r=value; declare -i n=7; declare -lrx lr=ABC; declare -ux ux=abc; printf '<%s>\\n' \"${{x@A}}\" \"${{r@A}}\" \"${{n@A}}\" \"${{lr@A}}\" \"${{ux@A}}\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "<declare -x x='value'>\n<declare -r r='value'>\n<declare -i n='7'>\n<declare -rxl lr='abc'>\n<declare -xu ux='ABC'>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_transform_assignment_prints_indexed_arrays() {
+    let output_path = "target/rubash-param-transform-assignment-array-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "arr=(alpha beta); printf '<%s>\\n' \"${{arr@A}}\" \"${{arr[1]@A}}\" \"${{arr[*]@A}}\" > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        // GNU 5.3 (WSL script-file probe, rubash#371): a quoted ${arr[*]@A}
+        // is ONE word — chk_atstar (subst.c:7642) never marks a quoted [*]
+        // for the final list_string split (subst.c:12134).
+        "<declare -a arr='alpha'>\n<declare -a arr='beta'>\n<declare -a arr=([0]=\"alpha\" [1]=\"beta\")>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_transform_assignment_prints_assoc_arrays() {
+    let output_path = "target/rubash-param-transform-assignment-assoc-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("declare -A assoc; assoc[one]=alpha; assoc[two]=beta; printf '<%s>\\n' \"${{assoc@A}}\" \"${{assoc[one]@A}}\" \"${{assoc[*]@A}}\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    // GNU 5.3 (WSL script-file probe, rubash#371): element-assigned assoc
+    // arrays keep the `declare -A assoc=(...)` body — assign_array_element
+    // (arrayfunc.c:815) allocates a real cell, so array_var_assignment
+    // (subst.c:8690) renders it — and a quoted [*] stays one word. Key
+    // order is GNU hash order (assoc_to_assign, assoc.c:414).
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "<declare -A assoc>\n<declare -A assoc='alpha'>\n<declare -A assoc=([two]=\"beta\" [one]=\"alpha\" )>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_transform_prints_attributes() {
+    let output_path = "target/rubash-param-transform-attrs-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("v=value; export x=value; readonly r=value; declare -i n=7; arr=(alpha beta); declare -A assoc; assoc[one]=alpha; printf '<%s>\\n' \"${{v@a}}\" \"${{x@a}}\" \"${{r@a}}\" \"${{n@a}}\" \"${{arr@a}}\" \"${{arr[1]@a}}\" \"${{assoc@a}}\" \"${{assoc[one]@a}}\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "<>\n<x>\n<r>\n<i>\n<a>\n<a>\n<A>\n<A>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_transform_prints_combined_attributes() {
+    let output_path = "target/rubash-param-transform-combined-attrs-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("declare -ix xi=7; readonly -a ra=(alpha); declare -lrx lr=ABC; declare -ux ux=abc; printf '<%s>\\n' \"${{xi@a}}\" \"${{ra@a}}\" \"${{lr@a}}\" \"${{ux@a}}\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "<ix>\n<ar>\n<rxl>\n<xu>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_transform_expands_prompt_escapes() {
+    let output_path = "target/rubash-param-transform-prompt-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("USER=alice; HOSTNAME=box.example; HOME=/home/alice; PWD=/home/alice/project; PS='\\u@\\h:\\w:\\W:\\$:\\\\'; printf '<%s>\\n' \"${{PS@P}}\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let (user, mark) = prompt_identity();
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        format!("<{user}@box:~/project:project:{mark}:\\>\n")
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_transform_prompt_expands_variables_and_commands() {
+    let output_path = "target/rubash-param-transform-prompt-vars-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("USER=alice; HOST=box; PS='\\[red\\]${{HOST}} $(echo ok) \\u\\[reset\\]'; printf '<%s>\\n' \"${{PS@P}}\" > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let (user, _) = prompt_identity();
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        format!("<redbox ok {user}reset>\n")
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_transform_prints_key_value_pairs() {
+    let output_path = "target/rubash-param-transform-key-value-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("v=value; arr=(alpha beta); declare -A assoc; assoc[one]=alpha; assoc[two]=beta; echo scalar:${{v@K}}:${{v@k}} > {output_path}; echo indexed:${{arr[@]@K}} / ${{arr[@]@k}} >> {output_path}; echo assoc:${{assoc[@]@K}} / ${{assoc[@]@k}} >> {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    // Assoc key/value order is GNU hash order (assoc_to_kvpair,
+    // assoc.c:346 iterates hash buckets): WSL GNU 5.3 prints
+    // `two "beta" one "alpha"` for this exact input (rubash#371 sibling
+    // red — the old expectation pinned insertion order).
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "scalar:'value':'value'\nindexed:0 \"alpha\" 1 \"beta\" / 0 alpha 1 beta\nassoc:two \"beta\" one \"alpha\" / two beta one alpha\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+/// rubash#796 differential (GNU 5.3.0 probe, 2026-10-13): the `@K`
+/// transform emits a trailing separator after the last pair. The UNQUOTED
+/// word field-splits its expansion result, so the trailing IFS whitespace
+/// produces no field and `echo assoc:${assoc[@]@K}` stores no trailing
+/// space; the QUOTED face keeps it (GNU: `echo "x:${assoc[@]@K}"` prints a
+/// trailing space). Pair order is GNU hash order (assoc.c:346), pinned by
+/// test_parameter_transform_prints_key_value_pairs.
+#[test]
+fn test_parameter_transform_at_k_trailing_separator_splits_away_unquoted() {
+    let output_path = "target/rubash-param-transform-atk-trailing-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "declare -A assoc; assoc[one]=alpha; assoc[two]=beta; echo assoc:${{assoc[@]@K}} > {output_path}; echo \"q:${{assoc[@]@K}}\" >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "assoc:two \"beta\" one \"alpha\"\nq:two \"beta\" one \"alpha\" \n",
+        "unquoted @K word drops the trailing separator; quoted face keeps it"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_transform_changes_case() {
+    let output_path = "target/rubash-param-transform-case-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("v=AbCd; echo ${{v@U}} ${{v@L}} > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "ABCD abcd\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_transform_applies_to_positional_parameters() {
+    let output_path = "target/rubash-param-transform-positional-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input =
+        format!("function p {{ echo ${{1@U}} ${{@@Q}} > {output_path}; }}; p alpha 'two words'");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "ALPHA 'alpha' 'two words'\n"
+    );
+    let _ = fs::remove_file(output_path);
+}

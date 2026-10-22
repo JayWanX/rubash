@@ -1,0 +1,270 @@
+use super::super::*;
+use std::fs;
+
+#[test]
+fn test_parameter_equals_assigns_default_only_when_unset() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-equals-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "unset v; : ${{v=default}}; echo unset:$v > {output_path}; v=; : ${{v=default}}; echo empty:$v >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "unset:default\nempty:\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_equals_assigns_before_regular_command() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-equals-command-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("unset v; echo ${{v=default}} $v > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "default default\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_array_element_parameter_assignment_writes_element() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-array-element-param-assign-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "arr=(); : ${{arr[1]:=bee}}; : ${{arr[1]:=skip}}; \
+         : ${{arr[0]=}}; : ${{arr[0]=skip}}; \
+         declare -A assoc; : ${{assoc[key]=ant}}; : ${{assoc[key]=skip}}; \
+         printf '<%s>|<%s>|<%s>\\n' \"${{arr[0]}}\" \"${{arr[1]}}\" \"${{assoc[key]}}\" > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "<>|<bee>|<ant>\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_assignment_expansion_assigns_inside_quoted_words() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-assign-quoted-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "unset v w; v=; printf '<%s>:%s\\n' \"${{v:=default}}\" \"$v\" > {output_path}; \
+         printf '<%s>:%s\\n' \"x${{w=word}}y\" \"$w\" >> {output_path}; \
+         unset cmd; ${{cmd:=echo}} command-position:$cmd >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "<default>:default\n<xwordy>:word\ncommand-position:echo\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_parameter_assignment_expansion_assigns_inside_assignment_values() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-assign-rhs-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "unset v x w y; x=${{v:=default}}; printf 'x=<%s> v=<%s>\\n' \"$x\" \"$v\" > {output_path}; \
+         y=pre${{w=word}}post; printf 'y=<%s> w=<%s>\\n' \"$y\" \"$w\" >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "x=<default> v=<default>\ny=<prewordpost> w=<word>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_nested_parameter_assignment_expansion_assigns_inner_word() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-assign-nested-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "unset a b; a=set; printf 'alt=<%s> b=<%s>\\n' \"${{a:+${{b:=bee}}}}\" \"$b\" > {output_path}; \
+         unset a b; printf 'def=<%s> b=<%s>\\n' \"${{a:-${{b:=bee}}}}\" \"$b\" >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "alt=<bee> b=<bee>\ndef=<bee> b=<bee>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_nested_parameter_assignment_expansion_assigns_outer_rhs() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-assign-nested-rhs-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "unset a b; printf 'outer=<%s> a=<%s> b=<%s>\\n' \"${{a:=${{b:=bee}}}}\" \"$a\" \"$b\" > {output_path}; \
+         unset a b; a=old; printf 'skip=<%s> a=<%s> b=<%s>\\n' \"${{a:=${{b:=bee}}}}\" \"$a\" \"${{b-unset}}\" >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "outer=<bee> a=<bee> b=<bee>\nskip=<old> a=<old> b=<unset>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+// rubash#402 (probe wt37-374 K074 / wt38 run402 p402m M1): `${RO:=new}`
+// against a readonly target is an expansion-time assignment failure —
+// GNU subst.c:8158-8166 leaves last_command_exit_value = EX_BADUSAGE (2)
+// before bash_variable_assignment_error(0) -> exp_jump_to_top_level
+// (DISCARD): the diagnostic goes to stderr, the printf never runs, and
+// the next line observes $? 2. Probed byte-identical on WSL GNU 5.3.0.
+#[test]
+fn test_parameter_assignment_expansion_rejects_readonly_targets() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-param-assign-readonly-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    std::env::remove_var("RUBASH_PARAM_ASSIGN_RO");
+    let input = format!(
+        "unset RUBASH_PARAM_ASSIGN_RO; readonly RUBASH_PARAM_ASSIGN_RO; \
+         printf '<%s>\\n' \"${{RUBASH_PARAM_ASSIGN_RO:=new}}\" > {shell_output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    // The DISCARD abort ends the failing list (last command here), so the
+    // run completes while $? carries EX_BADUSAGE (2).
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 2);
+    assert!(!output_path.exists());
+    std::env::remove_var("RUBASH_PARAM_ASSIGN_RO");
+}
+
+// rubash#402 (probe wt37-374 K075 / wt38 run402 p402m M3): same EX_BADUSAGE
+// (2) expansion failure through a nameref — the diagnostic names the TARGET
+// variable (GNU err_readonly on the resolved cell), the printf never runs,
+// and the next line observes $? 2.
+#[test]
+fn test_parameter_assignment_expansion_reports_readonly_nameref_target() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-param-assign-readonly-nameref-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    std::env::remove_var("RUBASH_PARAM_ASSIGN_RO_TARGET");
+    std::env::remove_var("RUBASH_PARAM_ASSIGN_RO_REF");
+    let input = format!(
+        "unset RUBASH_PARAM_ASSIGN_RO_TARGET RUBASH_PARAM_ASSIGN_RO_REF; \
+         readonly RUBASH_PARAM_ASSIGN_RO_TARGET; \
+         declare -n RUBASH_PARAM_ASSIGN_RO_REF=RUBASH_PARAM_ASSIGN_RO_TARGET; \
+         printf '<%s>\\n' \"${{RUBASH_PARAM_ASSIGN_RO_REF:=new}}\" > {shell_output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 2);
+    assert!(!output_path.exists());
+    std::env::remove_var("RUBASH_PARAM_ASSIGN_RO_TARGET");
+    std::env::remove_var("RUBASH_PARAM_ASSIGN_RO_REF");
+}
+
+#[test]
+fn test_parameter_assignment_expansion_rejects_positional_parameters() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-param-assign-positional-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let input = format!("set --; printf '<%s>\\n' \"${{1:=default}}\" > {shell_output_path}");
+    // wt37 (#374): run through the real CLI - the in-process tokenize+execute_ast
+    // posture cannot model this construct; the CLI run is byte-identical to WSL GNU
+    // Bash 5.3.0 (probe wt37-374 K073, target/issue-suites/results/wt37-374/run/).
+    let (_cli_out, cli_err, cli_code) = run_cli_script(&input);
+    assert_eq!(cli_code, Some(1), "stderr: {cli_err}");
+
+    assert!(!output_path.exists());
+}
+
+#[test]
+fn test_parameter_assignment_expansion_uses_existing_positional_and_special_values() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-param-assign-special-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "set -- ok; printf 'pos:<%s>\\n' \"${{1:=default}}\" > {output_path}; \
+         set -- ''; \
+         printf 'empty:<%s>\\n' \"${{1=default}}\" >> {output_path}; \
+         printf 'status:<%s>\\n' \"${{?:=default}}\" >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "pos:<ok>\nempty:<>\nstatus:<0>\n"
+    );
+    let _ = fs::remove_file(output_path);
+}

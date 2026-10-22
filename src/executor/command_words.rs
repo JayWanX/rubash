@@ -1,0 +1,720 @@
+use super::*;
+use crate::executor::markers::STORAGE_WORD_PREFIX;
+
+impl Executor {
+    /// GNU execute_cmd.c:4188 bind_lastarg: bind `$_` to `value`, strip the
+    /// export attribute (4191-4192 VUNSETATTR att_exported), and keep BOTH
+    /// stores in sync — the typed variable store shadows env_vars in
+    /// shell_variable_value (variable_state.rs), so a binding that lands only
+    /// in env_vars is invisible to `$_` expansion while `declare -p _` shows
+    /// the new value (rubash#321).
+    pub(in crate::executor) fn bind_underscore(&mut self, value: &str) {
+        // wt34/perf2: GNU's bind_lastarg (execute_cmd.c:4191
+        // bind_variable("_", value)) rebinds the cell unconditionally, but
+        // the observable state is the VALUE — a loop body whose last word
+        // equals the previous bind (`:` for thousands of iterations) leaves
+        // both stores byte-identical. The equality gates skip the key+value
+        // allocation pair (env mirror) and the value clone (typed store)
+        // for that unchanged case; attributes and the EXPORTED_VARS
+        // rewrite keep their existing (no-op-gated) logic untouched.
+        if self.shell_state.env_vars.get("_").map(String::as_str) != Some(value) {
+            self.shell_state
+                .env_vars
+                .insert("_".to_string(), value.to_string());
+        }
+        // perf17: GNU's attribute clear is a flag-bit test
+        // (variables.h:124-133 att_exported, VUNSETATTR at
+        // execute_cmd.c:4191) — an absent attribute is a no-op. The
+        // marker-string encoding expressed it as clone + split + join +
+        // reinsert of an UNCHANGED list (bind_lastarg runs after EVERY
+        // simple command: 67.7 of the 71.9 ms matcmd tail on the
+        // 20000-command null probe, i.e. 13.6% of the whole loop). A
+        // list containing neither `_` nor an empty fragment (the filter
+        // drops both) leaves the stored string byte-identical, so the
+        // membership pre-check — the same no-op gate perf11 used for the
+        // other marker lists (env_helpers unmark_env_name) — runs on a
+        // BORROW; the string is only materialized for a real rewrite.
+        //
+        // rubash#437: the pre-check must not scan the whole list. On a
+        // real shell __RUBASH_EXPORTED_VARS holds ~170 export names
+        // (~4 KB), and bind_underscore runs once per command, so the old
+        // `.split(DATA_DOLLAR).any(|n| n.is_empty() || n == "_")` was a
+        // 4 KB scan per loop iteration (the top self-time frame in a
+        // `while` arithmetic loop). The rewritten encoding makes it O(1):
+        //   * `_` membership -> the structured attr map, answered by
+        //     is_marked (EXPORTED_VARS is one of the ten attribute keys;
+        //     VarAttrs::flag). This is the only disjunct that can be true
+        //     for a well-formed list.
+        //   * the `name.is_empty()` disjunct is unreachable: every writer
+        //     of the serialized list (VarTable::replace_attr_list,
+        //     string_append, string_remove, restore_attr_string) filters
+        //     empty names before joining on DATA_DOLLAR, so a split of a
+        //     stored list never yields an empty fragment. Dropping it
+        //     removes the residual O(n) `windows(2)` separator scan the
+        //     first rewrite of this guard left behind (still 4 KB per
+        //     command) — bind_lastarg's observable effect is only the `_`
+        //     unexport, which is_marked covers exactly.
+        // `_` membership -> the structured attr map, answered by
+        // is_marked (EXPORTED_VARS is one of the ten attribute keys;
+        // VarAttrs::flag). Unset the bit through the structured map;
+        // the serialized string is rendered on demand and never
+        // rewritten here (#916).
+        let needs_rewrite = is_marked_var(&self.shell_state.env_vars, EXPORTED_VARS, "_");
+        if needs_rewrite {
+            self.shell_state.env_vars.unmark_name(EXPORTED_VARS, "_");
+        }
+        // perf17: GNU's second half is bind_variable("_", value) — one
+        // variable-cell update (variables.c). The old shape cloned the
+        // whole Variable (including its value string) to overwrite the
+        // value, then re-inserted under a freshly allocated "_" key;
+        // VariableStore::set's only refusal is a readonly binding, so the
+        // same outcome (readonly keeps the old value, everything else
+        // swaps the value in place, no other field moves) is a guarded
+        // get_mut with zero clones.
+        let old_readonly = self
+            .shell_state
+            .variables
+            .get("_")
+            .is_some_and(|old| old.readonly);
+        if !old_readonly {
+            if let Some(old) = self.shell_state.variables.get_mut("_") {
+                let unchanged =
+                    matches!(&old.value, crate::shell::ShellValue::Scalar(s) if s == value);
+                if !unchanged {
+                    old.value = crate::shell::ShellValue::Scalar(value.to_string());
+                }
+            }
+        }
+    }
+
+    pub(in crate::executor) fn update_underscore_parameter(&mut self, cmd: &CommandNode) {
+        if let Some(value) = cmd.words.last() {
+            // GNU execute_cmd.c:4746 (lastarg = lastword->word->word, the
+            // EXPANDED word list) + execute_cmd.c:4943 bind_lastarg(lastarg):
+            // `$_` is bound to the last word's text after execution — a plain
+            // string with internal quoting already removed; GNU has no
+            // in-band carriers. Rubash's parse-time word for a
+            // compound-assignment operand (`w=()`) still carries the
+            // COMPOUND_ASSIGNMENT_MARKER flag (`w=__RUBASH_CA1__()`), which
+            // must never reach a variable cell: `declare`'s full listing
+            // renders `$_` verbatim and the marker would leak into output
+            // (bashdb `info variables` runs a bare `declare` inside a process
+            // substitution).
+            // perf17: `str::replace` allocates even when the needle is
+            // absent; the marker appears only on compound-assignment
+            // operands, so the (alloc-free) `contains` gate keeps the
+            // common last-word text a borrow. GNU's lastarg is used
+            // as-is (execute_cmd.c:4746) — no rewrite happens there.
+            let visible: std::borrow::Cow<'_, str> = if value.contains(COMPOUND_ASSIGNMENT_MARKER) {
+                std::borrow::Cow::Owned(value.replace(COMPOUND_ASSIGNMENT_MARKER, ""))
+            } else {
+                std::borrow::Cow::Borrowed(value)
+            };
+            self.bind_underscore(&visible);
+        }
+    }
+
+    pub(in crate::executor) fn removes_unquoted_null_word(
+        &self,
+        cmd: &CommandNode,
+        index: usize,
+    ) -> bool {
+        if cmd.words.first().is_some_and(|word| word == "[[") {
+            return false;
+        }
+
+        // GNU subst.c:12026-12035 expand_word_internal: a null result is
+        // discarded only when the word carried no quoting — a quoted
+        // `${...}` that expands empty (`"${foo:-$@}"` with no positional
+        // parameters) still yields one empty field. raw_word_is_quoted
+        // skips ${...}/$() bodies, so only the word's own outer quoting
+        // counts here.
+        if cmd.word_metadata.get(index).is_some_and(|metadata| {
+            crate::executor::command_prepare::raw_word_is_quoted(Some(&metadata.raw))
+        }) {
+            return false;
+        }
+
+        cmd.word_kinds
+            .get(index)
+            .is_some_and(|kind| *kind == TokenKind::Variable)
+            || cmd
+                .word_metadata
+                .get(index)
+                .map(|metadata| metadata.raw.as_str())
+                .or_else(|| cmd.words.get(index).map(String::as_str))
+                .is_some_and(word_has_unquoted_command_substitution)
+    }
+
+    pub(in crate::executor) fn splits_unquoted_expanded_word(
+        &self,
+        cmd: &CommandNode,
+        index: usize,
+        expanded: &str,
+    ) -> bool {
+        // GNU general.c:480 (parse.y) marks `name[subscript]=value` an
+        // ASSIGNMENT word, and an assignment word is never field-split: the
+        // parser expands the subscript with expand_subscript_string and the
+        // value as an assignment RHS, neither of which splits. An unquoted
+        // `$(...)` or `$var` inside the SUBSCRIPT must therefore not break
+        // the word into `A[m` + `n]=v` -- the expanded word is consumed
+        // verbatim by execute_array_element_assignment.
+        if cmd
+            .array_element_assignments
+            .iter()
+            .any(|assignment| assignment.word_index == Some(index))
+        {
+            return false;
+        }
+        // GNU parse.y:5366 read_token_word / general.c:480 assignment(): a
+        // declaration-builtin operand whose RAW token is assignment-shaped
+        // (`name[sub]=value`) carries W_ASSIGNMENT and is never field-split,
+        // even when the subscript expands to text containing IFS
+        // whitespace (`declare A[$k]=v` stays one word). The check must use
+        // the raw token — the expanded text has already lost the quoting
+        // that would prove it is not an assignment word.
+        if matches!(
+            cmd.words.first().map(String::as_str),
+            Some("export" | "readonly" | "declare" | "typeset" | "local")
+        ) && cmd
+            .word_metadata
+            .get(index)
+            .is_some_and(|metadata| Self::raw_word_is_assignment(&metadata.raw))
+        {
+            return false;
+        }
+        // Every remaining term of the result below is conjoined with
+        // `field_split_would_change_word`, so a word that does not split at
+        // all (the common case: a plain `$i` or `$((...))` loop word whose
+        // expansion holds no IFS byte) yields false regardless of quoting.
+        // Compute it up front and bail before the four raw-word predicates
+        // each materialise the word as a `Vec<char>` (rubash#437).
+        let field_split_values = self.field_split_values(expanded);
+        let field_split_would_change_word = field_split_values.len() != 1
+            || field_split_values
+                .first()
+                .is_some_and(|field| field != expanded);
+        if !field_split_would_change_word {
+            return false;
+        }
+        // A word wrapped in quotes (e.g. `"$(cmd) extra"`) keeps its spaces
+        // together: quote removal happens after field splitting in Bash, so
+        // quoted words must not be split even when they expand to whitespace.
+        // Quote state comes from the raw word only: word_quotes (the
+        // lexer quote segments) also records quotes nested inside a braced
+        // parameter expansion (e.g. ${1-"$@"}), but those are word syntax
+        // of the expansion, not outer quoting, so they must not suppress
+        // field splitting of the unquoted word's result. raw_word_is_quoted
+        // skips ${...}, $(), backticks and $'...'/$"..." bodies.
+        let word_is_quoted = cmd
+            .word_metadata
+            .get(index)
+            .map(|metadata| {
+                crate::executor::command_prepare::raw_word_is_quoted(Some(&metadata.raw))
+            })
+            .unwrap_or(false);
+        let unquoted_variable = cmd
+            .word_kinds
+            .get(index)
+            .is_some_and(|kind| *kind == TokenKind::Variable)
+            && !word_is_quoted;
+        let unquoted_dynamic_parameter = unquoted_variable
+            && cmd
+                .words
+                .get(index)
+                .and_then(|word| dynamic_scalar_parameter_name(word))
+                .is_some_and(|name| self.dynamic_parameter_is_set(name));
+        let unquoted_command_substitution = cmd
+            .word_metadata
+            .get(index)
+            .map(|metadata| metadata.raw.as_str())
+            .or_else(|| cmd.words.get(index).map(String::as_str))
+            .is_some_and(word_has_unquoted_command_substitution);
+        let unquoted_indirect_name_list = cmd
+            .words
+            .get(index)
+            .is_some_and(|word| word_is_unquoted_indirect_name_list(word));
+        let unquoted_embedded_parameter = cmd
+            .word_metadata
+            .get(index)
+            .map(|metadata| metadata.raw.as_str())
+            .or_else(|| cmd.words.get(index).map(String::as_str))
+            .is_some_and(raw_word_has_unquoted_parameter_expansion_outside_quotes);
+
+        (unquoted_variable && !unquoted_dynamic_parameter && field_split_would_change_word)
+            || (unquoted_embedded_parameter && field_split_would_change_word)
+            || (unquoted_command_substitution && field_split_would_change_word)
+            || (unquoted_indirect_name_list && field_split_would_change_word)
+    }
+
+    /// `${arr[@]+"${arr[@]}"}` (and the `${arr+"${arr[@]}"}` spelling
+    /// bash-completion's _comp_get_words uses) whole-word guard — GNU
+    /// subst.c `+` operator: a set array's alternative expands as the
+    /// quoted array expansion, one word per element. Only the exact
+    /// self-referential idiom is claimed; everything else falls through to
+    /// the general expander.
+    pub(in crate::executor) fn guarded_quoted_array_guard_values(
+        &self,
+        raw: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let raw = raw?;
+        let inner = raw.strip_prefix("${")?.strip_suffix("}")?;
+        let plus = inner.find('+')?;
+        let (guard_name, alt) = inner.split_at(plus);
+        let alt = &alt[1..];
+        // The alternative must be exactly the quoted array expansion
+        // `"${name[@]}"` (or `[*]`), and the guard's name must be the same
+        // array — with or without the element subscript (GNU checks the
+        // same variable; `${arr+...}` and `${arr[@]+...}` both test
+        // whether the array is set).
+        let array_name = alt
+            .strip_prefix("\"${")
+            .and_then(|rest| rest.strip_suffix("[@]}\""))
+            .or_else(|| {
+                alt.strip_prefix("\"${")
+                    .and_then(|rest| rest.strip_suffix("[*]}\""))
+            })?;
+        if !is_shell_name(array_name) {
+            return None;
+        }
+        let guard_base = guard_name
+            .strip_suffix("[@]")
+            .or_else(|| guard_name.strip_suffix("[*]"))
+            .unwrap_or(guard_name);
+        if guard_base != array_name {
+            return None;
+        }
+        Some(self.array_at_word_values(alt).unwrap_or_default())
+    }
+
+    pub(in crate::executor) fn expand_for_word_values_result(
+        &mut self,
+        word: &str,
+        raw: Option<&str>,
+        metadata: Option<&WordMetadata>,
+    ) -> Result<Vec<String>, String> {
+        // A fully single-quoted for-list item carries literal data only
+        // (the lexer already removed the outer quotes); any double quotes
+        // left in the value are characters, not operators. Without this
+        // fast path expand_word re-removed them, so
+        // `for testcmd in 'set -- ${foo="$*"}'` iterated over
+        // `set -- ${foo=$*}` (posixexp5 lost the testcmd echo).
+        if super::command_prepare::raw_word_is_fully_single_quoted(raw) {
+            // This fast path stands in for the whole expansion walker, so it
+            // must return what the walker returns for this word. Two
+            // downstream finalisation steps were both missing:
+            //
+            //  * the quote-data carrier decode. The `'`-quoted interior
+            //    carries DATA_DOLLAR / DATA_BACKTICK / DATA_DQUOTE for every
+            //    expansion-trigger byte inside it (lexer/quotes.rs:321/325/329;
+            //    markers.rs:86-95 and :135), and the walker's last step
+            //    decodes the whole family (decode_word_position_carriers,
+            //    markers.rs:378). GNU keeps no marker inside a single-quoted
+            //    span — parse.y:3877 parse_matched_pair reads it literally and
+            //    subst.c:4807 dequote_string is the only removal.
+            //  * the word-prefix marker drop. The lexer prefixes a word that
+            //    begins with a quoted tilde with QUOTED_WORD_PREFIX (0x1b,
+            //    markers.rs:107) so no later tilde pass touches it, and the
+            //    walker drops it in expand_marked_or_special_word
+            //    (expand_word.rs:515).
+            //
+            // Restoring only '\u{1f}' bound the loop variable with live
+            // \x18/\x1a carriers, and dropping nothing left the \x1b prefix on
+            // `for v in '~'` (rubash#629: both leaked into the compound
+            // element, which serialises the value verbatim).
+            let word = word
+                .strip_prefix(crate::executor::markers::QUOTED_WORD_PREFIX)
+                .unwrap_or(word);
+            return Ok(vec![
+                crate::executor::markers::decode_word_position_carriers(word),
+            ]);
+        }
+        let suppress_glob = word.starts_with(crate::executor::markers::QUOTED_WORD_PREFIX)
+            || word.starts_with(STORAGE_WORD_PREFIX)
+            || super::command_prepare::raw_word_suppresses_pathname_expansion(raw, metadata);
+        // GNU subst.c param_expand expands a for-list word exactly like a
+        // command word, so the braced-alternate word-list fan-outs apply
+        // here too (braced_alternate_word_values): `${b[@]+"${b[@]:0:2}"}`
+        // with b=("" x) iterates over TWO words, the first an empty quoted
+        // field (parameter_brace_expand_rhs sets *qdollaratp for the
+        // multi-word rhs, subst.c:8023-8027; rubash#315).
+        if !word.starts_with(STORAGE_WORD_PREFIX) {
+            if let Some(values) = self.braced_alternate_word_values(word, raw) {
+                return Ok(values);
+            }
+        }
+        if let Some(values) = self.quoted_positional_at_word_values_with_raw(word, raw, None) {
+            return Ok(values);
+        }
+        // GNU subst.c parameter_brace_expand's `+` arm: the alternative word
+        // expands with full quoting, so the self-referential guard idiom
+        // `${arr[@]+"${arr[@]}"}` (bash-completion's
+        // ${v+"${a[@]}"} pattern, selfref.rubash bucket) yields one quoted
+        // word per element — never IFS-split, never one joined argument.
+        // The single-string operator expander cannot carry that shape.
+        if let Some(values) = self.guarded_quoted_array_guard_values(raw) {
+            return Ok(values);
+        }
+        if let Some(values) = self.array_at_word_values(word) {
+            if word_is_unquoted_array_list_expansion(word) {
+                return Ok(field_split_array_values_with_ifs(
+                    values,
+                    self.shell_state.env_vars.get("IFS").map(String::as_str),
+                ));
+            }
+            return Ok(values);
+        }
+        // A fully double-quoted for-list word (STORAGE_WORD_PREFIX marker)
+        // runs the same quoted braced-alternate fan-outs the command-argv
+        // path runs (command_prepare.rs): GNU subst.c:10119-10128
+        // parameter_brace_expand calls chk_atstar on every valid array
+        // reference BEFORE the operator switch, so a double-quoted
+        // `"${a[@]:-}"` sets quoted_dollar_at (subst.c:7635-7639) even with
+        // the `:-` operator present; with the array set and non-null the
+        // `-`/`:-` arm just uses TEMP (subst.c:10350-10390), the
+        // string_list_dollar_at value whose element separators survive
+        // double-quote joining — one word per element (arrayfunc.c:1552).
+        // For-in lists expand words exactly like command words
+        // (subst.c:13219 expand_word_list_internal), so the argv path's
+        // STORAGE_WORD_PREFIX block applies here unchanged; without it the
+        // for path fell to the scalar operator expander, which joins
+        // `[@]` with spaces (parameter_operator_value) and lost the
+        // element boundaries (bash_it.sh `for f in "${BASH_IT_LIB[@]:-}"`).
+        if word.starts_with(STORAGE_WORD_PREFIX) {
+            if let Some(values) = self.quoted_braced_alternate_positional_at_values(word) {
+                return Ok(values);
+            }
+            if let Some(values) = self.braced_alternate_word_values(word, raw) {
+                return Ok(values);
+            }
+        }
+        // GNU runs brace expansion before parameter expansion; the brace
+        // scanner skips dollar-brace bodies, so a dollar-brace in the word
+        // does not suppress the split (foo{bar,${var.} -> foobar foobaz.).
+        if self.is_brace_expand_enabled() {
+            let braced = super::command_prepare::expand_braces_with_optional_raw(word, raw);
+            if braced.len() > 1 {
+                let values = braced
+                    .into_iter()
+                    .map(|word| self.expand_for_brace_word_values(&word, raw, suppress_glob))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                return Ok(values);
+            }
+        }
+
+        self.expand_for_brace_word_values(word, raw, suppress_glob)
+    }
+
+    fn expand_for_brace_word_values(
+        &mut self,
+        word: &str,
+        raw: Option<&str>,
+        suppress_glob: bool,
+    ) -> Result<Vec<String>, String> {
+        let mut expanded = self.expand_word(word);
+        if expanded.contains("<(") || expanded.contains(">(") {
+            expanded = self
+                .materialize_assignment_process_substitutions(&expanded)
+                .unwrap_or(expanded);
+        }
+        if for_word_has_unquoted_expansion(word, raw) {
+            // Field splitting follows $IFS (builtins/eval.def word_list /
+            // word_expand: split on IFS whitespace and delimiters), not on
+            // generic Unicode whitespace. `IFS=$'\001' for x in $a` must
+            // split on \001 exactly like an external command's word list.
+            //
+            // GNU subst.c:13219 expand_word_list_internal splits the word
+            // and THEN pathname-expands each resulting field
+            // (glob_expand_word_list): a glob character that reaches the
+            // field only through an expansion boundary still expands —
+            // bash-it's reloader `for f in "$BASH_IT/enabled"/*"${type}.bash"`
+            // with type='' never matched its enabled components because the
+            // split-only path returned the literal `*.bash`
+            // (rubash#316: the aliases completion and its
+            // _bash-it-component-completion-callback-on-init-aliases were
+            // never sourced).
+            let fields = self.field_split_values(&expanded);
+            if suppress_glob {
+                return Ok(fields.into_iter().map(finalize_for_list_value).collect());
+            }
+            let mut values = Vec::with_capacity(fields.len());
+            for field in fields {
+                match glob::pathname_expand_word(&field, &self.shell_state.env_vars) {
+                    glob::PathnameExpansion::Matches(matches) => values.extend(matches),
+                    glob::PathnameExpansion::NoMatch => values.push(finalize_for_list_value(field)),
+                    glob::PathnameExpansion::Fail(pattern) => return Err(pattern),
+                }
+            }
+            return Ok(values);
+        }
+        if suppress_glob {
+            // A for-list value is a bound VALUE, not split transport: drop
+            // the ANSI_C_IFS_GUARD pairs (decoded `$'...'` blanks) the way
+            // argv materialization does (rubash#379; array27.sub `for k in
+            // $\'\t'` must bind the bare tab). GNU subst.c:4807
+            // dequote_string strips the CTLESC quoting pairs off every word
+            // once pathname expansion has decided, quoted or not — a
+            // double-quoted `"f*"` binds plain `f*` (glob-active on later
+            // unquoted use), exactly like the single-quoted fast path and
+            // plain assignment do. Without this the loop variable kept the
+            // CTLESC carrier (${#p} is 3, unquoted $p never globs, and an
+            // unquoted $p in a case pattern stays literal — issue #675:
+            // per-arm expand_word_leave_quoted (execute_cmd.c:3712) sees
+            // quoted text where GNU sees plain data).
+            return Ok(vec![finalize_for_list_value(expanded)]);
+        }
+        // Apply glob expansion for for-loop words
+        match glob::pathname_expand_word(&expanded, &self.shell_state.env_vars) {
+            glob::PathnameExpansion::Matches(matches) => Ok(matches),
+            glob::PathnameExpansion::NoMatch => Ok(vec![finalize_for_list_value(expanded)]),
+            glob::PathnameExpansion::Fail(pattern) => Err(pattern),
+        }
+    }
+
+    pub(in crate::executor) fn field_split_values(&self, value: &str) -> Vec<String> {
+        field_split_values_with_ifs(
+            // ANSI_C_IFS_GUARD (lexer/quotes.rs) marks decoded `$'...'`
+            // blanks as literal word data; convert it to IFS_GLUE -- the
+            // splitters' existing protection carrier -- so the field splitter
+            // keeps the blank inside the current field (rubash#379: GNU
+            // splits only expansion results, never source-word bytes).
+            // E400-aware: user U+E401 (E400 E401) is data (rubash#735).
+            &crate::executor::markers::ansi_c_ifs_guard_to_ifs_glue(value),
+            self.shell_state.env_vars.get("IFS").map(String::as_str),
+        )
+    }
+
+    pub(in crate::executor) fn expand_escaped_indirect_parameter_literal(
+        &self,
+        value: &str,
+    ) -> Option<String> {
+        let marker = "\\${$";
+        let start = value.find(marker)?;
+        let mut output = String::new();
+        output.push_str(&value[..start]);
+        let mut index = start + marker.len();
+        let rest = &value[index..];
+        let mut name = String::new();
+        for ch in rest.chars() {
+            if !is_shell_name_char(ch) {
+                break;
+            }
+            name.push(ch);
+            index += ch.len_utf8();
+        }
+        if name.is_empty() {
+            return None;
+        }
+        let tail = &value[index..];
+        let end = tail.find('}')?;
+        let resolved = self.expand_embedded_parameters(&format!("${name}"));
+        output.push_str("${");
+        output.push_str(&resolved);
+        output.push_str(&tail[..end]);
+        output.push('}');
+        output.push_str(&tail[end + 1..]);
+        Some(output)
+    }
+}
+
+fn dynamic_scalar_parameter_name(word: &str) -> Option<&str> {
+    let name = word
+        .strip_prefix("${")
+        .and_then(|word| word.strip_suffix('}'))
+        .or_else(|| word.strip_prefix('$'))?;
+    is_shell_name(name).then_some(name)
+}
+
+fn word_is_unquoted_indirect_name_list(word: &str) -> bool {
+    let Some(inner) = crate::executor::parameter_ops::whole_word_braced_parameter_body(word)
+        .and_then(|body| body.strip_prefix('!'))
+    else {
+        return false;
+    };
+
+    inner
+        .strip_suffix("[@]")
+        .or_else(|| inner.strip_suffix("[*]"))
+        .is_some_and(|name| !name.is_empty())
+        || inner
+            .strip_suffix('*')
+            .or_else(|| inner.strip_suffix('@'))
+            .is_some_and(|prefix| !prefix.is_empty())
+}
+
+pub(in crate::executor) fn raw_word_has_unquoted_parameter_expansion(raw: &str) -> bool {
+    // Fast reject (rubash#437): a parameter expansion needs a literal `$`;
+    // without one the answer is false and the Vec<char> collection is pure
+    // overhead. Loop-heavy scripts expand plain `$i` words that are often
+    // already de-quoted to no `$` at all on this path.
+    if !raw.as_bytes().contains(&b'$') {
+        return false;
+    }
+    let chars = raw.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] == '\\' {
+            index += 2;
+            continue;
+        }
+        if chars[index] == '$' {
+            match chars.get(index + 1).copied() {
+                Some('{') => {
+                    if chars.get(index + 2).is_some_and(|ch| {
+                        is_shell_name_start(*ch)
+                            || matches!(*ch, '@' | '*' | '#' | '?' | '$' | '!' | '-' | '0')
+                    }) {
+                        return true;
+                    }
+                }
+                Some(ch)
+                    if is_shell_name_start(ch)
+                        || matches!(ch, '@' | '*' | '#' | '?' | '$' | '!' | '-' | '0') =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+/// rubash#743: per-character quote state for field-split eligibility.
+/// Returns true only if the raw word contains a parameter expansion (`$name`,
+/// `${...}`, `$@`, etc.) OUTSIDE any `'...'`/`"..."` segment. GNU tracks
+/// quoting per character (parse.y read_token_word; subst.c:11639-11673
+/// CTLESC-protects quoted source chars), so a mixed word like `a$w"b"`
+/// field-splits the unquoted `$w` result while the quoted `"b"` stays
+/// joined. The word-level `raw_word_is_quoted` is too coarse: it suppresses
+/// splitting for the whole word when any quote appears.
+pub(in crate::executor) fn raw_word_has_unquoted_parameter_expansion_outside_quotes(
+    raw: &str,
+) -> bool {
+    if !raw.as_bytes().contains(&b'$') {
+        return false;
+    }
+    let chars = raw.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            index += 2;
+            continue;
+        }
+        // Skip $'...', $"...", ${...}, $(...) spans: quotes inside are word
+        // syntax of the expansion, not outer quoting (same rule as
+        // raw_word_is_quoted).
+        if ch == '$' {
+            match chars.get(index + 1) {
+                Some('\'') | Some('"') => {
+                    let quote = chars[index + 1];
+                    index += 2;
+                    while index < chars.len() && chars[index] != quote {
+                        if chars[index] == '\\' {
+                            index += 1;
+                        }
+                        index += 1;
+                    }
+                    index += 1;
+                    continue;
+                }
+                Some('{') => {
+                    // A braced span IS a parameter expansion: when the `$`
+                    // introducing it sits outside any quote segment, the
+                    // word carries an unquoted expansion regardless of what
+                    // the body contains (quotes inside the body are the
+                    // expansion's own word syntax, not outer quoting).
+                    // Skipping the body wholesale hid the expansion from
+                    // this scan and cost `${assoc[@]@K}`, `${$+<newline>}`
+                    // and the nested `\"${a[@]}\"` guard fragment their
+                    // field split (rubash#795/#796): an escaped `\"` is
+                    // data, never a quote toggle, so `\"${x}\"` must
+                    // classify exactly like a bare `${x}`.
+                    if !in_single && !in_double {
+                        return true;
+                    }
+                    // Quoted at the introducer (`"${x}"`, `'${x}'`): the
+                    // span's RESULT never field-splits, so keep scanning
+                    // after the body. Skip to matching } (nested braces
+                    // handled by depth).
+                    let mut depth = 1usize;
+                    index += 2;
+                    while index < chars.len() && depth > 0 {
+                        if chars[index] == '{' {
+                            depth += 1;
+                        } else if chars[index] == '}' {
+                            depth -= 1;
+                        } else if chars[index] == '\\' {
+                            index += 1;
+                        }
+                        index += 1;
+                    }
+                    continue;
+                }
+                Some('(') => {
+                    // $(...) — skip to matching ). Handled as a unit; the
+                    // command-substitution split path has its own check.
+                    let mut depth = 1usize;
+                    index += 2;
+                    while index < chars.len() && depth > 0 {
+                        if chars[index] == '(' {
+                            depth += 1;
+                        } else if chars[index] == ')' {
+                            depth -= 1;
+                        } else if chars[index] == '\\' {
+                            index += 1;
+                        }
+                        index += 1;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            // Unquoted $name / $@ / $1 etc. outside quotes: eligible.
+            if !in_single && !in_double {
+                match chars.get(index + 1).copied() {
+                    Some(ch)
+                        if is_shell_name_start(ch)
+                            || matches!(ch, '@' | '*' | '#' | '?' | '$' | '!' | '-' | '0') =>
+                    {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+        } else if ch == '"' && !in_single {
+            in_double = !in_double;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Drop the ANSI_C_IFS_GUARD pairs (decoded `$'...'` blanks) at a VALUE
+/// boundary: the guard is field-split transport (rubash#379), and a bound
+/// for-list value is final data -- the same contract argv materialization
+/// (command_prepare::materialize_expanded_command_word) applies.
+/// E400-aware: user U+E401 data (E400 E401) must survive (rubash#735).
+pub(in crate::executor) fn strip_for_word_guards(value: &str) -> String {
+    crate::executor::markers::strip_ansi_c_ifs_guard(value)
+}
+
+/// Storage-side half of GNU dequote_string (subst.c:4807) for for-list
+/// bindings: after field splitting and pathname expansion have decided,
+/// every bound word is dequoted — CTLESC quoting pairs reduce to their data
+/// character — whether or not globbing ran. See expand_for_brace_word_values.
+fn finalize_for_list_value(value: String) -> String {
+    crate::executor::markers::dequote_ctlesc_pairs(&strip_for_word_guards(&value))
+}

@@ -1,0 +1,229 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rust:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check UTF-8 boundary hygiene
+        run: bash scripts/check-utf8-boundary-hygiene.sh
+
+      - name: Prepare external bashdb fixture
+        run: |
+          git clone --depth 1 --branch bash-5.2 https://github.com/Trepan-Debuggers/bashdb.git target/bashdb-source
+          cd target/bashdb-source
+          bash ./autogen.sh
+          ./configure --prefix="$GITHUB_WORKSPACE/target/bashdb-install"
+          make -j2
+          make install
+          cd "$GITHUB_WORKSPACE"
+          bash scripts/setup-bashdb-fixture.sh target/bashdb-install
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run Rust library tests
+        run: cargo nextest run --lib --profile ci
+
+      # #824 mechanism: the marker-leak golden suite is the only gate that
+      # feeds user-literal marker text (typed `__RUBASH_*` ASCII, $'\uE3xx'
+      # PUA data, raw C0 bytes) to the decode boundaries — the in-binary
+      # debug_assert family this suite pins is armed only in dev-profile
+      # builds of the spawned shell, and no other CI lane ran these targets
+      # (the #824 panics therefore never met a gate). Hermetic, fast, hard
+      # gate (unlike the continue-on-error cli_tests lane below).
+      - name: Run marker leak golden tests
+        run: cargo nextest run --test marker_leak_golden --test issue824_marker_decode_boundary_regressions --profile ci
+
+      - name: Run compatibility CLI tests
+        continue-on-error: true
+        run: cargo nextest run --test cli_tests --profile ci
+
+  rust-macos:
+    name: Rust tests (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The bashdb fixture is only required by cli_tests (continue-on-error
+      # above); lib tests run fixture-free. This job gives the #[cfg(unix)]
+      # engine tests (signal tables, PATH walk, wait decode, fd extras)
+      # their first real darwin execution -- cross-target-check only proves
+      # they compile FOR darwin.
+      - name: Run Rust library tests
+        run: cargo test --lib
+
+  regression:
+    name: GNU regression goldens and canaries
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # rubash#945: the only lane that compiles #[cfg(all(test, windows))]
+      # code. The ubuntu/macos lib-test jobs cfg it out, and `cargo test
+      # --test regression` below builds the lib WITHOUT cfg(test) — so a
+      # broken windows-only test signature (4aaedfb8 VarTable, cd.rs)
+      # shipped green. Runs the tests too, not just --no-run: these
+      # windows-gated unit tests otherwise never execute in CI.
+      - name: Run Rust library tests
+        run: cargo test --lib
+
+      # wt4/ci lane (2026-09-27): byte-pinned regression suite.
+      # - tests/regression/golden/*.gnu.{out,err} are GNU Bash 5.3.0
+      #   captures (WSL, /usr/local/bin/bash) of the fixture scripts under
+      #   tests/regression/fixtures/; the runner has no WSL, so the
+      #   recorded bytes are the baseline (the re-capture command is
+      #   documented in each fixture header).
+      # - tests/regression/snapshots/*.snap are TODAY's-rubash snapshots
+      #   of GNU upstream suite slices; a diff means a semantic shift and
+      #   requires a conscious re-record with
+      #   RUBASH_REGRESSION_RECORD=1 cargo test --test regression.
+      # Runs on windows because the snapshots were recorded against the
+      # Windows environment (tests/gnu-compat/helpers-win PE helpers,
+      # emulated-coreutils paths); per-test bounds are enforced inside
+      # the suite (60-360s), the job timeout is the outer backstop.
+      - name: Run regression suite (goldens, snapshots, perf canaries)
+        run: cargo test --test regression
+
+      # Re-record protocol runner leg (see tests/regression.rs module
+      # header): record the suite snapshots with THIS runner's engine and
+      # upload the bytes. When the comparison step above fails because the
+      # committed .snap files are stale, this artifact IS the replacement
+      # content — commit it with the behavior-fix reference per slice
+      # instead of hand-transcribing the truncated panic window.
+      - name: Record upstream-suite snapshots (golden-refresh artifact)
+        if: always()
+        shell: bash
+        run: RUBASH_REGRESSION_RECORD=1 cargo test --test regression upstream_suite_slice_snapshots
+
+      - name: Upload recorded snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-snapshots
+          path: tests/regression/snapshots/
+          if-no-files-found: error
+
+  cross-target-check:
+    name: Cross-target check (linux/darwin/android)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin, aarch64-linux-android, armv7-linux-androideabi
+
+      - name: Check Linux target
+        run: cargo check --target x86_64-unknown-linux-gnu
+
+      - name: Check macOS target
+        run: cargo check --target aarch64-apple-darwin
+
+      - name: Check tests on Linux target
+        run: cargo check --tests --target x86_64-unknown-linux-gnu
+
+      - name: Check tests on macOS target
+        run: cargo check --tests --target aarch64-apple-darwin
+
+      # Android (bionic): check-only, no linking — the runner has no NDK.
+      # Both targets are Tier 2, so rustup's rust-std is enough for cargo
+      # check. Mirrors the musl/OpenHarmony gate (unixwin/niubash#210).
+      - name: Check Android aarch64 target
+        run: cargo check --target aarch64-linux-android
+
+      - name: Check Android armv7 target
+        run: cargo check --target armv7-linux-androideabi
+
+  shell-functionality:
+    name: Shell functionality tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build rubash
+        run: cargo build
+
+      - name: Run shell functionality tests
+        run: bash tests/run_all_tests.sh
+
+  bash-upstream-progress:
+    name: Bash upstream test progress
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run GNU Bash upstream tests
+        run: scripts/run-bash-upstream-tests.sh
+
+      - name: Publish progress summary
+        if: always()
+        run: |
+          if [[ -f target/bash-upstream-tests/summary.md ]]; then
+            cat target/bash-upstream-tests/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Bash upstream summary was not generated." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload upstream test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bash-upstream-test-progress
+          path: |
+            target/bash-upstream-tests/summary.md
+            target/bash-upstream-tests/results.tsv
+            target/bash-upstream-tests/logs
+            target/issue-suites/results/bash-upstream-tests

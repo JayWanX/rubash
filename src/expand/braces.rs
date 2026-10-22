@@ -1,0 +1,893 @@
+//! Brace expansion for {a,b,c} comma-separated lists and {1..5}/{a..e} sequences.
+//!
+//! GNU Bash source ownership:
+// - braces.c
+
+/// Expand brace patterns in a word, returning multiple words.
+/// Handles {a,b,c} comma-separated lists and {1..5}, {a..e} sequences.
+/// Returns a single-element vec if no braces found (no expansion needed).
+pub fn expand_braces(word: &str) -> Vec<String> {
+    brace_expand(word)
+}
+
+fn brace_expand(text: &str) -> Vec<String> {
+    // GNU braces.c brace_expand recursion
+    let Some((open, close, etype)) = find_first_valid_brace(text) else {
+        return vec![text.to_string()];
+    };
+    let preamble = &text[..open];
+    let amble = &text[open + 1..close];
+    let postamble = &text[close + 1..];
+
+    let tack: Vec<String> = if etype == BRACE_SEQ {
+        // valid_seqterm already passed, try expand_seqterm
+        if let Some(seq) = expand_range(amble) {
+            seq
+        } else {
+            // GNU: if sequence expansion fails (overflow etc) and postamble non-empty,
+            // treat the whole brace as literal and recurse on postamble.
+            // If postamble empty, return literal whole text.
+            if !postamble.is_empty() {
+                let mut literal = Vec::new();
+                literal.push(format!("{{{}}}", amble));
+                literal
+            } else {
+                return vec![text.to_string()];
+            }
+        }
+    } else if etype == BRACE_COMMA {
+        expand_amble(amble)
+    } else {
+        vec![format!("{{{}}}", amble)]
+    };
+
+    // array_concat(preamble, tack)
+    let mut result: Vec<String> = Vec::new();
+    if preamble.is_empty() && tack.is_empty() {
+        result.push(String::new());
+    } else if preamble.is_empty() {
+        result.extend(tack.clone());
+    } else if tack.is_empty() {
+        result.push(preamble.to_string());
+    } else {
+        // preamble is single string, tack is Vec<String>
+        for t in &tack {
+            result.push(format!("{}{}", preamble, t));
+        }
+    }
+    // handle empty tack case where result is just preamble?
+    if result.is_empty() {
+        result.push(preamble.to_string());
+    }
+
+    if postamble.is_empty() {
+        return result;
+    }
+    let post_expanded = brace_expand(postamble);
+    // array_concat(result, post_expanded)
+    let mut final_result = Vec::new();
+    for r in &result {
+        for p in &post_expanded {
+            final_result.push(format!("{}{}", r, p));
+        }
+    }
+    // handle cases where result or post_expanded is empty?
+    if final_result.is_empty() {
+        return result;
+    }
+    final_result
+}
+
+fn expand_amble(amble: &str) -> Vec<String> {
+    let parts = split_brace_commas(amble);
+    // GNU braces.c expand_amble: every top-level alternative is brace-expanded
+    // and the results are appended (array_concat) — a list, not a cross
+    // product. Empty alternatives are KEPT as empty elements here; the
+    // resulting bare empty word is dropped later by ordinary unquoted
+    // empty-word removal. That is what makes
+    //   a{,}b  -> [ab][ab]   {a,}x -> [ax][x]   x{a,} -> [xa][x]
+    // while
+    //   {a,}   -> [a]        (the trailing empty word is discarded)
+    // and
+    //   {,}    -> one empty word (printf '<%s>' prints <>)
+    let mut result: Vec<String> = Vec::new();
+    for part in parts {
+        result.extend(brace_expand(part));
+    }
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    result
+}
+
+const BRACE_COMMA: i32 = 0x01;
+const BRACE_SEQ: i32 = 0x02;
+// const BRACE_NONE: i32 = 0x04;
+
+fn valid_seqterm(amble: &str) -> bool {
+    // Port of braces.c valid_seqterm minimal check
+    let Some(pos) = amble.find("..") else {
+        return false;
+    };
+    let lhs = &amble[..pos];
+    let rhs = &amble[pos + 2..];
+    if lhs.is_empty() || rhs.is_empty() {
+        return false;
+    }
+    if lhs.starts_with('.') || rhs.starts_with('}') {
+        return false;
+    }
+    // lhs type
+    let lhs_is_int = lhs
+        .as_bytes()
+        .first()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+        || ((lhs.starts_with('+') || lhs.starts_with('-'))
+            && lhs
+                .as_bytes()
+                .get(1)
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false));
+    let lhs_is_char = lhs.len() == 1 && lhs.as_bytes()[0].is_ascii_alphabetic();
+    if !lhs_is_int && !lhs_is_char {
+        return false;
+    }
+    // rhs type: need to handle possible increment part ".."
+    // Extract first segment of rhs before next ".." if any
+    let rhs_first = if let Some(p) = rhs.find("..") {
+        &rhs[..p]
+    } else {
+        rhs
+    };
+    if rhs_first.is_empty() {
+        return false;
+    }
+    let rhs_is_int = rhs_first
+        .as_bytes()
+        .first()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+        || ((rhs_first.starts_with('+') || rhs_first.starts_with('-'))
+            && rhs_first
+                .as_bytes()
+                .get(1)
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false));
+    let rhs_is_char = rhs_first.len() == 1 && rhs_first.as_bytes()[0].is_ascii_alphabetic();
+    if !rhs_is_int && !rhs_is_char {
+        return false;
+    }
+    // Types must match (both int or both char)
+    let lhs_is_int_type = lhs_is_int;
+    let rhs_is_int_type = rhs_is_int;
+    if lhs_is_int_type != rhs_is_int_type {
+        return false;
+    }
+    // Also ensure rhs segment is not empty and not starting with '}'
+    true
+}
+
+/// UTF-8 bytes of markers.rs ASSIGN_DATA_DQUOTE (U+E302) — the stored form
+/// of a `"` in de-quoted assignment text.
+const DQUOTE_CARRIER: &[u8] = "\u{E302}".as_bytes();
+/// UTF-8 bytes of markers.rs ASSIGN_DATA_SQUOTE (U+E301) — the stored form
+/// of a `'` in de-quoted assignment text.
+const SQUOTE_CARRIER: &[u8] = "\u{E301}".as_bytes();
+
+/// True for a `$` byte OR its cooked-word carrier DATA_DOLLAR (U+001F,
+/// markers.rs): quoting already turned this dollar into data, so the brace
+/// scanners must give a following `{` the same treatment GNU gives `${` —
+/// braces.c:679-680 brace_gobbler "treat ${...} like \{...}" — and never
+/// read it as brace syntax. A cooked `'${x,y}'` word arrives here as
+/// `\x1f{x,y}`; without this predicate the scanner expands the member list
+/// that quoting made literal.
+fn is_dollar_or_carrier(byte: u8) -> bool {
+    byte == b'$' || byte == DATA_DOLLAR_BYTE
+}
+
+/// UTF-8 byte of markers.rs DATA_DOLLAR (U+001F) — single-byte C0 carrier.
+const DATA_DOLLAR_BYTE: u8 = 0x1f;
+
+/// Returns the DATA-quote carrier starting at `i`, if any.
+fn data_quote_carrier_at(bytes: &[u8], i: usize) -> Option<&'static [u8]> {
+    if bytes.len() >= i + DQUOTE_CARRIER.len()
+        && &bytes[i..i + DQUOTE_CARRIER.len()] == DQUOTE_CARRIER
+    {
+        Some(DQUOTE_CARRIER)
+    } else if bytes.len() >= i + SQUOTE_CARRIER.len()
+        && &bytes[i..i + SQUOTE_CARRIER.len()] == SQUOTE_CARRIER
+    {
+        Some(SQUOTE_CARRIER)
+    } else {
+        None
+    }
+}
+
+/// Skips a DATA-quote span opened by `carrier`, mirroring GNU braces.c
+/// brace_gobbler's quoted-state skip: everything until the same carrier
+/// recurs is opaque. An unterminated span runs to the end of the word,
+/// after which no valid brace group can follow.
+fn skip_data_quote_carrier(bytes: &[u8], i: usize, carrier: &[u8]) -> usize {
+    let mut j = i + carrier.len();
+    while j + carrier.len() <= bytes.len() {
+        if &bytes[j..j + carrier.len()] == carrier {
+            return j + carrier.len();
+        }
+        j += 1;
+    }
+    bytes.len()
+}
+
+fn find_first_valid_brace(text: &str) -> Option<(usize, usize, i32)> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        // Assignment-storage DATA quotes ride as the PUA sentinels
+        // E301 (') / E302 (") because the lexer already de-quoted the word
+        // (markers.rs ASSIGN_DATA_SQUOTE / ASSIGN_DATA_DQUOTE). GNU
+        // braces.c:189-193 brace_gobbler opens quoted state on those
+        // characters in the RAW word and skips everything until the same
+        // character closes it — a comma or brace inside a quoted brace
+        // member never splits (`a=({","})` stays one literal element). The
+        // sentinels carry exactly that quote through rubash's stored form,
+        // so the scanner must honor them as quote openers the same way.
+        if let Some(carrier) = data_quote_carrier_at(bytes, i) {
+            i = skip_data_quote_carrier(bytes, i, carrier);
+            continue;
+        }
+        // Skip single-quoted strings
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // Skip double-quoted strings
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // GNU bash runs brace expansion on the word itself; the text of a
+        // command substitution is a separate parse unit and the outer shell
+        // must not split braces inside it (parse.y read_token_word hands the
+        // $()/backtick body to parse_comsub, never to brace_expand). Skip
+        // the whole substitution body here.
+        if bytes[i] == b'`' {
+            i = skip_backtick_body(bytes, i);
+            continue;
+        }
+        if is_dollar_or_carrier(bytes[i]) {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+                i = skip_dollar_paren_body(bytes, i);
+                continue;
+            }
+            if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                // $'...' ANSI-C quoting: the single quote opens a quoted
+                // unit, not a quoting state toggle for later bytes.
+                i = skip_single_quoted(bytes, i + 1);
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                // Skip the whole ${...} parameter body: its closing brace is
+                // part of the expansion (subst.c extract_dollar_brace_string),
+                // never the closing brace of an enclosing brace group, and a
+                // comma inside it (foo{bar,${var}.}) does not split. The
+                // DATA_DOLLAR carrier form (cooked word) is the same body.
+                i = skip_dollar_brace_body(bytes, i);
+                continue;
+            }
+        }
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        // Bash ignores a brace opener at a word boundary when it is followed
+        // by whitespace or a closing brace; this keeps `{ a,b}` literal.
+        let preceded_by_whitespace = i == 0 || bytes[i - 1].is_ascii_whitespace();
+        let followed_by_whitespace_or_close =
+            i + 1 >= bytes.len() || bytes[i + 1].is_ascii_whitespace() || bytes[i + 1] == b'}';
+        if preceded_by_whitespace && followed_by_whitespace_or_close {
+            i += 1;
+            continue;
+        }
+        // Skip ${...} parameter expansions (and the DATA_DOLLAR carrier
+        // form of the same opener in cooked words).
+        if i > 0 && is_dollar_or_carrier(bytes[i - 1]) {
+            i += 1;
+            continue;
+        }
+
+        let inner_start = i + 1;
+        let mut depth = 1u32;
+        let mut j = inner_start;
+        let mut has_comma = false;
+        let mut has_double_dot = false;
+        let mut j_escaped = false;
+        let mut j_single = false;
+        let mut j_double = false;
+
+        while j < bytes.len() && depth > 0 {
+            if j_escaped {
+                j_escaped = false;
+                j += 1;
+                continue;
+            }
+            if bytes[j] == b'\'' && !j_double {
+                j_single = !j_single;
+                j += 1;
+                continue;
+            }
+            if bytes[j] == b'"' && !j_single {
+                j_double = !j_double;
+                j += 1;
+                continue;
+            }
+            if let Some(carrier) = data_quote_carrier_at(bytes, j) {
+                // GNU braces.c brace_gobbler: inside quote state only the
+                // same quote character closes it; the other quote kind is
+                // data and never opens nested state.
+                if carrier == DQUOTE_CARRIER && !j_single {
+                    j_double = !j_double;
+                } else if carrier == SQUOTE_CARRIER && !j_double {
+                    j_single = !j_single;
+                }
+                j += carrier.len();
+                continue;
+            }
+            if j_single || j_double {
+                j += 1;
+                continue;
+            }
+            match bytes[j] {
+                b'\\' => {
+                    j_escaped = true;
+                    j += 1;
+                    continue;
+                }
+                c if is_dollar_or_carrier(c) && j + 1 < bytes.len() && bytes[j + 1] == b'{' => {
+                    j = skip_dollar_brace_body(bytes, j);
+                    continue;
+                }
+                c if is_dollar_or_carrier(c) && j + 1 < bytes.len() && bytes[j + 1] == b'(' => {
+                    j = skip_dollar_paren_body(bytes, j);
+                    continue;
+                }
+                b'`' => {
+                    j = skip_backtick_body(bytes, j);
+                    continue;
+                }
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                b',' if depth == 1 => has_comma = true,
+                b'.' if depth == 1 && j + 1 < bytes.len() && bytes[j + 1] == b'.' => {
+                    has_double_dot = true;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+
+        if depth != 0 {
+            i += 1;
+            continue;
+        }
+
+        let inner = &text[inner_start..j];
+        let etype = if has_comma {
+            BRACE_COMMA
+        } else if has_double_dot {
+            BRACE_SEQ
+        } else {
+            0 // BRACE_NONE
+        };
+        if etype == 0 {
+            i += 1;
+            continue;
+        }
+        if etype == BRACE_SEQ && !valid_seqterm(inner) {
+            // GNU valid_seqterm check: skip invalid sequence brace
+            i += 1;
+            continue;
+        }
+        return Some((i, j, etype));
+    }
+    None
+}
+
+/// Index just past the matching close brace of the ${ at `start` (which
+/// points at the $). Tracks brace nesting while staying inside quoted
+/// spans, mirroring subst.c extract_dollar_brace_string's search.
+fn skip_dollar_brace_body(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 2;
+    let mut depth = 1usize;
+    let mut single = false;
+    let mut double = false;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'\\' && !single {
+            i += 2;
+            continue;
+        }
+        if ch == b'\'' && !double {
+            single = !single;
+        } else if ch == b'"' && !single {
+            double = !double;
+        } else if !single && !double {
+            if ch == b'{' {
+                depth += 1;
+            } else if ch == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Index just past the closing backtick starting at `start`. Backslash
+/// escapes are honored (parse.y lexes \` inside a word as escaped data).
+fn skip_backtick_body(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'`' {
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Index just past the matching close paren of the $( at `start` (which
+/// points at the $). Tracks parenthesis nesting while staying inside
+/// single- and double-quoted spans, mirroring parse.y parse_comsub's
+/// matching-paren search.
+fn skip_dollar_paren_body(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 2;
+    let mut depth = 1usize;
+    let mut single = false;
+    let mut double = false;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'\\' && !single {
+            i += 2;
+            continue;
+        }
+        if ch == b'\'' && !double {
+            single = !single;
+        } else if ch == b'"' && !single {
+            double = !double;
+        } else if !single && !double {
+            if ch == b'(' {
+                depth += 1;
+            } else if ch == b')' {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Index just past the closing single quote starting at `start`.
+fn skip_single_quoted(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+fn split_brace_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0u32;
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut escaped = false;
+    // GNU braces.c searches for splitting commas outside quoted spans, so a
+    // comma inside "..." or '...' (echo {"x,x"}) does not split the group.
+    let mut single = false;
+    let mut double = false;
+    while i < bytes.len() {
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'\\' => {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            b'\'' if !double => single = !single,
+            b'"' if !single => double = !double,
+            // Data-quote sentinels (markers.rs E301/E302) are the stored
+            // form of the quotes GNU braces.c skips while splitting commas
+            // (braces.c:189-193 quoted-state handling in brace_gobbler).
+            // Only the same carrier kind toggles its state; the other kind
+            // is data inside the active quote.
+            b'\xEE' if data_quote_carrier_at(bytes, i).is_some() => {
+                match data_quote_carrier_at(bytes, i) {
+                    Some(DQUOTE_CARRIER) if !single => double = !double,
+                    Some(SQUOTE_CARRIER) if !double => single = !single,
+                    _ => {}
+                }
+                i += DQUOTE_CARRIER.len();
+                continue;
+            }
+            b'{' if !single && !double => depth += 1,
+            b'}' if !single && !double => depth = depth.saturating_sub(1),
+            b',' if depth == 0 && !single && !double => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+fn expand_range(s: &str) -> Option<Vec<String>> {
+    let parts = s.split("..").collect::<Vec<_>>();
+    let ([left, right] | [left, right, _]) = parts.as_slice() else {
+        return None;
+    };
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+    let step = match parts.as_slice() {
+        [_, _] => 1,
+        [_, _, step] => step.parse::<i64>().ok()?.abs().max(1),
+        _ => return None,
+    };
+
+    // Numeric range
+    if let (Ok(start), Ok(end)) = (left.parse::<i64>(), right.parse::<i64>()) {
+        let width = numeric_range_width(left, right);
+        // Port of GNU braces.c mkseq (bash 5.3 braces.c:373-472): precompute
+        // the element count with checked arithmetic (any overflow -> literal
+        // fallback, same as GNU returning NULL from mkseq), then emit
+        // exactly `count` values. The increment only happens BETWEEN
+        // elements, never after the last one — incrementing past `end`
+        // would overflow i64 for end == i64::MAX ({MAX-2..MAX}).
+        let abs_incr = step;
+        let incr: i64 = if start <= end { abs_incr } else { -abs_incr };
+        let prevn: i64 = if start < end {
+            match end.checked_sub(start) {
+                Some(v) => v,
+                None => return None,
+            }
+        } else {
+            match start.checked_sub(end) {
+                Some(v) => v,
+                None => return None,
+            }
+        };
+        let count: usize = match usize::try_from(prevn / abs_incr) {
+            Ok(q) => match q.checked_add(1) {
+                Some(c) => c,
+                None => return None,
+            },
+            Err(_) => return None,
+        };
+        let mut result = Vec::with_capacity(count);
+        let mut n = start;
+        for i in 0..count {
+            result.push(format_numeric_range_value(n, width));
+            if i + 1 < count {
+                // Invariant: n stays within [min(start,end), max(start,end)],
+                // so this cannot overflow (same invariant GNU relies on).
+                n += incr;
+            }
+        }
+        return Some(result);
+    }
+    // Alpha range
+    let start = left.as_bytes()[0];
+    let end = right.as_bytes()[0];
+    if left.len() == 1
+        && right.len() == 1
+        && start.is_ascii_alphabetic()
+        && end.is_ascii_alphabetic()
+    {
+        // GNU braces.c mkseq ST_CHAR path: same count-based loop as the
+        // numeric range (count = |end-start|/incr + 1). count > 1 implies
+        // step <= 57, so the `step as i32` cast below cannot truncate.
+        let diff = (start as i32 - end as i32).unsigned_abs() as usize;
+        let step_u = usize::try_from(step).unwrap_or(usize::MAX);
+        let count = diff / step_u + 1;
+        let dir: i32 = if start <= end { 1 } else { -1 };
+        let mut result = Vec::with_capacity(count);
+        let mut cur = start as i32;
+        // GNU braces.c renders the backslash position of a character
+        // sequence as an EMPTY element (it is the quoting character):
+        // {a..Z} yields ... ] "" [ ... so the baseline shows "]  [".
+        for i in 0..count {
+            let byte = cur as u8;
+            if byte == b'\\' {
+                result.push(String::new());
+            } else {
+                result.push((byte as char).to_string());
+            }
+            if i + 1 < count {
+                cur += dir * (step as i32);
+            }
+        }
+        return Some(result);
+    }
+    None
+}
+
+fn numeric_range_width(left: &str, right: &str) -> Option<usize> {
+    let left_digits = left.trim_start_matches('-');
+    let right_digits = right.trim_start_matches('-');
+    let padded = [left_digits, right_digits]
+        .iter()
+        .any(|value| value.len() > 1 && value.starts_with('0'));
+    padded.then(|| left.len().max(right.len()))
+}
+
+fn format_numeric_range_value(value: i64, width: Option<usize>) -> String {
+    let Some(width) = width else {
+        return value.to_string();
+    };
+    if value < 0 {
+        format!(
+            "-{:0width$}",
+            value.unsigned_abs(),
+            width = width.saturating_sub(1)
+        )
+    } else {
+        format!("{value:0width$}")
+    }
+}
+
+#[cfg(test)]
+mod dollar_probe_tests {
+    use super::expand_braces;
+
+    #[test]
+    fn dollar_body_splits_like_gnu() {
+        assert_eq!(expand_braces("foo{bar,${a}.}"), vec!["foobar", "foo${a}."]);
+        assert_eq!(expand_braces("${a}{x,y}"), vec!["${a}x", "${a}y"]);
+        assert_eq!(expand_braces("{a,${a},b}"), vec!["a", "${a}", "b"]);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_comma_brace() {
+        assert_eq!(expand_braces("{a,b,c}"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_nested_comma() {
+        assert_eq!(expand_braces("x{a,b}y"), vec!["xay", "xby"]);
+    }
+
+    #[test]
+    fn test_range_numeric() {
+        assert_eq!(expand_braces("{1..3}"), vec!["1", "2", "3"]);
+    }
+
+    /// rubash#416/#417: the DATA_DOLLAR carrier (U+001F) is the cooked-word
+    /// transport of a quoted `$`; a brace body it opens is `${...}`
+    /// parameter text and must be skipped exactly like a literal `${`
+    /// (GNU braces.c:679-680 brace_gobbler "treat ${...} like \{...}").
+    /// Before this invariant the scanner expanded the member list that
+    /// quoting had made literal and downstream remove_shell_quotes ate the
+    /// word's data backslashes (`'a\nb${VAR}c'` -> `anb${VAR}c`).
+    #[test]
+    fn data_dollar_carrier_opens_a_parameter_body_not_a_brace_group() {
+        let cooked_single_quoted = "a\\nb\u{1f}{VAR}c";
+        assert_eq!(
+            expand_braces(cooked_single_quoted),
+            vec![cooked_single_quoted]
+        );
+        // A comma inside the carrier-opened body is parameter text, not a
+        // member separator: `'${x,y}'` stays literal.
+        let cooked_comma_body = "\u{1f}{x,y}";
+        assert_eq!(expand_braces(cooked_comma_body), vec![cooked_comma_body]);
+        // The carrier form of `$(` (command substitution) is skipped the
+        // same way.
+        let cooked_comsub = "\u{1f}(echo {1,2})";
+        assert_eq!(expand_braces(cooked_comsub), vec![cooked_comsub]);
+        // A REAL brace group in the same word still expands; the carrier
+        // body's closing brace is never consumed as the group's.
+        assert_eq!(
+            expand_braces("x\u{1f}{V}r{a,b}"),
+            vec!["x\u{1f}{V}ra", "x\u{1f}{V}rb"]
+        );
+        // Literal `${` keeps its GNU skip.
+        assert_eq!(expand_braces("${V}r{a,b}"), vec!["${V}ra", "${V}rb"]);
+    }
+
+    #[test]
+    fn test_seq_near_i64_max_terminates() {
+        // GNU: {9223372036854775805..9223372036854775807} -> exactly 3 values.
+        // rubash hung >5s here via the binary; pin down which layer.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = expand_range("9223372036854775805..9223372036854775807");
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Some(r)) => assert_eq!(
+                r,
+                vec![
+                    "9223372036854775805".to_string(),
+                    "9223372036854775806".to_string(),
+                    "9223372036854775807".to_string()
+                ]
+            ),
+            Ok(None) => panic!("expand_range returned None on i64 boundary"),
+            Err(_) => panic!("expand_range HUNG on i64 boundary"),
+        }
+
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = brace_expand("{9223372036854775805..9223372036854775807}");
+            let _ = tx2.send(r);
+        });
+        match rx2.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(r) => assert_eq!(r.len(), 3),
+            Err(_) => panic!("brace_expand HUNG on i64 boundary"),
+        }
+    }
+
+    #[test]
+    fn test_range_numeric_step_and_padding() {
+        assert_eq!(expand_braces("{1..5..2}"), vec!["1", "3", "5"]);
+        assert_eq!(expand_braces("{1..6..4}"), vec!["1", "5"]);
+        assert_eq!(expand_braces("{5..1..2}"), vec!["5", "3", "1"]);
+        assert_eq!(expand_braces("{01..03}"), vec!["01", "02", "03"]);
+        assert_eq!(expand_braces("{-03..01..2}"), vec!["-03", "-01", "001"]);
+        assert_eq!(
+            expand_braces("{-003..001..2}"),
+            vec!["-003", "-001", "0001"]
+        );
+    }
+
+    #[test]
+    fn test_range_alpha() {
+        assert_eq!(expand_braces("{a..c}"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_range_alpha_step() {
+        assert_eq!(expand_braces("{a..e..2}"), vec!["a", "c", "e"]);
+        assert_eq!(expand_braces("{e..a..2}"), vec!["e", "c", "a"]);
+    }
+
+    #[test]
+    fn test_nested_escaped_brace_preserves_literal_suffix() {
+        assert_eq!(
+            expand_braces(r"{x,y,\{a,b,c}}"),
+            vec![r"x}", r"y}", r"\{a}", r"b}", r"c}"],
+        );
+    }
+
+    #[test]
+    fn test_no_brace() {
+        assert_eq!(expand_braces("hello"), vec!["hello"]);
+    }
+
+    #[test]
+    fn test_escaped_commas_do_not_split_brace_items() {
+        assert_eq!(expand_braces(r"a{b\,c,d}"), vec![r"ab\,c", "ad"]);
+        assert_eq!(expand_braces(r"{x\,y,z}"), vec![r"x\,y", "z"]);
+    }
+
+    #[test]
+    fn test_escaped_braces_do_not_start_or_end_nested_groups() {
+        assert_eq!(expand_braces(r"{a\{b,c}"), vec![r"a\{b", "c"]);
+        assert_eq!(expand_braces(r"{a\}b,c}"), vec![r"a\}b", "c"]);
+    }
+
+    #[test]
+    fn test_adjacent_brace_groups() {
+        assert_eq!(expand_braces("{a,b}{1..2}"), vec!["a1", "a2", "b1", "b2"]);
+    }
+
+    #[test]
+    fn test_escaped_brace_group_adjacent_to_real_group() {
+        // Escaped braces stay literal (backslashes stripped later by quote
+        // removal in command_prepare) while unescaped groups still expand.
+        assert_eq!(expand_braces(r"\{a,b}{1,2}"), vec![r"\{a,b}1", r"\{a,b}2"]);
+        assert_eq!(
+            expand_braces(r"a\{b,c}d{e,f}g"),
+            vec![r"a\{b,c}deg", r"a\{b,c}dfg"]
+        );
+    }
+
+    #[test]
+    fn test_invalid_nested_sequences_expand_only_nested_commas() {
+        // Expectations below are taken from GNU bash 5.3.0 directly
+        // (braces.tests lines 136-142), not from the pre-rewrite sketch:
+        //   echo {{1,2,3}..4}   -> {1..4} {2..4} {3..4}
+        //   echo {6..{7,8,9}}   -> {6..7} {6..8} {6..9}
+        //   echo {{a..c}..{1..3}} -> 9 words {a..1} ... {c..3}
+        // Note the nested sequence braces are RETAINED in the output: the
+        // invalid outer {..} never expands, it just carries the endpoint text.
+        assert_eq!(
+            expand_braces("{{1,2,3}..4}"),
+            vec!["{1..4}", "{2..4}", "{3..4}"],
+        );
+        assert_eq!(
+            expand_braces("{6..{7,8,9}}"),
+            vec!["{6..7}", "{6..8}", "{6..9}"],
+        );
+        // GNU cross-products the two nested sequences even though neither is a
+        // comma group in the valid_seqterm sense.
+        assert_eq!(
+            expand_braces("{{a..c}..{1..3}}"),
+            vec![
+                "{a..1}", "{a..2}", "{a..3}", "{b..1}", "{b..2}", "{b..3}", "{c..1}", "{c..2}",
+                "{c..3}",
+            ],
+        );
+        assert_eq!(
+            expand_braces("{{a..c}..{1,10}}"),
+            vec!["{a..1}", "{a..10}", "{b..1}", "{b..10}", "{c..1}", "{c..10}"],
+        );
+    }
+
+    #[test]
+    fn test_debug_adjacent_braces() {
+        let result = expand_braces("{a,b}{1,2}");
+        println!("Debug: expand_braces = {:?}", result);
+        assert_eq!(result, vec!["a1", "a2", "b1", "b2"]);
+    }
+}

@@ -1,0 +1,1669 @@
+//! Typed command-substitution capture metadata.
+//!
+//! This is the first owner-scoped boundary corresponding to GNU Bash
+//! subst.c::read_comsub. Payload bytes remain data; lexical context is kept
+//! separately instead of being encoded in global C0 sentinels.
+//!
+//! Raw bytes travel as U+E000 sentinel + payload-char marker pairs; literal
+//! chars that collide with the registry zone (U+E000..=U+E3FF, and the
+//! escape introducer U+E400 itself) are E400-prefixed at entry, so
+//! private-use text (prompt glyphs such as U+E0A0) can never collide with
+//! the marker space and survives every encode/decode round trip byte-exact.
+
+use crate::executor::command_subst_helpers::trim_capture_terminator_bytes;
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::executor) enum SubstitutionQuoteContext {
+    Unquoted,
+    DoubleQuoted,
+    HereDocument,
+}
+/// Sentinel introducing a raw-byte marker pair.
+pub(crate) use crate::executor::markers::RAW_BYTE_MARKER_ESCAPE;
+/// First marker payload char, encoding raw byte 0x00.
+pub(crate) use crate::executor::markers::RAW_BYTE_MARKER_FIRST;
+/// Last marker payload char, encoding raw byte 0xff.
+pub(crate) use crate::executor::markers::RAW_BYTE_MARKER_LAST;
+
+/// Build the two-char raw-byte marker (sentinel + payload char) for a byte.
+pub(crate) fn encode_raw_byte_marker(byte: u8) -> String {
+    let mut output = String::new();
+    push_raw_byte_marker(&mut output, byte);
+    output
+}
+
+/// GNU u32cconv (lib/sh/unicode.c:239-262): on a 4-byte-wchar_t platform the
+/// conversion is wctomb for every value <= 0x7fffffff, so UTF-8 output uses
+/// the mathematical UTF-8 form even for surrogate code points (wctomb
+/// encodes U+D800 as ED A0 80) and for the 5/6-byte forms above 0x10ffff
+/// (printf '\U00200000' -> F8 88 80 80 80, '\U7000002c' -> FD B0 80 80 80
+/// AC under GNU bash 5.3.0). Values above 0x7fffffff fail the conversion
+/// and produce no output. Bytes that cannot be carried as UTF-8 scalars
+/// (surrogate encodings, the 5/6-byte forms) travel as raw-byte marker
+/// pairs; printable scalar results stay as plain chars.
+pub(crate) fn u32cconv_utf8_text(value: u32) -> String {
+    // A representable Unicode scalar (everything except the surrogate
+    // range) travels as its own char: glob2.sub uses IFS=$'\u3b1' and the
+    // IFS splitter must see exactly one delimiter char, not a marker-pair
+    // byte sequence. Only values with no char form need the raw-byte
+    // marker carrier.
+    //
+    // Control characters that are assignment carrier bytes (0x0c, 0x11,
+    // 0x13, 0x14, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1c, 0x1d, 0x1f) must
+    // be encoded as raw-byte markers to match the ANSI-C lexer's
+    // push_ansi_c_byte encoding. Without this, `printf -v r '\U00000013'`
+    // stores raw char \x13, but `$'\023'` stores a marker pair — they
+    // compare unequal (unicode1.sub: EChar != RChar) and `$r` expansion
+    // strips the raw char (len=0, %q='').
+    if let Some(ch) = char::from_u32(value) {
+        if (value as u32) <= 0x7f
+            && ch.is_control()
+            && crate::lexer::ansi::is_assignment_carrier_byte(value)
+        {
+            return encode_raw_byte_marker(value as u8);
+        }
+        return String::from(ch);
+    }
+    if value > 0x7fff_ffff {
+        return String::new();
+    }
+    let length = if value < 0x800 {
+        2
+    } else if value < 0x1_0000 {
+        3
+    } else if value < 0x20_0000 {
+        4
+    } else if value < 0x400_0000 {
+        5
+    } else {
+        6
+    };
+    let first_mask: u32 = match length {
+        2 => 0xc0,
+        3 => 0xe0,
+        4 => 0xf0,
+        5 => 0xf8,
+        _ => 0xfc,
+    };
+    let first_shift = 6 * (length - 1);
+    let mut output = String::new();
+    push_u32cconv_byte(&mut output, first_mask | (value >> first_shift));
+    let mut shift = first_shift;
+    while shift >= 6 {
+        shift -= 6;
+        push_u32cconv_byte(&mut output, 0x80 | ((value >> shift) & 0x3f));
+    }
+    output
+}
+
+fn push_u32cconv_byte(output: &mut String, byte: u32) {
+    output.push_str(&encode_raw_byte_marker(byte as u8));
+}
+
+fn push_raw_byte_marker(output: &mut String, byte: u8) {
+    output.push(char::from_u32(RAW_BYTE_MARKER_ESCAPE).expect("sentinel is valid"));
+    output.push(char::from_u32(RAW_BYTE_MARKER_FIRST + byte as u32).expect("marker char is valid"));
+}
+
+/// Escape literal registry-zone chars with the E000 literal-char prefix so
+/// decoders can tell payload chars apart from marker introducers
+/// (E000 doubles; other zone chars get one prefix).
+fn push_escaped_text_with_carriers(output: &mut String, text: &str) {
+    for ch in text.chars() {
+        let byte = ch as u32;
+        if byte < 0x80 && is_carrier_byte(byte) {
+            push_raw_byte_marker(output, byte as u8);
+        } else {
+            crate::executor::markers::push_literal_char(output, ch);
+        }
+    }
+}
+
+fn is_carrier_byte(byte: u32) -> bool {
+    // Same canonical tagged set as is_assignment_carrier_byte
+    // (lexer/ansi.rs) and bytes_to_assignment_shell_text: {0x0c, 0x11, 0x13}
+    // plus the whole 0x14..=0x1f carrier block. A raw byte in this range is
+    // always user data here — bytes_to_shell_text converts bytes to text —
+    // so it must be marker-tagged before any carrier consumer can claim it.
+    crate::lexer::ansi::is_assignment_carrier_byte(byte)
+}
+
+pub(in crate::executor) struct SubstitutionOutput {
+    pub(in crate::executor) bytes: Vec<u8>,
+    pub(in crate::executor) status: i32,
+    pub(in crate::executor) context: SubstitutionQuoteContext,
+}
+
+impl SubstitutionOutput {
+    pub(in crate::executor) fn readback(
+        mut bytes: Vec<u8>,
+        status: i32,
+        context: SubstitutionQuoteContext,
+    ) -> Self {
+        // GNU read_comsub discards NUL bytes while reading the child pipe.
+        bytes.retain(|byte| *byte != 0);
+        // Trailing line terminator(s), CRLF-aware: see
+        // trim_capture_terminator_bytes and niubash #120.
+        trim_capture_terminator_bytes(&mut bytes);
+        Self {
+            bytes,
+            status,
+            context,
+        }
+    }
+
+    pub(in crate::executor) fn text_lossy(&self) -> String {
+        bytes_to_shell_text(&self.bytes)
+    }
+
+    /// Materialize assignment values without colliding with legacy C0 metadata.
+    ///
+    /// `\x14..\x1f` are still used by parser/assignment adapters, so a raw
+    /// command-substitution byte in that range must use the owner-tagged byte
+    /// marker before entering the legacy scalar map.
+    pub(in crate::executor) fn assignment_text(&self) -> String {
+        bytes_to_assignment_shell_text(&self.bytes)
+    }
+
+    /// Convert capture metadata into an expansion fragment without decoding payload bytes.
+    pub(in crate::executor) fn into_fragment(self) -> ExpandedFragment {
+        let quoted = !matches!(self.context, SubstitutionQuoteContext::Unquoted);
+        ExpandedFragment {
+            bytes: self.bytes,
+            quoted,
+            splittable: !quoted,
+            ctlesc_markers: false,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::executor) enum SubstitutionSplitPolicy {
+    Split,
+    NoSplit,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::executor) struct ExpandedFragment {
+    pub(in crate::executor) bytes: Vec<u8>,
+    pub(in crate::executor) quoted: bool,
+    pub(in crate::executor) splittable: bool,
+    /// Source-text provenance: the fragment's 0x11 bytes are live CTLESC
+    /// markers, not data. GNU expand_word_internal copies characters that
+    /// were quoted in the source word into the expansion result with a
+    /// CTLESC prefix (subst.c:11639-11673, `SCOPY_CHAR_I (twochars,
+    /// CTLESC, c, ...)`); those markers ride through the splice until the
+    /// globber (glob.c udequote_pathname, 429-448) treats the protected
+    /// characters as literals, and argv materialization strips them the
+    /// way dequote_string (subst.c:4807) does. Capture bytes from a
+    /// command substitution are payload data — a literal 0x11 byte in
+    /// `$(printf '\x11')` output has no marker meaning — so only
+    /// source-text fragments raise this flag (rubash#187: the mixed word
+    /// `pre"a*"$(echo hi)post` froze its quoted-span marker into argv).
+    pub(in crate::executor) ctlesc_markers: bool,
+}
+
+impl ExpandedFragment {
+    #[allow(dead_code)]
+    pub(in crate::executor) fn literal(text: &str, quoted: bool) -> Self {
+        Self {
+            bytes: text.as_bytes().to_vec(),
+            quoted,
+            splittable: false,
+            ctlesc_markers: true,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::executor) fn expanded(text: &str, quoted: bool) -> Self {
+        Self {
+            bytes: text.as_bytes().to_vec(),
+            quoted,
+            splittable: true,
+            ctlesc_markers: false,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(in crate::executor) struct ExpandedWord {
+    pub(in crate::executor) fragments: Vec<ExpandedFragment>,
+    pub(in crate::executor) status: Option<i32>,
+}
+
+impl ExpandedWord {
+    #[allow(dead_code)]
+    pub(in crate::executor) fn append_literal(&mut self, text: &str, quoted: bool) {
+        self.fragments.push(ExpandedFragment::literal(text, quoted));
+    }
+
+    /// Append the output of the parameter walker (storage-domain shell text,
+    /// transport carriers intact) as a PAYLOAD fragment.
+    ///
+    /// GNU symmetry anchor: expansion output appended in a quoted word goes
+    /// through quote_string (subst.c:4773, reached from the add_quoted_string
+    /// label at subst.c:11862), which CTLESC-escapes every character of the
+    /// value uniformly, and the assignment store boundary strips those pairs
+    /// again with dequote_string (subst.c:4807). No class of expansion-output
+    /// character is "frozen" mid-encode. The source-text provenance that
+    /// E400-wraps registry-zone chars (LITERAL_CHAR_ESCAPE, the parse.y:5694
+    /// got_character CTLESC-add port) applies only to word text from the
+    /// lexer — walker output is payload, so its raw-byte marker pairs
+    /// (U+E000+U+E0xx) must decode to their bytes here; materialization
+    /// re-tags carrier bytes as pairs, keeping the round trip that the final
+    /// output boundary (echo/printf) decodes exactly once. Passing walker
+    /// output through append_literal instead E400-escaped the pair chars as
+    /// user literals and froze them into storage (rubash#296:
+    /// a="${v}$(true)" stored literal U+E000 U+E01C instead of the ESC byte).
+    pub(in crate::executor) fn append_expanded_shell_text(&mut self, text: &str, quoted: bool) {
+        let bytes = shell_text_to_raw_bytes(text);
+        self.fragments.push(ExpandedFragment {
+            bytes,
+            quoted,
+            splittable: false,
+            ctlesc_markers: false,
+        });
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::executor) fn append_substitution(&mut self, output: SubstitutionOutput) {
+        self.status = Some(output.status);
+        self.fragments.push(output.into_fragment());
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::executor) fn split(
+        &self,
+        ifs: Option<&str>,
+        policy: SubstitutionSplitPolicy,
+    ) -> Vec<String> {
+        split_expanded_fragments(&self.fragments, ifs, policy)
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::executor) fn materialize_lossy_at_boundary(&self) -> String {
+        let mut bytes = Vec::new();
+        let mut marker_positions = Vec::new();
+        for fragment in &self.fragments {
+            if fragment.ctlesc_markers {
+                for (offset, byte) in fragment.bytes.iter().enumerate() {
+                    if *byte == CTLESC_MARKER_BYTE {
+                        marker_positions.push(bytes.len() + offset);
+                    }
+                }
+            }
+            bytes.extend(fragment.bytes.iter().copied());
+        }
+        materialize_field_text(&bytes, &marker_positions)
+    }
+}
+
+/// Read a file-backed input redirection target as shell text.
+///
+/// GNU redir.c opens input redirection targets and feeds raw bytes to the
+/// reading owner (read builtin and descriptors duplicated from the entry).
+/// Rubash stores virtual input records as String, so strict UTF-8 decoding
+/// here either dropped the record entirely or aborted the whole redirect
+/// when the file contained invalid sequences. Encode invalid bytes with the
+/// owner-tagged RAW_BYTE_MARKER contract so downstream owners keep byte
+/// provenance until their own output boundary decodes exactly once.
+pub(crate) fn read_shell_input_file(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    Ok(bytes_to_shell_text(&bytes))
+}
+/// Decode owner-tagged raw-byte markers back into real bytes.
+///
+/// This is the exact-once consumer boundary for byte sinks such as
+/// child-process stdin writers and final pipeline output materialization.
+/// Only sentinel-introduced marker pairs decode to bytes; every other code
+/// point, including private-use glyphs, keeps its UTF-8 encoding.
+pub(crate) fn shell_text_to_raw_bytes(text: &str) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == crate::executor::markers::LITERAL_CHAR_ESCAPE {
+            // E400 + c is the literal-char escape: emit c verbatim.
+            let literal = chars.next().unwrap_or(ch);
+            let mut encoded = [0; 4];
+            output.extend_from_slice(literal.encode_utf8(&mut encoded).as_bytes());
+            continue;
+        }
+        if ch as u32 != RAW_BYTE_MARKER_ESCAPE {
+            let mut encoded = [0; 4];
+            output.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+            continue;
+        }
+        match chars.peek().copied() {
+            Some(next) if next as u32 == RAW_BYTE_MARKER_ESCAPE => {
+                chars.next();
+                let mut encoded = [0; 4];
+                output.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+            }
+            Some(next)
+                if (RAW_BYTE_MARKER_FIRST..=RAW_BYTE_MARKER_LAST).contains(&(next as u32)) =>
+            {
+                chars.next();
+                output.push((next as u32 - RAW_BYTE_MARKER_FIRST) as u8);
+            }
+            // E000 + <non-payload char> is a stray introducer: emit the
+            // char, drop the escape (recovery; nothing produces this).
+            Some(next) => {
+                chars.next();
+                let mut encoded = [0; 4];
+                output.extend_from_slice(next.encode_utf8(&mut encoded).as_bytes());
+            }
+            _ => {
+                let mut encoded = [0; 4];
+                output.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+            }
+        }
+    }
+    output
+}
+
+/// Decode owner-tagged raw-byte marker pairs into byte chars (WTF-8 style:
+/// byte value == code point) for the Windows child-argv boundary.
+///
+/// GNU shell_execve (execute_cmd.c:6139) hands execve the raw word bytes, so
+/// an invalid-UTF-8 byte such as 0xCD in `$'ab\xCD'` reaches the child as
+/// that byte. Windows argv is UTF-16 (CreateProcessW), so raw byte-argv does
+/// not exist; the documented contract here (rubash#141) is that each invalid
+/// byte travels as its own code point (U+00CD for byte 0xCD) instead of the
+/// internal transport marker pair — the previous behavior leaked the PUA
+/// pair (U+E000 U+E0CE) verbatim into the child command line, which ANSI
+/// children then re-encoded through the system codepage as GBK mojibake.
+pub(crate) fn decode_raw_byte_markers_to_byte_chars(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch as u32 != RAW_BYTE_MARKER_ESCAPE {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some(next) if next as u32 == RAW_BYTE_MARKER_ESCAPE => {
+                // E000 E000 is an escaped literal U+E000 in user data.
+                output.push(ch);
+            }
+            Some(next)
+                if (RAW_BYTE_MARKER_FIRST..=RAW_BYTE_MARKER_LAST).contains(&(next as u32)) =>
+            {
+                output.push(
+                    char::from_u32(next as u32 - RAW_BYTE_MARKER_FIRST)
+                        .expect("raw-byte marker payload maps to a valid Latin-1 code point"),
+                );
+            }
+            // E000 + <non-payload char> is a stray introducer (recovery;
+            // nothing produces this): keep the payload char.
+            Some(next) => output.push(next),
+            None => output.push(ch),
+        }
+    }
+    output
+}
+
+/// Decode marker characters embedded in an otherwise byte-oriented output.
+///
+/// Echo can receive shell text from a read record, but it also emits raw
+/// bytes for -e octal and hexadecimal escapes. Decode the reserved UTF-8
+/// encoding in-place so those already-raw bytes remain untouched.
+pub(crate) fn decode_raw_byte_markers(bytes: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let Some((ch, char_len)) = next_char(bytes, index) else {
+            output.push(bytes[index]);
+            index += 1;
+            continue;
+        };
+        if ch == crate::executor::markers::LITERAL_CHAR_ESCAPE {
+            // E400 + c is the literal-char escape: emit c verbatim.
+            match next_char(bytes, index + char_len) {
+                Some((_, next_len)) => {
+                    output.extend_from_slice(&bytes[index + char_len..index + char_len + next_len]);
+                    index += char_len + next_len;
+                }
+                None => {
+                    output.extend_from_slice(&bytes[index..index + char_len]);
+                    index += char_len;
+                }
+            }
+            continue;
+        }
+        if ch as u32 != RAW_BYTE_MARKER_ESCAPE {
+            output.extend_from_slice(&bytes[index..index + char_len]);
+            index += char_len;
+            continue;
+        }
+        match next_char(bytes, index + char_len) {
+            Some((next_ch, next_len)) if next_ch as u32 == RAW_BYTE_MARKER_ESCAPE => {
+                output.extend_from_slice(&bytes[index..index + char_len]);
+                index += char_len + next_len;
+            }
+            Some((next_ch, next_len))
+                if (RAW_BYTE_MARKER_FIRST..=RAW_BYTE_MARKER_LAST).contains(&(next_ch as u32)) =>
+            {
+                output.push((next_ch as u32 - RAW_BYTE_MARKER_FIRST) as u8);
+                index += char_len + next_len;
+            }
+            // E000 + <non-payload char> is a stray introducer: emit the
+            // char, drop the escape (recovery; nothing produces this).
+            Some((_next_ch, next_len)) => {
+                output.extend_from_slice(&bytes[index + char_len..index + char_len + next_len]);
+                index += char_len + next_len;
+            }
+            _ => {
+                output.extend_from_slice(&bytes[index..index + char_len]);
+                index += char_len;
+            }
+        }
+    }
+    output
+}
+
+fn next_char(bytes: &[u8], index: usize) -> Option<(char, usize)> {
+    if index >= bytes.len() {
+        return None;
+    }
+    let len = utf8_sequence_len(bytes[index])?;
+    if index + len > bytes.len() {
+        return None;
+    }
+    let chunk = std::str::from_utf8(&bytes[index..index + len]).ok()?;
+    Some((chunk.chars().next()?, len))
+}
+
+fn utf8_sequence_len(lead: u8) -> Option<usize> {
+    match lead {
+        0x00..=0x7f => Some(1),
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
+}
+pub(crate) fn bytes_to_assignment_shell_text(bytes: &[u8]) -> String {
+    // bytes_to_shell_text already marker-tags every carrier byte
+    // (is_carrier_byte covers 0x0c/0x11/0x13 plus the whole 0x14..=0x1f
+    // block), so the storage-domain encoding is the general encoding.
+    bytes_to_shell_text(bytes)
+}
+
+pub(crate) fn bytes_to_shell_text(bytes: &[u8]) -> String {
+    let mut output = String::new();
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(text) => {
+                push_escaped_text_with_carriers(&mut output, text);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                push_escaped_text_with_carriers(
+                    &mut output,
+                    std::str::from_utf8(&remaining[..valid]).unwrap_or_default(),
+                );
+                push_raw_byte_marker(&mut output, remaining[valid]);
+                remaining = &remaining[valid + 1..];
+            }
+        }
+    }
+    output
+}
+
+/// Script-entry byte decoding. GNU shell.c reads script files as raw bytes
+/// with no encoding gate — general.c:718 check_binary_file (ELF magic /
+/// NUL within the first line, two when `#!`) is the only rejection — so a
+/// script carrying ISO-8859/CJK stray bytes runs normally (rubash#132).
+/// Unlike `bytes_to_shell_text` this leaves valid UTF-8 untouched (no
+/// carrier escaping: script bytes like form feed must keep whatever lexer
+/// meaning they already have) and rides each byte of an invalid sequence
+/// as a raw-byte marker pair, so the output boundary
+/// (`decode_raw_byte_markers`, e.g. echo) restores the original byte.
+///
+/// One entry-side escape DOES apply to valid UTF-8 spans (rubash#856): a
+/// literal marker-zone char (U+E000..=U+E401 — RAW_BYTE_MARKER_ESCAPE,
+/// raw-byte payloads, the E301.. registry block, LITERAL_CHAR_ESCAPE
+/// itself) is user data per the #296 ownership contract but is
+/// indistinguishable from a stray marker introducer at every later decode
+/// boundary — `v="a<U+E000>b"` stored `ab` and `${v//a/ZZ}` emitted `ZZb`
+/// where GNU 5.3.0 keeps the PUA glyph verbatim. Those chars can only be
+/// told apart from live markers at THIS boundary (script bytes are fresh
+/// source — transport text never enters through file reads), so they are
+/// E400-escaped here exactly like `push_escaped_text_with_carriers` does
+/// for the stdin path (`read_unbuffered_line`).
+///
+/// The `-c` operand has its own entry escaping — see
+/// `command_string_entry_text` below (rubash#948), applied in
+/// `run_command_string_with_init` (main.rs). The boundary, in words:
+/// the respawn exclusion is a DOUBLE-ESCAPE exclusion only, not an
+/// all-`-c` exclusion. A respawned `&`/coproc child (`RESPAWNED_CHILD`,
+/// the `__RUBASH_SHELL_PID` / `__RUBASH_COPROC_CHILD` env markers,
+/// including the `__RUBASH_CMD_FILE` file-transport variant) receives
+/// serialized AST source (compound_exec `bash_command_source_text`) whose
+/// words already carry transport spelling (E400 pairs and raw-byte
+/// markers); re-escaping that text would prefix already-escaped pairs
+/// again, so the respawned arm skips entry escaping entirely. Every other
+/// `-c` string is fresh source — the same class as a script file or
+/// stdin — and is escaped, with the one nuance that an existing
+/// `E400` + zone-char pair is protocol emitted by a rubash parent's argv
+/// materialization and is preserved rather than re-escaped.
+pub(crate) fn bytes_to_script_text(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if !text.contains(crate::executor::markers::is_marker_zone_char) {
+            // Zero-change fast path: every currently-runnable script decodes
+            // to exactly the String String::from_utf8 produced.
+            return text.to_string();
+        }
+        return escape_marker_zone_chars(text);
+    }
+    let mut output = String::new();
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(text) => {
+                push_marker_zone_escaped(&mut output, text);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                push_marker_zone_escaped(
+                    &mut output,
+                    std::str::from_utf8(&remaining[..valid]).unwrap_or_default(),
+                );
+                push_raw_byte_marker(&mut output, remaining[valid]);
+                remaining = &remaining[valid + 1..];
+            }
+        }
+    }
+    output
+}
+
+/// `-c` operand entry escaping (rubash#948). A user-supplied command string
+/// is fresh source — the same class as a script file or stdin — so literal
+/// marker-zone chars must be E400-escaped before the lexer sees them or they
+/// are read as live protocol (`rubash -c 'echo "x<U+E319>41;y"'` decoded the
+/// payload and printed `xAy`; stdin/script faces were already covered by
+/// `bytes_to_script_text`/`bytes_to_shell_text`).
+///
+/// Unlike script files, `-c` text can already be PARTIALLY transport-spelled:
+/// a rubash parent's argv materialization keeps `E400` + zone-char pairs
+/// verbatim when it launches another `rubash -c`, so an existing
+/// `LITERAL_CHAR_ESCAPE` + `is_marker_zone_char` pair here is protocol, not
+/// user data, and is copied unchanged. Re-escaping it would double-encode
+/// (E400+E400, E400+zone) and leak the pair into output. A lone typed
+/// `U+E400` still gets the literal escape — the `-c` channel's documented
+/// ambiguous seam, since transport text is indistinguishable from user data
+/// at this boundary. Whole-operand transport spelling (respawned `&`/coproc
+/// children, `RESPAWNED_CHILD`) is skipped entirely at the call site in
+/// `run_command_string_with_init` — this escaping is idempotent only within
+/// one text, it does not make already-spelled respawn source safe to
+/// re-escape.
+pub(crate) fn command_string_entry_text(command: &str) -> String {
+    use crate::executor::markers::{is_marker_zone_char, LITERAL_CHAR_ESCAPE};
+    if !command.chars().any(is_marker_zone_char) {
+        return command.to_string();
+    }
+    let mut output = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == LITERAL_CHAR_ESCAPE && chars.peek().is_some_and(|next| is_marker_zone_char(*next))
+        {
+            output.push(ch);
+            output.push(chars.next().expect("peeked char exists"));
+        } else {
+            crate::executor::markers::push_literal_char(&mut output, ch);
+        }
+    }
+    output
+}
+
+/// E400-escape every marker-zone char in `text` (script-source literal
+/// boundary — see `bytes_to_script_text`).
+fn push_marker_zone_escaped(output: &mut String, text: &str) {
+    for ch in text.chars() {
+        crate::executor::markers::push_literal_char(output, ch);
+    }
+}
+
+fn escape_marker_zone_chars(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    push_marker_zone_escaped(&mut output, text);
+    output
+}
+
+#[allow(dead_code)]
+pub(in crate::executor) fn split_expanded_fragments(
+    fragments: &[ExpandedFragment],
+    ifs: Option<&str>,
+    policy: SubstitutionSplitPolicy,
+) -> Vec<String> {
+    // Field text accumulates as raw bytes and materializes through
+    // bytes_to_shell_text at each boundary: fragment bytes are payload data
+    // (substitution output may hold non-UTF-8 bytes), so widening each byte
+    // with `byte as char` would Latin-1-encode multibyte literal text into
+    // mojibake (niubash#92: "中文$(echo h)"$(echo x) printed ä¸­æ–‡hx).
+    // Source-text fragments additionally record the byte positions of their
+    // live CTLESC markers so materialization keeps them as marker chars
+    // instead of owner-tagging them as payload data (rubash#187).
+    let mut fields = Vec::new();
+    if policy == SubstitutionSplitPolicy::NoSplit {
+        let mut bytes = Vec::new();
+        let mut marker_positions = Vec::new();
+        for fragment in fragments {
+            record_source_carrier_markers(fragment, bytes.len(), &mut marker_positions);
+            bytes.extend(fragment.bytes.iter().copied());
+        }
+        return vec![materialize_field_text(&bytes, &marker_positions)];
+    }
+    let ifs = ifs.unwrap_or(" \t\n");
+    let whitespace: Vec<u8> = ifs
+        .bytes()
+        .filter(|byte| byte.is_ascii_whitespace())
+        .collect();
+    let non_whitespace: Vec<u8> = ifs
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let mut current: Vec<u8> = Vec::new();
+    let mut current_markers: Vec<usize> = Vec::new();
+    let mut saw_unquoted = false;
+    let mut pending_non_whitespace = false;
+    for fragment in fragments {
+        record_source_carrier_markers(fragment, current.len(), &mut current_markers);
+        for byte in &fragment.bytes {
+            let is_ifs = ifs.as_bytes().contains(byte);
+            if fragment.splittable && !fragment.quoted && is_ifs {
+                saw_unquoted = true;
+                if non_whitespace.contains(byte) || !current.is_empty() {
+                    let taken = std::mem::take(&mut current);
+                    let taken_markers = std::mem::take(&mut current_markers);
+                    fields.push(materialize_field_text(&taken, &taken_markers));
+                    pending_non_whitespace = non_whitespace.contains(byte);
+                }
+                continue;
+            }
+            // IFS whitespace inside non-splittable (literal) fragments is
+            // data, not a delimiter: only real expansion output is subject
+            // to field splitting, so quoted literal text like "a b" must
+            // keep its space (niubash#92 fragment path).
+            if fragment.splittable && !fragment.quoted && whitespace.contains(byte) {
+                continue;
+            }
+            if pending_non_whitespace && current.is_empty() {
+                pending_non_whitespace = false;
+            }
+            current.push(*byte);
+        }
+    }
+    if !current.is_empty() || !saw_unquoted {
+        fields.push(materialize_field_text(&current, &current_markers));
+    }
+    fields
+}
+
+/// The byte a live CTLESC marker occupies inside source-text fragments.
+const CTLESC_MARKER_BYTE: u8 = crate::executor::markers::CTLESC as u8;
+
+/// Record the absolute positions a fragment's live CTLESC marker bytes will
+/// occupy when appended to an accumulator of length `base_len`.
+fn record_ctlesc_markers(
+    fragment: &ExpandedFragment,
+    base_len: usize,
+    marker_positions: &mut Vec<usize>,
+) {
+    if !fragment.ctlesc_markers {
+        return;
+    }
+    for (offset, byte) in fragment.bytes.iter().enumerate() {
+        if *byte == CTLESC_MARKER_BYTE {
+            marker_positions.push(base_len + offset);
+        }
+    }
+}
+
+/// Record the absolute positions of every live carrier-family byte of a
+/// SOURCE-TEXT fragment appended at `base_len`.
+///
+/// rubash#354: GNU keeps a character that was quoted in the source word
+/// (parse.y:5694-5706 got_escaped_character) riding through expansion with
+/// its CTLESC protection (subst.c:11639-11673) and strips the protection
+/// only at argv materialization (subst.c:4807 dequote_string), where the
+/// character becomes literal data. Rubash's source-text carriers
+/// (DATA_DQUOTE for `\"`, DATA_SQUOTE, DATA_BACKSLASH, ...) are the same
+/// in-band port: they must reach the argv materializer
+/// (materialize_expanded_command_word -> decode_word_position_carriers) as
+/// LIVE carrier chars, not be owner-tagged as payload data. Owner-tagging
+/// them here turned the marker pair into raw output bytes at the final
+/// decode (`echo "\"$(echo x)\""` printed 0x18 0x78 0x18).
+///
+/// Capture fragments keep the payload owner-tagging (ctlesc_markers ==
+/// false): a 0x18 byte that came OUT of a command substitution is data and
+/// must reach the output boundary as that byte.
+fn record_source_carrier_markers(
+    fragment: &ExpandedFragment,
+    base_len: usize,
+    marker_positions: &mut Vec<usize>,
+) {
+    if !fragment.ctlesc_markers {
+        return;
+    }
+    for (offset, byte) in fragment.bytes.iter().enumerate() {
+        if is_carrier_byte(*byte as u32) {
+            marker_positions.push(base_len + offset);
+        }
+    }
+}
+
+/// Materialize one accumulated field: bytes that are payload data go through
+/// the bytes_to_shell_text owner-tagging, while bytes at `marker_positions`
+/// (ascending) stay live carrier marker chars — the globber consumes them as
+/// per-character quoting (glob.c udequote_pathname, 429-448) and argv
+/// materialization strips them (dequote_string, subst.c:4807). This is the
+/// rubash port of GNU keeping CTLESC-protected characters in the expansion
+/// result until after pathname expansion (subst.c:11639-11673). A position
+/// may hold any carrier-family byte (CTLESC, DATA_DQUOTE, DATA_BACKSLASH,
+/// ... — rubash#354's source-text provenance set), and the original byte is
+/// what stays live; every carrier byte is ASCII, so the `as char` widening
+/// is exact.
+fn materialize_field_text(bytes: &[u8], marker_positions: &[usize]) -> String {
+    if marker_positions.is_empty() {
+        return bytes_to_shell_text(bytes);
+    }
+    let mut output = String::with_capacity(bytes.len());
+    let mut run_start = 0usize;
+    for &position in marker_positions {
+        if position > run_start {
+            output.push_str(&bytes_to_shell_text(&bytes[run_start..position]));
+        }
+        // Marker bytes are in-band PUA sentinels (ASCII-range carriers on
+        // the wire), never UTF-8 continuation bytes — From<u8> states that
+        // invariant instead of an unreviewed widening cast.
+        output.push(char::from(bytes[position]));
+        run_start = position + 1;
+    }
+    if run_start < bytes.len() {
+        output.push_str(&bytes_to_shell_text(&bytes[run_start..]));
+    }
+    output
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::executor) struct SubstitutionSpan {
+    pub(in crate::executor) start: usize,
+    pub(in crate::executor) end: usize,
+    pub(in crate::executor) context: SubstitutionQuoteContext,
+}
+
+#[allow(dead_code)]
+pub(in crate::executor) fn scan_substitution_spans(raw: &str) -> Vec<SubstitutionSpan> {
+    let chars: Vec<(usize, char)> = raw.char_indices().collect();
+    let mut spans = Vec::new();
+    let mut index = 0usize;
+    let mut single = false;
+    let mut double = false;
+    while index < chars.len() {
+        let (offset, ch) = chars[index];
+        if ch == '\\' && !single {
+            index += 2;
+            continue;
+        }
+        if ch == '\'' && !double {
+            single = !single;
+            index += 1;
+            continue;
+        }
+        if ch == '"' && !single {
+            double = !double;
+            index += 1;
+            continue;
+        }
+        let dollar_paren = ch == '$'
+            && chars.get(index + 1).is_some_and(|(_, next)| *next == '(')
+            && chars.get(index + 2).is_none_or(|(_, next)| *next != '(');
+        let backtick = ch == char::from(96);
+        if !single && (dollar_paren || backtick) {
+            let start = offset;
+            let context = if double {
+                SubstitutionQuoteContext::DoubleQuoted
+            } else {
+                SubstitutionQuoteContext::Unquoted
+            };
+            let mut depth = if dollar_paren { 1usize } else { 0usize };
+            let mut cursor = index + if dollar_paren { 2 } else { 1 };
+            let mut inner_single = false;
+            let mut inner_double = false;
+            // Track `case ... esac` pattern lists inside the span: a pattern
+            // clause's `)` (`case 1 in 1) echo;; esac`) must not close the
+            // substitution. Same word-boundary rules as the lexer's comsub
+            // scanner (lexer/skip.rs) and the embedded walker.
+            let mut inner_case_depth = 0usize;
+            let mut inner_word = String::new();
+            let mut inner_word_boundary = true;
+            let mut inner_current_word_boundary = true;
+            // `case WORD in' chain tracker (GNU special_case_tokens,
+            // parse.y:3369-3386 + 3433-3441) — see embedded_mutations
+            // update_command_substitution_case_depth (rubash#284).
+            let mut inner_case_in_stage = 0u8;
+            // PST_CASEPAT port (rubash#380).
+            let mut inner_case_pattern_region = false;
+            // rubash#380: previous significant unquoted char fed to the
+            // case word machine (the `esac` previous-token witness,
+            // parse.y:3181/3183).
+            let mut inner_prev_sig: Option<char> = None;
+            // GNU read_token (parse.y:3630-3643): `#` opens a comment only
+            // at a token boundary — after whitespace, a separator, or the
+            // body start. The comment runs to end of line and its text
+            // never reaches token recognition, so a `)` inside it does not
+            // close the span (issue #513).
+            let mut inner_token_boundary = true;
+            while cursor < chars.len() {
+                let (_, inner) = chars[cursor];
+                if inner == '\\' && !inner_single {
+                    cursor += 2;
+                    inner_token_boundary = false;
+                    continue;
+                }
+                if backtick && inner == char::from(96) && !inner_single && !inner_double {
+                    spans.push(SubstitutionSpan {
+                        start,
+                        end: chars[cursor].0 + 1,
+                        context,
+                    });
+                    index = cursor + 1;
+                    break;
+                }
+                if dollar_paren {
+                    if inner == '#' && !inner_single && !inner_double && inner_token_boundary {
+                        while cursor < chars.len() && chars[cursor].1 != '\n' {
+                            cursor += 1;
+                        }
+                        inner_word.clear();
+                        inner_word_boundary = true;
+                        inner_current_word_boundary = true;
+                        inner_token_boundary = true;
+                        continue;
+                    }
+                    crate::executor::embedded_mutations::update_command_substitution_case_depth_region(
+                        inner,
+                        inner_single,
+                        inner_double,
+                        &mut inner_word,
+                        &mut inner_case_depth,
+                        &mut inner_word_boundary,
+                        &mut inner_current_word_boundary,
+                        &raw[chars[cursor].0 + inner.len_utf8()..],
+                        &mut inner_case_in_stage,
+                        &mut inner_case_pattern_region,
+                        inner_prev_sig,
+                    );
+                    if !inner_single && !inner_double && crate::lexer::esac_prev_token_char(inner) {
+                        inner_prev_sig = Some(inner);
+                    }
+                    // Heredoc bodies are literal data for substitution-span
+                    // matching: parse.y gather_here_documents reads the whole
+                    // body before the parser looks at the next token, so a `)`
+                    // inside the body must not close the substitution. Mirrors
+                    // lexer/skip.rs skip_heredoc_in_command_substitution and
+                    // parser skip_command_substitution_heredoc.
+                    if !inner_single
+                        && !inner_double
+                        && inner == '<'
+                        && chars.get(cursor + 1).is_some_and(|&(_, next)| next == '<')
+                        && chars.get(cursor + 2).is_none_or(|&(_, next)| next != '<')
+                    {
+                        if let Some(next_cursor) =
+                            skip_command_substitution_heredoc_body(&chars, cursor)
+                        {
+                            cursor = next_cursor;
+                            continue;
+                        }
+                    }
+                    if inner == '\'' && !inner_double {
+                        inner_single = !inner_single;
+                    }
+                    // Inside double quotes, `$(...)` is a nested command
+                    // substitution (GNU parse.y `xparse_dolparen` / subst.c
+                    // `extract_command_substitution`): a `"` inside the nested
+                    // `$(...)` does NOT close the outer double quote.  Skip the
+                    // nested `$(...)` as a unit *before* the `"` toggle below so
+                    // the outer `inner_double` state is preserved.
+                    if inner_double
+                        && inner == '$'
+                        && chars.get(cursor + 1).is_some_and(|(_, next)| *next == '(')
+                        && chars.get(cursor + 2).is_none_or(|(_, next)| *next != '(')
+                    {
+                        if let Some(next_cursor) = skip_nested_dollar_paren_in_span(&chars, cursor)
+                        {
+                            cursor = next_cursor;
+                            continue;
+                        }
+                    }
+                    if inner == '"' && !inner_single {
+                        inner_double = !inner_double;
+                    }
+                    if !inner_single
+                        && !inner_double
+                        && inner == '$'
+                        && chars.get(cursor + 1).is_some_and(|(_, next)| *next == '(')
+                    {
+                        depth += 1;
+                        cursor += 2;
+                        inner_token_boundary = false;
+                        continue;
+                    }
+                    // GNU parse.y:3952-3956 parse_matched_pair: a `)` closes
+                    // only after count reaches zero, and EVERY unquoted `(`
+                    // nests (`ch == open` -> count++, no `$` prefix required)
+                    // — parse_comsub (parse.y:4451) parses `$(printf "%b"
+                    // @(hugo))` with the extglob group's `(` counted, so
+                    // hugo's `)` does not close the substitution. Counting
+                    // only `$(`-introduced parens truncated the span at the
+                    // first inner `)` and the fragment expander ran
+                    // `printf "%b" @(hugo` as the body (printf.tests line
+                    // 359 red gate).
+                    if !inner_single && !inner_double && inner == '(' && inner_case_depth == 0 {
+                        depth += 1;
+                    }
+                    if !inner_single && !inner_double && inner == ')' && inner_case_depth == 0 {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            spans.push(SubstitutionSpan {
+                                start,
+                                end: chars[cursor].0 + 1,
+                                context,
+                            });
+                            index = cursor + 1;
+                            break;
+                        }
+                    }
+                    // The boundary tracks what the live body tokenizer sees:
+                    // quote-delimited bytes are word text.
+                    if !inner_single && !inner_double {
+                        inner_token_boundary = inner.is_whitespace()
+                            || matches!(inner, ';' | '&' | '|' | '(' | ')' | '<' | '>');
+                    }
+                }
+                cursor += 1;
+            }
+            if index <= cursor {
+                index = cursor;
+            }
+            continue;
+        }
+        index += 1;
+    }
+    spans
+}
+
+/// Skip a nested `$(...)` command substitution that appears inside double
+/// quotes within a command-substitution span, returning the character index
+/// just past the matching `)`.
+///
+/// The nested `$(...)` has its own independent quote state: a `"` inside it
+/// does not affect the caller's `inner_double` flag.  This mirrors GNU
+/// `xparse_dolparen` (parse.y) and `extract_command_substitution` (subst.c),
+/// where the parser tracks quote state independently inside each nested
+/// substitution.
+fn skip_nested_dollar_paren_in_span(chars: &[(usize, char)], start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut cursor = start + 2; // skip `$(``
+    let mut single = false;
+    let mut double = false;
+    while cursor < chars.len() {
+        let (_, ch) = chars[cursor];
+        if ch == '\\' && !single {
+            cursor += 2;
+            continue;
+        }
+        if ch == '\'' && !double {
+            single = !single;
+            cursor += 1;
+            continue;
+        }
+        if ch == '"' && !single {
+            double = !double;
+            cursor += 1;
+            continue;
+        }
+        // Recursively skip nested `$(...)` inside double quotes so a `"`
+        // inside it does not toggle our `double` flag.
+        if double
+            && ch == '$'
+            && chars.get(cursor + 1).is_some_and(|(_, next)| *next == '(')
+            && chars.get(cursor + 2).is_none_or(|(_, next)| *next != '(')
+        {
+            if let Some(next_cursor) = skip_nested_dollar_paren_in_span(chars, cursor) {
+                cursor = next_cursor;
+                continue;
+            }
+        }
+        if !single
+            && !double
+            && ch == '$'
+            && chars.get(cursor + 1).is_some_and(|(_, next)| *next == '(')
+            && chars.get(cursor + 2).is_none_or(|(_, next)| *next != '(')
+        {
+            depth += 1;
+            cursor += 2;
+            continue;
+        }
+        if !single && !double && ch == '(' {
+            depth += 1;
+        }
+        if !single && !double && ch == ')' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(cursor + 1);
+            }
+        }
+        cursor += 1;
+    }
+    None
+}
+
+/// Advance past a here-document that appears inside a command-substitution
+/// span. `cursor` is the character index of the first `<` of `<<`; returns
+/// the character index just past the closing delimiter line.
+///
+/// Returns `None` when the header cannot be resolved (no delimiter word), in
+/// which case the caller falls back to ordinary character-by-character
+/// scanning.
+fn skip_command_substitution_heredoc_body(chars: &[(usize, char)], cursor: usize) -> Option<usize> {
+    let mut header_end = cursor + 2;
+    while header_end < chars.len() && chars[header_end].1 != '\n' {
+        header_end += 1;
+    }
+    if header_end >= chars.len() {
+        return None;
+    }
+    let header: String = chars[cursor + 2..header_end]
+        .iter()
+        .map(|&(_, ch)| ch)
+        .collect();
+    let strip_tabs = header.trim_start().starts_with('-');
+    let trimmed = if strip_tabs {
+        header.trim_start_matches([' ', '\t', '-'])
+    } else {
+        header.trim_start()
+    };
+    let Some(raw_delimiter) = trimmed.split_whitespace().next() else {
+        return None;
+    };
+    let delimiter = raw_delimiter
+        .trim_matches(['\'', '"'])
+        .trim_start_matches('\\');
+    if delimiter.is_empty() {
+        return None;
+    }
+
+    let mut line_start = header_end + 1;
+    while line_start <= chars.len() {
+        let mut line_end = line_start;
+        while line_end < chars.len() && chars[line_end].1 != '\n' {
+            line_end += 1;
+        }
+        let line: String = chars[line_start..line_end]
+            .iter()
+            .map(|&(_, ch)| ch)
+            .collect();
+        let candidate = if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line.as_str()
+        };
+        if candidate == delimiter {
+            return Some((line_end + (line_end < chars.len()) as usize).min(chars.len()));
+        }
+        // GNU make_cmd.c:602-611 (PST_EOFTOKEN): a body line that is the
+        // delimiter followed by `)` closes the heredoc and that `)` then
+        // closes the enclosing command substitution. Resume the span scan at
+        // the `)` so the caller's paren check closes the substitution there.
+        if candidate.strip_suffix(')') == Some(delimiter) {
+            let stripped = line.chars().count() - candidate.chars().count();
+            return Some((line_start + stripped + delimiter.chars().count()).min(chars.len()));
+        }
+        if line_end >= chars.len() {
+            break;
+        }
+        line_start = line_end + 1;
+    }
+    Some(chars.len())
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::executor) struct RawWordFragment {
+    pub(in crate::executor) text: String,
+    pub(in crate::executor) substitution: bool,
+    pub(in crate::executor) context: Option<SubstitutionQuoteContext>,
+}
+
+#[allow(dead_code)]
+pub(in crate::executor) fn split_raw_word_fragments(raw: &str) -> Vec<RawWordFragment> {
+    let spans = scan_substitution_spans(raw);
+    if spans.is_empty() {
+        return vec![RawWordFragment {
+            text: raw.to_string(),
+            substitution: false,
+            context: None,
+        }];
+    }
+    let mut fragments = Vec::new();
+    let mut cursor = 0usize;
+    for span in spans {
+        if span.start > cursor {
+            fragments.push(RawWordFragment {
+                text: raw[cursor..span.start].to_string(),
+                substitution: false,
+                context: None,
+            });
+        }
+        fragments.push(RawWordFragment {
+            text: raw[span.start..span.end].to_string(),
+            substitution: true,
+            context: Some(span.context),
+        });
+        cursor = span.end;
+    }
+    if cursor < raw.len() {
+        fragments.push(RawWordFragment {
+            text: raw[cursor..].to_string(),
+            substitution: false,
+            context: None,
+        });
+    }
+    fragments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::command_substitution_value_needs_payload_protection;
+
+    #[test]
+    fn payload_protection_boundary_rejects_lexical_backticks_and_existing_tokens() {
+        assert!(command_substitution_value_needs_payload_protection(
+            "$x",
+            &format!("{}{}", "a", crate::executor::markers::DATA_BACKTICK_STR)
+        ));
+        assert!(!command_substitution_value_needs_payload_protection(
+            "`$x`",
+            &format!("{}{}", "a", crate::executor::markers::DATA_BACKTICK_STR)
+        ));
+        assert!(!command_substitution_value_needs_payload_protection(
+            "$x",
+            &format!("{}1a;", crate::executor::markers::COMSUB_PAYLOAD_SENTINEL),
+        ));
+        assert!(!command_substitution_value_needs_payload_protection(
+            "literal",
+            &format!("{}{}", "a", crate::executor::markers::DATA_BACKTICK_STR)
+        ));
+    }
+
+    #[test]
+    fn span_scanner_tracks_mixed_quote_contexts() {
+        let spans = scan_substitution_spans(r#"pre$(u)"$(q)"post"#);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].context, SubstitutionQuoteContext::Unquoted);
+        assert_eq!(spans[1].context, SubstitutionQuoteContext::DoubleQuoted);
+    }
+
+    #[test]
+    fn span_scanner_ignores_arithmetic_expansions() {
+        assert!(scan_substitution_spans("A:$(( )); B:$(printf x)").len() == 1);
+        assert_eq!(scan_substitution_spans("A:$(( ))"), Vec::new());
+    }
+
+    #[test]
+    fn span_scanner_ignores_nested_syntax_inside_single_quotes() {
+        let spans = scan_substitution_spans(r#"'$(literal)' $(outer $(inner))"#);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].context, SubstitutionQuoteContext::Unquoted);
+    }
+
+    #[test]
+    fn span_scanner_treats_heredoc_bodies_as_literal_data() {
+        // parse.y gather_here_documents reads the whole heredoc body before
+        // the parser looks at the next token, so a `)` inside the body must
+        // not close the command substitution (heredoc3.sub `this paren ) is
+        // not a problem`).
+        let raw = "$(cat <<EOF\nthis paren ) is not a problem\nEOF\n)";
+        let spans = scan_substitution_spans(raw);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(raw.get(spans[0].start..spans[0].end), Some(raw));
+    }
+
+    #[test]
+    fn span_scanner_resumes_at_paren_after_heredoc_delimiter() {
+        // GNU make_cmd.c:602-611 (PST_EOFTOKEN): `EOF)` closes the heredoc
+        // and the same `)` closes the substitution.
+        let raw = "$(cat <<EOF\nbody\nEOF)\nrest";
+        let spans = scan_substitution_spans(raw);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            raw.get(spans[0].start..spans[0].end),
+            Some("$(cat <<EOF\nbody\nEOF)")
+        );
+    }
+
+    #[test]
+    fn raw_fragments_preserve_adjacent_literal_and_substitution_spans() {
+        let fragments = split_raw_word_fragments(r#"pre$(u)"$(q)"post"#);
+        assert_eq!(fragments.len(), 5);
+        assert_eq!(fragments[0].text, "pre");
+        assert!(!fragments[0].substitution);
+        assert_eq!(fragments[1].text, "$(u)");
+        assert_eq!(
+            fragments[1].context,
+            Some(SubstitutionQuoteContext::Unquoted)
+        );
+        assert_eq!(fragments[2].text, "\"");
+        assert_eq!(fragments[3].text, "$(q)");
+        assert_eq!(
+            fragments[3].context,
+            Some(SubstitutionQuoteContext::DoubleQuoted)
+        );
+        assert_eq!(fragments[4].text, "\"post");
+    }
+
+    #[test]
+    fn readback_removes_nuls_and_trailing_line_terminators() {
+        let output = SubstitutionOutput::readback(
+            b"a\0b\n\n".to_vec(),
+            17,
+            SubstitutionQuoteContext::HereDocument,
+        );
+        assert_eq!(output.bytes, b"ab");
+        assert_eq!(output.status, 17);
+        assert_eq!(output.context, SubstitutionQuoteContext::HereDocument);
+        assert_eq!(output.text_lossy(), "ab");
+    }
+
+    /// Windows-native tools write "\r\n" for every "\n". The '\r' of a CRLF
+    /// terminator leaves with the '\n' it belongs to; an interior CRLF and a
+    /// lone trailing '\r' are data (niubash #120). Unix keeps the GNU
+    /// contract instead (E17): subst.c strips trailing <newline> bytes only,
+    /// so every '\r' survives as data.
+    #[test]
+    fn readback_strips_crlf_terminators_only() {
+        #[cfg(windows)]
+        let (terminator_want, repeated_want, interior_want): (&[u8], &[u8], &[u8]) =
+            (b"a", b"a", b"a\r\nb");
+        #[cfg(not(windows))]
+        let (terminator_want, repeated_want, interior_want): (&[u8], &[u8], &[u8]) =
+            (b"a\r", b"a\r\n\r", b"a\r\nb\r");
+
+        let terminator =
+            SubstitutionOutput::readback(b"a\r\n".to_vec(), 0, SubstitutionQuoteContext::Unquoted);
+        assert_eq!(terminator.bytes, terminator_want);
+
+        let repeated = SubstitutionOutput::readback(
+            b"a\r\n\r\n".to_vec(),
+            0,
+            SubstitutionQuoteContext::Unquoted,
+        );
+        assert_eq!(repeated.bytes, repeated_want);
+
+        let interior = SubstitutionOutput::readback(
+            b"a\r\nb\r\n".to_vec(),
+            0,
+            SubstitutionQuoteContext::Unquoted,
+        );
+        assert_eq!(interior.bytes, interior_want);
+
+        let lone_cr =
+            SubstitutionOutput::readback(b"a\r".to_vec(), 0, SubstitutionQuoteContext::Unquoted);
+        assert_eq!(lone_cr.bytes, b"a\r");
+    }
+
+    #[test]
+    fn readback_preserves_sentinels_and_invalid_utf8_until_text_conversion() {
+        let output = SubstitutionOutput::readback(
+            vec![0x1d, 0x1f, 0x1a, 0x15, 0xff, b'\n', b'\n'],
+            23,
+            SubstitutionQuoteContext::DoubleQuoted,
+        );
+        assert_eq!(output.bytes, vec![0x1d, 0x1f, 0x1a, 0x15, 0xff]);
+        assert_eq!(output.status, 23);
+        assert_eq!(output.context, SubstitutionQuoteContext::DoubleQuoted);
+        // d45619ee: every carrier-range byte (0x0c/0x11/0x13 + 0x14..=0x1f)
+        // and every invalid-UTF-8 byte is owner-tagged as an E000/E001+b
+        // marker pair — raw passthrough would let a carrier consumer claim
+        // user data. The readback bytes stay untouched; only text_lossy
+        // encodes.
+        assert_eq!(
+            output
+                .text_lossy()
+                .chars()
+                .map(|ch| ch as u32)
+                .collect::<Vec<_>>(),
+            [0x1d, 0x1f, 0x1a, 0x15, 0xff]
+                .iter()
+                .flat_map(|b| [RAW_BYTE_MARKER_ESCAPE, RAW_BYTE_MARKER_FIRST + *b as u32])
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn substitution_output_into_fragment_preserves_bytes_and_quote_policy() {
+        let unquoted = SubstitutionOutput::readback(
+            vec![0x1d, 0x1f, b'a'],
+            0,
+            SubstitutionQuoteContext::Unquoted,
+        )
+        .into_fragment();
+        assert_eq!(unquoted.bytes, vec![0x1d, 0x1f, b'a']);
+        assert!(!unquoted.quoted);
+        assert!(unquoted.splittable);
+
+        let quoted = SubstitutionOutput::readback(
+            vec![0x1a, 0x15, b'b'],
+            0,
+            SubstitutionQuoteContext::DoubleQuoted,
+        )
+        .into_fragment();
+        assert_eq!(quoted.bytes, vec![0x1a, 0x15, b'b']);
+        assert!(quoted.quoted);
+        assert!(!quoted.splittable);
+    }
+
+    #[test]
+    fn expanded_word_tracks_status_and_materializes_only_at_boundary() {
+        let mut word = ExpandedWord::default();
+        word.append_literal("pre", true);
+        word.append_substitution(SubstitutionOutput::readback(
+            vec![0x1d, b'a', b' ', b'b'],
+            41,
+            SubstitutionQuoteContext::Unquoted,
+        ));
+        assert_eq!(word.status, Some(41));
+        // d45619ee carrier contract: the substitution byte 0x1d is
+        // owner-tagged in materialized text (UTF-8 of U+E000 U+E01E), not
+        // emitted raw — decoders restore it at the byte boundary.
+        let mut expected = b"pre".to_vec();
+        expected.extend_from_slice(
+            format!(
+                "{}{}",
+                char::from_u32(RAW_BYTE_MARKER_ESCAPE).unwrap(),
+                char::from_u32(RAW_BYTE_MARKER_FIRST + 0x1d).unwrap()
+            )
+            .as_bytes(),
+        );
+        expected.extend_from_slice(b"a b");
+        assert_eq!(word.materialize_lossy_at_boundary().as_bytes(), &expected);
+        assert_eq!(
+            word.split(Some(" "), SubstitutionSplitPolicy::Split),
+            vec![
+                format!(
+                    "pre{}{}a",
+                    char::from_u32(RAW_BYTE_MARKER_ESCAPE).unwrap(),
+                    char::from_u32(RAW_BYTE_MARKER_FIRST + 0x1d).unwrap()
+                ),
+                "b".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn unquoted_ifs_splits_but_quoted_fragment_does_not() {
+        let fragments = [
+            ExpandedFragment::expanded("a  b", false),
+            ExpandedFragment::literal(" c d", true),
+        ];
+        assert_eq!(
+            split_expanded_fragments(&fragments, Some(" \t\n"), SubstitutionSplitPolicy::Split),
+            vec!["a", "b c d"]
+        );
+    }
+
+    #[test]
+    fn non_whitespace_ifs_preserve_interior_empty_fields() {
+        let fragments = [ExpandedFragment::expanded("a::b:", false)];
+        assert_eq!(
+            split_expanded_fragments(&fragments, Some(":"), SubstitutionSplitPolicy::Split),
+            vec!["a", "", "b"]
+        );
+    }
+
+    #[test]
+    fn literal_ifs_bytes_are_not_field_split() {
+        let fragments = [ExpandedFragment::literal("a::b:", false)];
+        assert_eq!(
+            split_expanded_fragments(&fragments, Some(":"), SubstitutionSplitPolicy::Split),
+            vec!["a::b:"],
+        );
+    }
+
+    #[test]
+    fn split_keeps_multibyte_literal_bytes_without_mojibake() {
+        // niubash#92 fragment path: `"中文$(echo h)"$(echo x)` expands a
+        // quoted literal + two substitution outputs under Split policy.
+        // Field materialization must UTF-8 decode bytes, not widen each
+        // byte with `byte as char` (which printed ä¸­æ–‡hx).
+        let fragments = [
+            ExpandedFragment::literal("中文", false),
+            ExpandedFragment::expanded("h", false),
+            ExpandedFragment::expanded("x", false),
+        ];
+        assert_eq!(
+            split_expanded_fragments(&fragments, Some(" \t\n"), SubstitutionSplitPolicy::Split),
+            vec!["中文hx"]
+        );
+    }
+
+    /// rubash#187: a mixed word's quoted span sits BEFORE the command
+    /// substitution (`pre"a*"$(echo hi)post`). The literal fragment's
+    /// CTLESC bytes are live glob-protection markers (GNU expand_word_
+    /// internal copies quoted chars with CTLESC, subst.c:11639-11673) and
+    /// must survive the byte splice as raw marker chars — NOT be
+    /// owner-tagged as payload data the way bytes captured FROM the
+    /// substitution are.
+    #[test]
+    fn split_keeps_literal_ctlesc_markers_as_chars_and_capture_bytes_as_data() {
+        let literal = format!("a{}*", crate::executor::markers::CTLESC);
+        let fragments = [
+            ExpandedFragment::literal("pre", false),
+            ExpandedFragment::literal(&literal, false),
+            ExpandedFragment {
+                bytes: vec![b'h', b'i'],
+                quoted: false,
+                splittable: true,
+                ctlesc_markers: false,
+            },
+            ExpandedFragment::literal("post", false),
+        ];
+        let fields = split_expanded_fragments(&fragments, None, SubstitutionSplitPolicy::NoSplit);
+        assert_eq!(
+            fields[0].chars().collect::<Vec<_>>(),
+            vec!['p', 'r', 'e', 'a', '\u{11}', '*', 'h', 'i', 'p', 'o', 's', 't']
+        );
+    }
+
+    /// rubash#187 companion: a 0x11 byte that came OUT of a command
+    /// substitution is payload data — the splice owner-tags it, so the
+    /// globber and the final dequote never mistake it for a marker.
+    #[test]
+    fn split_owner_tags_capture_0x11_as_data() {
+        let fragments = [
+            ExpandedFragment::literal("x", false),
+            ExpandedFragment {
+                bytes: vec![0x11],
+                quoted: true,
+                splittable: false,
+                ctlesc_markers: false,
+            },
+            ExpandedFragment::literal("y", false),
+        ];
+        let fields = split_expanded_fragments(&fragments, None, SubstitutionSplitPolicy::NoSplit);
+        assert_eq!(
+            fields[0].chars().map(|ch| ch as u32).collect::<Vec<_>>(),
+            vec![
+                'x' as u32,
+                RAW_BYTE_MARKER_ESCAPE,
+                RAW_BYTE_MARKER_FIRST + 0x11,
+                'y' as u32,
+            ]
+        );
+    }
+
+    #[test]
+    fn split_preserves_ifs_whitespace_inside_literal_fragments() {
+        // Literal (non-splittable) fragment text is data: the space inside
+        // `"a b$(echo h)"` is quoted source text and survives field
+        // splitting even though the word as a whole is split-eligible.
+        let fragments = [
+            ExpandedFragment::literal("a b", false),
+            ExpandedFragment::expanded("h", false),
+            ExpandedFragment::expanded("x", false),
+        ];
+        assert_eq!(
+            split_expanded_fragments(&fragments, Some(" \t\n"), SubstitutionSplitPolicy::Split),
+            vec!["a bhx"]
+        );
+    }
+
+    #[test]
+    fn no_split_keeps_empty_and_adjacent_fragments_as_one_word() {
+        let fragments = [
+            ExpandedFragment::literal("pre", true),
+            ExpandedFragment::literal("", true),
+            ExpandedFragment::literal("post", true),
+        ];
+        assert_eq!(
+            split_expanded_fragments(&fragments, Some(":"), SubstitutionSplitPolicy::NoSplit),
+            vec!["prepost"]
+        );
+    }
+
+    #[test]
+    fn no_split_materializes_invalid_bytes_as_raw_markers() {
+        let fragments = [ExpandedFragment {
+            bytes: vec![b'a', 0xff, b'b'],
+            quoted: true,
+            splittable: false,
+            ctlesc_markers: false,
+        }];
+        let fields = split_expanded_fragments(&fragments, None, SubstitutionSplitPolicy::NoSplit);
+        assert_eq!(
+            fields[0].chars().map(|ch| ch as u32).collect::<Vec<_>>(),
+            vec![
+                b'a' as u32,
+                RAW_BYTE_MARKER_ESCAPE,
+                RAW_BYTE_MARKER_FIRST + 0xff,
+                b'b' as u32,
+            ],
+        );
+    }
+
+    #[test]
+    fn readback_keeps_child_quote_bytes_as_data() {
+        let output = SubstitutionOutput::readback(
+            b"\"x y\"\n".to_vec(),
+            0,
+            SubstitutionQuoteContext::DoubleQuoted,
+        );
+        assert_eq!(output.text_lossy(), "\"x y\"");
+    }
+
+    #[test]
+    fn read_shell_input_file_preserves_invalid_utf8_as_raw_markers() {
+        let dir =
+            std::env::temp_dir().join(format!("rubash-read-input-bytes-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("input.bin");
+        std::fs::write(&path, [b'a', b'b', 0xff, b'\n']).unwrap();
+
+        let text = read_shell_input_file(&path).unwrap();
+        assert_eq!(
+            text.chars().map(|ch| ch as u32).collect::<Vec<_>>(),
+            vec![
+                b'a' as u32,
+                b'b' as u32,
+                RAW_BYTE_MARKER_ESCAPE,
+                RAW_BYTE_MARKER_FIRST + 0xff,
+                b'\n' as u32,
+            ]
+        );
+
+        // Valid UTF-8 segments keep their exact bytes, including multibyte
+        // characters adjacent to an invalid sequence.
+        std::fs::write(&path, vec![0xe4, 0xbd, 0xa0, 0xff, b'o', b'k']).unwrap();
+        let mixed = read_shell_input_file(&path).unwrap();
+        assert_eq!(
+            mixed.chars().map(|ch| ch as u32).collect::<Vec<_>>(),
+            vec![
+                0x4f60,
+                RAW_BYTE_MARKER_ESCAPE,
+                RAW_BYTE_MARKER_FIRST + 0xff,
+                b'o' as u32,
+                b'k' as u32
+            ],
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_text_roundtrip_preserves_raw_bytes_and_valid_utf8() {
+        let bytes = vec![b'a', 0xff, b'\n', 0xe4, 0xbd, 0xa0];
+        let encoded = bytes_to_shell_text(&bytes);
+        assert_eq!(shell_text_to_raw_bytes(&encoded), bytes);
+        // Valid UTF-8 passes through without marker encoding.
+        let text = "plain \u{4f60} text";
+        assert_eq!(
+            String::from_utf8(shell_text_to_raw_bytes(text)).unwrap(),
+            text.to_string()
+        );
+    }
+
+    #[test]
+    fn private_use_glyphs_survive_marker_decode() {
+        // Prompt themes use private-use glyphs (U+E0A0 git branch,
+        // U+E0B0 powerline separators). They are payload text, not markers.
+        let text = "\u{e0a0}\u{e0b0} main";
+        assert_eq!(
+            String::from_utf8(decode_raw_byte_markers(text.as_bytes())).unwrap(),
+            text
+        );
+        assert_eq!(shell_text_to_raw_bytes(text), text.as_bytes().to_vec());
+    }
+
+    #[test]
+    fn prompt_assignment_markers_restore_c0_but_not_pua_glyphs() {
+        // Starship-style PS1: \[ ESC [1;35m \] U+E0A0 " main". The ESC byte
+        // is marker-encoded for scalar storage and restored at the prompt
+        // boundary; the private-use glyph passes through byte-exact.
+        let mut ps1 = b"\\[\x1b[1;35m\\]".to_vec();
+        ps1.extend_from_slice("\u{e0a0}".as_bytes());
+        ps1.extend_from_slice(b" main");
+        let stored = bytes_to_assignment_shell_text(&ps1);
+        assert_eq!(
+            decode_raw_byte_markers(stored.as_bytes()),
+            ps1,
+            "prompt boundary must restore ESC exactly and keep the glyph"
+        );
+    }
+
+    #[test]
+    fn literal_sentinel_roundtrips_through_marker_encoding() {
+        let text = "a\u{e000}b\u{e0a0}";
+        let encoded = bytes_to_shell_text(text.as_bytes());
+        assert_ne!(encoded, text, "literal sentinels must be escaped");
+        assert_eq!(
+            String::from_utf8(shell_text_to_raw_bytes(&encoded)).unwrap(),
+            text
+        );
+        let invalid = vec![b'a', 0xe0, b'b'];
+        assert_eq!(
+            shell_text_to_raw_bytes(&bytes_to_shell_text(&invalid)),
+            invalid
+        );
+    }
+}

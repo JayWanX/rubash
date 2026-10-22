@@ -1,0 +1,1553 @@
+//! Array-related functions for the executor module.
+//!
+//! Contains free functions and `Executor` methods for working with
+//! indexed arrays, array storage, and array subscripts.
+
+mod executor;
+mod mapfile;
+mod storage;
+
+pub(super) use mapfile::split_mapfile_input;
+pub(crate) use storage::{ansic_quote, ansic_shouldquote};
+// rubash#616 (1a): typed-cell writers shared with builtins::declare and
+// builtins::printf (executor/mod.rs re-exports them at crate visibility).
+pub(super) use storage::{
+    append_indexed_mirror_segments, array_indices, array_store_enabled, array_value_at,
+    array_values, clean_negative_literal_subscript, format_indexed_array_storage,
+    format_indexed_array_values, indexed_array_entries, indexed_array_entries_cached,
+    is_array_storage, is_marked_array_var, normalize_array_expanded_value,
+    parse_array_integer_subscript, parse_array_numeric_subscript, parse_array_subscript,
+    parse_expanded_array_subscript, quote_array_value, resolve_indexed_array_subscript,
+    store_indexed_array, store_indexed_array_state, sync_typed_assoc_array,
+    sync_typed_indexed_array, sync_typed_indexed_element, upsert_typed_assoc_element,
+    AssocElementUpsert,
+};
+pub(crate) use storage::{
+    drop_typed_assoc_array, drop_typed_indexed_array, replace_typed_indexed_array,
+    sync_typed_assoc_storage, sync_typed_indexed_storage,
+};
+
+use std::collections::{BTreeMap, HashMap};
+
+use super::assignment_expansion::decode_compound_expansion_carriers;
+use super::{
+    apply_parameter_case_mod, assoc_value_at, eval_arith_value, eval_conditional_arith_value,
+    is_marked_var, is_shell_name, parse_indirect_pattern_removal, parse_parameter_case_mod,
+    parse_parameter_replacement, parse_parameter_transform, remove_parameter_pattern,
+    split_indexed_tagged_token, split_storage_words, unquote_storage_value, Executor,
+    ParameterTransform, ARRAY_FIELD_SPLIT_MARKER, ASSOC_VARS,
+};
+use crate::executor::markers::{DATA_DOLLAR, STORAGE_WORD_PREFIX};
+use crate::lexer::remove_shell_quotes;
+use crate::CommandNode;
+
+pub(super) fn is_array_element_assignment_word(word: &str) -> bool {
+    let Some((left, _)) = word.split_once('=') else {
+        return false;
+    };
+    let left = left.strip_suffix('+').unwrap_or(left);
+    let Some((name, index)) = left.split_once('[') else {
+        return false;
+    };
+    if !is_shell_name(name) {
+        return false;
+    }
+    // GNU skipsubscript (subst.c:2186 -> skip_matched_pair subst.c:2086):
+    // the subscript closes at the `]` that returns the bracket count to
+    // zero; nested `[` increments it, and quotes, escapes, backticks,
+    // `$(...)` and `${...}` hide their contents. `declare m["foo[bar"]=v`
+    // expands to `m[foo[bar]=v`, whose nested `[` leaves the subscript
+    // unterminated — GNU reports `not a valid identifier` — while
+    // `a[foo]bar]=v` has subscript `foo` and a `bar]` suffix that makes
+    // the word not an assignment at all (GNU: command not found).
+    let bytes = index.as_bytes();
+    let mut depth = 0usize;
+    let mut single = false;
+    let mut double = false;
+    let mut index_pos = 0usize;
+    while index_pos < bytes.len() {
+        let ch = bytes[index_pos];
+        if ch == b'\\' && !single {
+            index_pos += 2;
+            continue;
+        }
+        if single {
+            if ch == b'\'' {
+                single = false;
+            }
+            index_pos += 1;
+            continue;
+        }
+        if double {
+            if ch == b'"' {
+                double = false;
+            }
+            index_pos += 1;
+            continue;
+        }
+        match ch {
+            b'\'' => single = true,
+            b'"' => double = true,
+            b'`' => {
+                index_pos += 1;
+                while index_pos < bytes.len() && bytes[index_pos] != b'`' {
+                    index_pos += if bytes[index_pos] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'$' if bytes.get(index_pos + 1) == Some(&b'(')
+                || bytes.get(index_pos + 1) == Some(&b'{') =>
+            {
+                index_pos = skip_dollar_pair(bytes, index_pos + 1);
+                continue;
+            }
+            b'[' => depth += 1,
+            b']' if depth == 0 => return index_pos == bytes.len() - 1,
+            b']' => depth -= 1,
+            _ => {}
+        }
+        index_pos += 1;
+    }
+    false
+}
+
+/// Whether `cmd.words[index]` is an array-element assignment word.
+/// The parser's `array_element_assignments` nodes are authoritative — they
+/// were built with quote-aware raw scanning, so a subscript containing a
+/// quoted `]` (`A["]"]=v`, cooked `A[]]=v`) is recognized even though the
+/// de-quoted text no longer shows the real delimiter. The cooked-text scan
+/// remains as a fallback for synthetic commands built without parser
+/// metadata.
+pub(super) fn command_word_is_array_element_assignment(cmd: &CommandNode, index: usize) -> bool {
+    if cmd
+        .array_element_assignments
+        .iter()
+        .any(|assignment| assignment.word_index == Some(index))
+    {
+        return true;
+    }
+    cmd.words
+        .get(index)
+        .is_some_and(|word| is_array_element_assignment_word(word))
+}
+
+/// Skip a `$(`/`${` body starting at the delimiter (`(`/`{`) position,
+/// tracking nested delimiters, quotes, escapes and backticks
+/// (skip_matched_pair handling of `$(...)`/`${...}`).
+fn skip_dollar_pair(bytes: &[u8], open_pos: usize) -> usize {
+    let (open, close) = if bytes[open_pos] == b'(' {
+        (b'(', b')')
+    } else {
+        (b'{', b'}')
+    };
+    let mut depth = 1usize;
+    let mut single = false;
+    let mut double = false;
+    let mut index = open_pos + 1;
+    while index < bytes.len() {
+        let ch = bytes[index];
+        if ch == b'\\' && !single {
+            index += 2;
+            continue;
+        }
+        if single {
+            if ch == b'\'' {
+                single = false;
+            }
+            index += 1;
+            continue;
+        }
+        if double {
+            if ch == b'"' {
+                double = false;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            b'\'' => single = true,
+            b'"' => double = true,
+            b'`' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'`' {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+            }
+            _ if ch == open => depth += 1,
+            _ if ch == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return index + 1;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
+pub(super) fn append_scalar_value(current: &str, value: &str) -> String {
+    let mut output = current.to_string();
+    output.push_str(value);
+    output
+}
+
+fn is_ifs_whitespace(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n')
+}
+
+// \x1c marks whitespace that was quoted/escaped inside a `${var-word}`
+// style alternate: GNU removes the quotes but keeps such whitespace out of
+// field splitting (posixexp2 37). The marker is consumed here and the
+// protected char becomes plain field data.
+fn split_ifs_whitespace(value: &str, ifs: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == crate::executor::markers::IFS_GLUE {
+            if let Some(protected) = chars.next() {
+                current.push(protected);
+            }
+            continue;
+        }
+        if ifs.contains(ch) {
+            if !current.is_empty() {
+                fields.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        fields.push(current);
+    }
+    fields
+}
+
+fn split_mixed_ifs(value: &str, ifs: &str) -> Vec<String> {
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == crate::executor::markers::IFS_GLUE {
+            index += 1;
+            if index < chars.len() {
+                current.push(chars[index]);
+                index += 1;
+            }
+            continue;
+        }
+        if !ifs.contains(ch) {
+            current.push(ch);
+            index += 1;
+            continue;
+        }
+
+        if is_ifs_whitespace(ch) {
+            while index < chars.len()
+                && ifs.contains(chars[index])
+                && is_ifs_whitespace(chars[index])
+            {
+                index += 1;
+            }
+            if index < chars.len() && !is_ifs_whitespace(chars[index]) && ifs.contains(chars[index])
+            {
+                continue;
+            }
+            if !current.is_empty() {
+                fields.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        fields.push(std::mem::take(&mut current));
+        index += 1;
+        while index < chars.len() && ifs.contains(chars[index]) && is_ifs_whitespace(chars[index]) {
+            index += 1;
+        }
+    }
+
+    if !current.is_empty() {
+        fields.push(current);
+    }
+    fields
+}
+
+/// IFS splitting when the value or IFS contains raw-byte markers.
+///
+/// GNU `subst.c:1148-1250` (`string_extract_verbatim`) walks the string
+/// byte-by-byte, uses `mbrtowc` to identify multibyte character boundaries,
+/// and checks each complete character against the IFS character list via
+/// `wcschr`. A multibyte character like `€` (U+20AC, bytes E2 82 AC) is
+/// never split even if one of its bytes appears in IFS.
+///
+/// Rubash stores bytes >= 0x80 as U+E000 + U+E0xx marker pairs inside Rust
+/// Strings. This function decodes both sides to raw bytes, walks the value
+/// respecting UTF-8 character boundaries, and re-encodes the result.
+fn field_split_with_raw_byte_markers(value: &str, ifs: &str) -> Vec<String> {
+    use crate::executor::substitution_metadata::{
+        decode_raw_byte_markers, encode_raw_byte_marker, RAW_BYTE_MARKER_ESCAPE,
+    };
+
+    let sentinel = char::from_u32(RAW_BYTE_MARKER_ESCAPE).expect("sentinel is valid");
+
+    // Decode both sides to raw bytes.
+    let value_bytes = if value.contains(sentinel) {
+        decode_raw_byte_markers(value.as_bytes())
+    } else {
+        value.as_bytes().to_vec()
+    };
+    let ifs_bytes = if ifs.contains(sentinel) {
+        decode_raw_byte_markers(ifs.as_bytes())
+    } else {
+        ifs.as_bytes().to_vec()
+    };
+
+    // Build the IFS character list: each entry is a byte sequence for one
+    // IFS character (1 byte for ASCII, 1-4 bytes for UTF-8 multibyte).
+    let ifs_chars = split_into_chars(&ifs_bytes);
+    let ifs_is_whitespace =
+        |bytes: &[u8]| bytes.len() == 1 && matches!(bytes[0], b' ' | b'\t' | b'\n');
+
+    let mut fields: Vec<Vec<u8>> = Vec::new();
+    let mut current_bytes: Vec<u8> = Vec::new();
+    let mut index = 0;
+
+    while index < value_bytes.len() {
+        // \x1c protection marker: next byte is literal data, not a separator.
+        if value_bytes[index] == 0x1c {
+            index += 1;
+            if index < value_bytes.len() {
+                current_bytes.push(value_bytes[index]);
+                index += 1;
+            }
+            continue;
+        }
+
+        // Try to parse a UTF-8 character starting here.
+        let char_len = utf8_char_len(&value_bytes[index..]);
+        let char_bytes = &value_bytes[index..index + char_len];
+
+        // Check if this character matches any IFS character.
+        let matched_ifs = ifs_chars.iter().find(|ifs_char| {
+            ifs_char.len() == char_bytes.len() && ifs_char.as_slice() == char_bytes
+        });
+
+        if let Some(matched) = matched_ifs {
+            if ifs_is_whitespace(matched) {
+                // Whitespace IFS: skip consecutive whitespace IFS chars.
+                fields.push(std::mem::take(&mut current_bytes));
+                index += char_len;
+                while index < value_bytes.len() {
+                    let cl = utf8_char_len(&value_bytes[index..]);
+                    let cb = &value_bytes[index..index + cl];
+                    let is_ws_sep = ifs_chars.iter().any(|ic| {
+                        ic.len() == cb.len() && ic.as_slice() == cb && ifs_is_whitespace(ic)
+                    });
+                    if is_ws_sep {
+                        index += cl;
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            } else {
+                // Non-whitespace IFS: every separator produces a field.
+                fields.push(std::mem::take(&mut current_bytes));
+                index += char_len;
+                continue;
+            }
+        }
+
+        // Not a separator: add this character to the current field.
+        current_bytes.extend_from_slice(char_bytes);
+        index += char_len;
+    }
+
+    fields.push(std::mem::take(&mut current_bytes));
+
+    // Drop trailing empty field from a trailing non-whitespace separator.
+    if fields.last().is_some_and(|f| f.is_empty()) && fields.len() > 1 {
+        fields.pop();
+    }
+
+    // Re-encode byte fields back to Rust Strings with raw-byte markers.
+    fields
+        .into_iter()
+        .map(|bytes| bytes_to_shell_text(&bytes, &sentinel, &encode_raw_byte_marker))
+        .collect()
+}
+
+/// Split a byte sequence into individual characters (UTF-8 aware).
+/// Invalid UTF-8 bytes are treated as single-byte characters.
+fn split_into_chars(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut chars = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let len = utf8_char_len(&bytes[index..]);
+        chars.push(bytes[index..index + len].to_vec());
+        index += len;
+    }
+    chars
+}
+
+/// Return the length (in bytes) of the UTF-8 character starting at the
+/// beginning of `bytes`. Invalid bytes are treated as 1-byte characters.
+fn utf8_char_len(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let first = bytes[0];
+    if first < 0x80 {
+        1
+    } else if first & 0xE0 == 0xC0 {
+        2.min(bytes.len())
+    } else if first & 0xF0 == 0xE0 {
+        3.min(bytes.len())
+    } else if first & 0xF8 == 0xF0 {
+        4.min(bytes.len())
+    } else {
+        1
+    }
+}
+
+/// Re-encode raw bytes as a Rust String, using raw-byte markers for bytes
+/// >= 0x80 so the result is valid UTF-8 and round-trips through the executor.
+fn bytes_to_shell_text(
+    bytes: &[u8],
+    sentinel: &char,
+    encode_raw_byte_marker: &dyn Fn(u8) -> String,
+) -> String {
+    let mut output = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let len = utf8_char_len(&bytes[index..]);
+        let slice = &bytes[index..index + len];
+        if let Ok(text) = std::str::from_utf8(slice) {
+            output.push_str(text);
+        } else {
+            for &byte in slice {
+                if byte < 0x80 {
+                    output.push(char::from(byte));
+                } else {
+                    output.push_str(&encode_raw_byte_marker(byte));
+                }
+            }
+        }
+        index += len;
+    }
+    let _ = sentinel; // suppress unused warning
+    output
+}
+
+pub(super) fn field_split_values_with_ifs(value: &str, ifs: Option<&str>) -> Vec<String> {
+    let Some(ifs) = ifs else {
+        return split_ifs_whitespace(value, " \t\n");
+    };
+    if ifs.is_empty() {
+        // An empty IFS disables field splitting, not empty-field removal:
+        // GNU expand_word_list_internal (subst.c:13219) contributes no
+        // field at all for an unquoted expansion that produces nothing
+        // (`IFS='' ; for v in 1 a $x` iterates twice when x is unset).
+        return if value.is_empty() {
+            Vec::new()
+        } else {
+            vec![value.to_string()]
+        };
+    }
+
+    // Bash defines IFS whitespace narrowly as space, tab, and newline.
+    // Other Unicode whitespace remains data unless explicitly listed in IFS.
+    if ifs == " \t\n" {
+        return split_ifs_whitespace(value, ifs);
+    }
+
+    // When the value or IFS contains raw-byte markers (multibyte chars
+    // stored as U+E000 + U+E0xx pairs), char-level `ifs.contains(ch)` would
+    // falsely match the marker sentinel. Decode to bytes and split at the
+    // byte level while respecting UTF-8 character boundaries, matching GNU
+    // subst.c:1210-1240 (mbrtowc + wcschr against the IFS wchar list).
+    let sentinel = char::from_u32(crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
+        .expect("raw-byte sentinel is a valid char");
+    if value.contains(sentinel) || ifs.contains(sentinel) {
+        return field_split_with_raw_byte_markers(value, ifs);
+    }
+
+    if ifs.chars().all(is_ifs_whitespace) {
+        return split_ifs_whitespace(value, ifs);
+    }
+
+    if ifs.chars().any(is_ifs_whitespace) {
+        return split_mixed_ifs(value, ifs);
+    }
+
+    // Non-whitespace IFS: every separator produces a field. Bash keeps leading
+    // and internal empty fields (`IFS=:; set -- :a::b`) and drops only the
+    // final empty field produced by a trailing delimiter.
+    // \x1c marks literal IFS characters that must not be split (GNU CTLESC:
+    // literal word characters are marked during expansion, only expansion
+    // results are eligible for IFS splitting).
+    let chars: Vec<char> = value.chars().collect();
+    let mut fields: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == crate::executor::markers::IFS_GLUE {
+            // Protected literal character — add next char to current field
+            index += 1;
+            if index < chars.len() {
+                current.push(chars[index]);
+                index += 1;
+            }
+            continue;
+        }
+        if ifs.contains(ch) {
+            fields.push(std::mem::take(&mut current));
+            index += 1;
+            continue;
+        }
+        current.push(ch);
+        index += 1;
+    }
+    fields.push(current);
+    if fields.last().is_some_and(|field| field.is_empty()) && fields.len() > 1 {
+        fields.pop();
+    }
+    fields
+}
+
+pub(super) fn field_split_array_values_with_ifs(
+    values: Vec<String>,
+    ifs: Option<&str>,
+) -> Vec<String> {
+    values
+        .into_iter()
+        .flat_map(|value| field_split_values_with_ifs(&value, ifs))
+        .collect()
+}
+
+pub(super) fn field_split_positional_values_with_ifs(
+    values: Vec<String>,
+    ifs: Option<&str>,
+) -> Vec<String> {
+    // GNU subst.c:2957 string_list_dollar_at: an UNQUOTED `$@`/`$*` joins
+    // the parameters into ONE string using the first IFS character (a space
+    // when IFS is unset) and hands that string to the standard field
+    // splitter. The joined-string model is what makes the empty-field rules
+    // fall out: an empty parameter between neighbors is just two adjacent
+    // separators, yielding exactly one empty field; trailing empty fields
+    // drop like any IFS split; a lone empty parameter joins to "" and
+    // expands to zero fields. Probes 2026-09-27 (GNU 5.3.0): `set -- a ""
+    // b; set -- $@` -> 3 fields [a][][b]; `set -- a ""` -> 1; `set -- ""
+    // ""` -> 0; IFS=,: `set -- "a:" "" ":b"` -> 5 [a][][][][b].
+    if ifs.is_some_and(|ifs| ifs.is_empty()) {
+        // Posix interp 888 (IFS null): no field splitting — one word per
+        // parameter (callers already special-case the plain `$*`/`${*}`
+        // spellings the same way).
+        return values;
+    }
+    let separator = ifs.and_then(|ifs| ifs.chars().next()).unwrap_or(' ');
+    let joined = values.join(&separator.to_string());
+    field_split_values_with_ifs(&joined, ifs)
+}
+
+#[cfg(test)]
+mod field_split_tests {
+    use super::field_split_values_with_ifs;
+
+    #[test]
+    fn non_whitespace_ifs_keeps_leading_empty_fields() {
+        assert_eq!(field_split_values_with_ifs(":", Some(":")), vec![""]);
+        assert_eq!(field_split_values_with_ifs("::", Some(":")), vec!["", ""]);
+        assert_eq!(field_split_values_with_ifs(":a:", Some(":")), vec!["", "a"]);
+    }
+
+    #[test]
+    fn mixed_ifs_keeps_leading_empty_fields() {
+        assert_eq!(field_split_values_with_ifs(" : ", Some(": ")), vec![""]);
+        assert_eq!(field_split_values_with_ifs(": :", Some(": ")), vec!["", ""]);
+    }
+
+    #[test]
+    fn custom_newline_ifs_preserves_spaces_inside_fields() {
+        assert_eq!(
+            field_split_values_with_ifs("a b\na c\nx z", Some("\n")),
+            vec!["a b", "a c", "x z"]
+        );
+    }
+
+    #[test]
+    fn default_ifs_still_splits_shell_whitespace() {
+        assert_eq!(
+            field_split_values_with_ifs("a b\na c", Some(" \t\n")),
+            vec!["a", "b", "a", "c"]
+        );
+    }
+
+    #[test]
+    fn custom_space_ifs_collapses_repeated_spaces() {
+        assert_eq!(
+            field_split_values_with_ifs("a  b", Some(" ")),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn custom_newline_ifs_keeps_spaces_in_fields() {
+        assert_eq!(
+            field_split_values_with_ifs("a  b\nc  d", Some("\n")),
+            vec!["a  b", "c  d"]
+        );
+    }
+
+    #[test]
+    fn default_ifs_does_not_split_vertical_tab_or_form_feed() {
+        assert_eq!(
+            field_split_values_with_ifs("a\x0bb\x0cc", None),
+            vec!["a\x0bb\x0cc"]
+        );
+        assert_eq!(
+            field_split_values_with_ifs("a\x0bb\x0cc", Some(" \t\n")),
+            vec!["a\x0bb\x0cc"]
+        );
+    }
+
+    #[test]
+    fn default_ifs_does_not_split_non_ascii_whitespace() {
+        assert_eq!(
+            field_split_values_with_ifs("a\u{00a0}b\u{2003}c", None),
+            vec!["a\u{00a0}b\u{2003}c"]
+        );
+    }
+}
+
+pub(super) fn word_is_unquoted_array_list_expansion(word: &str) -> bool {
+    if word.starts_with('"') || word.starts_with('\'') || word.starts_with(STORAGE_WORD_PREFIX) {
+        return false;
+    }
+
+    let Some(inner) = crate::executor::parameter_ops::whole_word_braced_parameter_body(word) else {
+        return false;
+    };
+    let name = inner.split_once(':').map_or(inner, |(name, _)| name);
+    let name = parse_parameter_transform(name)
+        .map(|(name, _)| name)
+        .or_else(|| parse_indirect_pattern_removal(name).map(|(name, _, _)| name))
+        .or_else(|| parse_parameter_replacement(name).map(|(name, _, _, _)| name))
+        .or_else(|| parse_parameter_case_mod(name).map(|(name, _, _)| name))
+        .unwrap_or(name);
+    name.ends_with("[@]") || name.ends_with("[*]")
+}
+
+/// GNU arrayfunc.c:557 expand_compound_array_assignment sends every
+/// non-W_NOGLOB element word of a compound array assignment through the real
+/// pathname expansion (subst.c glob_vector / unquoted_glob_pattern_p rules):
+/// nullglob removes an unmatched word, failglob aborts the whole
+/// assignment, and slash-bearing patterns match path components. The
+/// previous hand-rolled `read_dir(".")` matcher returned `None` on no
+/// match, so callers stored the literal pattern and nullglob could never
+/// empty a list (niubash #121).
+pub(super) fn pathname_expand_array_token(
+    token: &str,
+    env_vars: &HashMap<String, String>,
+) -> crate::executor::glob::PathnameExpansion {
+    crate::executor::glob::pathname_expand_word(token, env_vars)
+}
+
+/// GNU arrayfunc.c quote_array_assignment_chars (arrayfunc.c:1107+) marks
+/// `[subscript]=value` / `[subscript]+=value` compound words W_NOGLOB: they
+/// are assignment words, not pathname patterns, so `[0]=nope-*` keeps its
+/// literal element even under nullglob/failglob. Field-split products are
+/// plain words again and do glob (array19.sub stores "[2]=2]" literally as
+/// an element, not an assignment), so callers only consult this for the
+/// original token.
+fn token_is_subscript_assignment(token: &str) -> bool {
+    if let Some((left, _)) = token.split_once('=') {
+        if array_assignment_has_subscript(left) {
+            return true;
+        }
+    }
+    if let Some((left, _)) = token.split_once("+=") {
+        if array_assignment_has_subscript(left) {
+            return true;
+        }
+    }
+    false
+}
+
+/// (start, length) of the first compound-element assignment operator
+/// (`=' or `+=') that GNU would recognize, as BYTE offsets into `token`:
+/// read_token_word builds each element with the quote-aware `[...]'
+/// subscript span (parse.y:5635-5651, parse_matched_pair P_ARRAYSUB), so
+/// an `=' INSIDE that span or inside quotes is word data
+/// (`[ "a]=b" ]' is one plain element — the old plain split_once misread
+/// it as subscript ` "a' and the storage silently dropped it, rubash#391).
+/// Hoisted quote sentinels (E307/E302) count as quotes.
+fn compound_element_operator_offset(token: &str) -> Option<(usize, usize)> {
+    let dq: char = crate::executor::markers::ASSIGN_DATA_DQUOTE;
+    let sq: char = crate::executor::markers::ASSIGN_HOISTED_SQUOTE;
+    let chars: Vec<char> = token.chars().collect();
+    let shadow: Vec<char> = chars
+        .iter()
+        .map(|c| match c {
+            c if *c == sq => '\'',
+            c if *c == dq => '"',
+            other => *other,
+        })
+        .collect();
+    // Byte offset of each char index (the sentinels differ in width from
+    // the quotes they shadow).
+    let mut byte_offsets = Vec::with_capacity(chars.len() + 1);
+    let mut acc = 0usize;
+    for c in &chars {
+        byte_offsets.push(acc);
+        acc += c.len_utf8();
+    }
+    byte_offsets.push(acc);
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    let mut index = 0usize;
+    // A leading subscript span: the operator can only sit after its closer.
+    if shadow.first() == Some(&'[') {
+        if let Some(end) = crate::lexer::arraysub_span_len(&shadow) {
+            index = end;
+        }
+    }
+    while index < shadow.len() {
+        let ch = shadow[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\\' if !single => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '+' if !single && !double && shadow.get(index + 1) == Some(&'=') => {
+                return Some((byte_offsets[index], "+=".len()));
+            }
+            '=' if !single && !double => {
+                return Some((byte_offsets[index], "=".len()));
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Restores the lexer carrier bytes (\x14 backslash, \x17 single quote,
+/// \x18 double quote, \x1f `$`, \x1a backtick, ANSI-C quote markers) that
+/// survive into raw assignment tokens, after operator-level quote removal
+/// has consumed the structural quotes (niubash #103 follow-up).
+fn restore_quote_carriers(value: &str) -> String {
+    // The ANSI-C markers are registry-zone sentinels: a typed
+    // `$'\uE010'`/`$'\uE011'` arrives as the escaped member of an E400
+    // pair and is user data, so only BARE carriers restore and the pair
+    // rides through verbatim for the boundary decode (rubash#840). C0
+    // carriers stay plain replaces — typed C0 bytes never arrive bare
+    // (they ride raw-byte marker pairs).
+    crate::executor::markers::restore_bare_sentinels(
+        &value
+            .replace(DATA_DOLLAR, "$")
+            .replace(crate::executor::markers::DATA_BACKTICK, "`")
+            .replace(crate::executor::markers::DATA_BACKSLASH, "\\")
+            .replace(crate::executor::markers::DATA_SQUOTE, "'")
+            .replace(crate::executor::markers::DATA_DQUOTE, "\""),
+        &[
+            (crate::executor::markers::ANSI_C_QUOTE_MARKER, "'"),
+            (crate::executor::markers::ANSI_C_DQUOTE_MARKER, "\""),
+        ],
+    )
+}
+
+/// Exactly-once decode for a compound element that carries spliced command
+/// substitution output. protect_command_substitution_output (execution_misc)
+/// maps the output's `$` to DATA_DOLLAR, a backtick to DATA_BACKTICK and a
+/// backslash to PROTECTED_BACKSLASH so the walker never re-interprets them;
+/// GNU's equivalent (subst.c:6682 read_comsub + comsub_shouldquote:6643)
+/// protects only CTLESC/CTLNUL because the spliced bytes are never re-run
+/// through parameter expansion. At the storage boundary the carriers must
+/// come back as real characters (variables.c:3536 assign_in_env copies the
+/// word into the value cell verbatim), or the literal `$`/backtick/backslash
+/// bytes vanish from the stored element (issue #249: COMPREPLY=($(compgen -P
+/// "$ "...)) dropped the prefix `$`). Control bytes travel as
+/// U+E319<hex>; sentinel payloads (rubash#840) and decode here too.
+fn finalize_comsub_element(value: &str) -> String {
+    crate::executor::execution_misc::decode_command_substitution_payload(
+        &crate::executor::execution_misc::restore_command_substitution_output(value),
+    )
+}
+
+/// rubash#616 (plan Phase 1c): the decoded result of a compound `( ... )`
+/// value, WITHOUT the render. Separating the render from the decode lets an
+/// append-only write grow the canonical mirror in place instead of
+/// re-rendering the whole array — what GNU does: assign_compound_array_list
+/// (arrayfunc.c:700) appends each element to the ARRAY object
+/// (`array_insert`, array.c:516; `last_ind = array_max_index(a) + 1`,
+/// arrayfunc.c:743) and never re-serialises it.
+pub(super) struct IndexedAppendOutcome {
+    /// The complete post-write element map — GNU's ARRAY object contents — or
+    /// `None` when the write was a pure append, which `appended` fully
+    /// describes and the caller can apply without ever building the map.
+    pub entries: Option<BTreeMap<usize, String>>,
+    /// Max index BEFORE this write (`None` for an empty array) — GNU
+    /// `array_max_index(a)` at arrayfunc.c:743.
+    pub old_max: Option<usize>,
+    /// Every element strictly above `old_max`, ascending — exactly what a
+    /// canonical mirror must grow by.
+    pub appended: Vec<(usize, String)>,
+    /// True when every mutation inserted above `old_max` and the integer
+    /// attribute did not rewrite existing elements, so the new render differs
+    /// from the old mirror only by `appended`.
+    pub appended_only: bool,
+    /// rubash#631: the first element header whose negative subscript resolved
+    /// before the array start. GNU reports `<word>: bad array subscript` for
+    /// it and stops the scan (arrayfunc.c:804-809), so the caller must still
+    /// store the elements above (they were inserted before the failure) and
+    /// then fail the assignment with status 1. `None` on every other path.
+    pub bad_subscript: Option<String>,
+}
+
+/// rubash#616 (plan Phase 1c): the array contents the compound scan decodes
+/// against. GNU edits the ARRAY object in place — assign_compound_array_list
+/// (arrayfunc.c:700) inserts each element and `array_max_index` + 1 is the
+/// append slot (arrayfunc.c:743) — and never rebuilds it from the serialised
+/// form. rubash therefore seeds from the structured cell, whose 1a
+/// "complete or absent" invariant makes it the same element set as the
+/// rendered mirror (see `Variables::indexed_array_cell`), and holds this
+/// call's writes in `mutations`. An append-only `a+=(...)` then costs
+/// O(elements appended) instead of O(array): the full map is built only when
+/// the caller actually needs a render.
+struct IndexedDecodeBase<'a> {
+    /// The structured cell (GNU's ARRAY object) when the array has one.
+    cell: Option<&'a BTreeMap<i64, String>>,
+    /// Fallback: the mirror's elements, parsed once, when there is no cell
+    /// (a fresh array, or a route whose cell was dropped).
+    parsed: BTreeMap<usize, String>,
+    /// Writes made by THIS call; the last write to an index wins.
+    mutations: BTreeMap<usize, String>,
+}
+
+impl IndexedDecodeBase<'_> {
+    /// Highest index present, this call's writes included — GNU
+    /// `array_max_index` (array.h:30-41, read at arrayfunc.c:743).
+    fn max(&self) -> Option<usize> {
+        let base = match self.cell {
+            Some(cell) => cell
+                .keys()
+                .next_back()
+                .and_then(|index| usize::try_from(*index).ok()),
+            None => self.parsed.keys().next_back().copied(),
+        };
+        base.max(self.mutations.keys().next_back().copied())
+    }
+
+    fn get(&self, index: usize) -> Option<&String> {
+        if let Some(value) = self.mutations.get(&index) {
+            return Some(value);
+        }
+        match self.cell {
+            Some(cell) => cell.get(&i64::try_from(index).ok()?),
+            None => self.parsed.get(&index),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.mutations.is_empty()
+            && match self.cell {
+                Some(cell) => cell.is_empty(),
+                None => self.parsed.is_empty(),
+            }
+    }
+
+    fn insert(&mut self, index: usize, value: String) {
+        self.mutations.insert(index, value);
+    }
+
+    /// The elements added strictly above `old_max`, ascending.
+    fn appended_above(&self, old_max: Option<usize>) -> Vec<(usize, String)> {
+        let start = match old_max {
+            Some(max) => std::ops::Bound::Excluded(max),
+            None => std::ops::Bound::Unbounded,
+        };
+        self.mutations
+            .range((start, std::ops::Bound::Unbounded))
+            .map(|(index, value)| (*index, value.clone()))
+            .collect()
+    }
+
+    /// Fold this call's writes into the full element map (the render input).
+    fn materialize(self) -> BTreeMap<usize, String> {
+        let mut entries = match self.cell {
+            Some(cell) => cell
+                .iter()
+                .filter_map(|(index, value)| {
+                    usize::try_from(*index)
+                        .ok()
+                        .map(|index| (index, value.clone()))
+                })
+                .collect(),
+            None => self.parsed,
+        };
+        entries.extend(self.mutations);
+        entries
+    }
+}
+
+/// GNU assign_compound_array_list (arrayfunc.c:700+): builds the indexed
+/// element map for a compound `( ... )` value. `cell` is the target's
+/// structured cell when it has one (Phase 1c seed) — pass `None` to decode
+/// against the mirror `current` alone, exactly as before. `Err(pattern)`
+/// reports a failglob pathname-expansion failure on one element word: GNU
+/// expand_compound_array_assignment (arrayfunc.c:557) aborts the whole
+/// assignment then, leaving the target's previous binding untouched.
+pub(super) fn append_array_value(
+    current: &str,
+    cell: Option<&BTreeMap<i64, String>>,
+    value: &str,
+    integer: bool,
+    ifs: Option<&str>,
+    env_vars: &crate::shell::var_table::VarTable,
+) -> Result<IndexedAppendOutcome, String> {
+    let mut entries = IndexedDecodeBase {
+        cell,
+        parsed: if cell.is_some() {
+            BTreeMap::new()
+        } else {
+            indexed_array_entries(current)
+        },
+        mutations: BTreeMap::new(),
+    };
+    let old_max = entries.max();
+    // An integer array rewrites EVERY element in the post-pass below, so even
+    // a pure append there can change existing values and must not take the
+    // append-only path.
+    let mut appended_only = !integer;
+    let mut next_index = old_max.map(|index| index + 1).unwrap_or(0);
+    // rubash#631: the first element header whose negative subscript resolved
+    // before the array start. GNU reports `bad array subscript` for it and
+    // stops the scan (arrayfunc.c:804-809), with the elements it already
+    // inserted still in place, then fails the assignment.
+    let mut bad_subscript: Option<String> = None;
+    // Bash appends `arr+=str` (no parens) to arr[0] for any array, not just
+    // integer arrays; `arr+=(x y)` appends new elements.
+    let scalar_append = !value.starts_with('(');
+    let brace_expand = crate::builtins::set::shell_option_enabled(env_vars, "braceexpand");
+    if crate::executor::assignment_expansion::dbg_aav_enabled() {
+        eprintln!("[AAV] value={value:?}");
+    }
+    let tokens = array_assignment_tokens(value)
+        .into_iter()
+        .flat_map(|token| split_indexed_tagged_token(&token, ifs))
+        .flat_map(|token| {
+            if brace_expand && !token.contains("${") && !token.contains('=') {
+                crate::expand::braces::expand_braces(&token)
+            } else {
+                vec![token]
+            }
+        })
+        .collect::<Vec<_>>();
+    for token in tokens {
+        // GNU ordering: quote_array_assignment_chars already marked
+        // [subscript]=value words W_NOGLOB, so pathname expansion applies
+        // only to ordinary element words (niubash #121).
+        if !token_is_subscript_assignment(&token) {
+            // GNU expand_compound_array_assignment (arrayfunc.c:574+610)
+            // re-parses the element text, so its quote characters are
+            // operators: quoted spans protect their own characters while
+            // an unquoted glob segment still expands
+            // (`arr=("dir"/*.txt)` stores the matches). Field-split and
+            // storage-marked products carry quotes as DATA — they keep the
+            // plain globber input.
+            let glob_word = if token.starts_with(ARRAY_FIELD_SPLIT_MARKER)
+                || token.starts_with(STORAGE_WORD_PREFIX)
+            {
+                token.clone()
+            } else {
+                crate::executor::glob::compound_element_glob_pattern(&token)
+            };
+            match crate::executor::glob::pathname_expand_word(&glob_word, env_vars) {
+                crate::executor::glob::PathnameExpansion::Matches(matches) => {
+                    for value in matches {
+                        entries.insert(next_index, value);
+                        next_index += 1;
+                    }
+                    continue;
+                }
+                crate::executor::glob::PathnameExpansion::NoMatch => {}
+                crate::executor::glob::PathnameExpansion::Fail(pattern) => {
+                    return Err(pattern);
+                }
+            }
+        }
+
+        if let Some((op_start, op_len)) = compound_element_operator_offset(&token) {
+            let left = &token[..op_start];
+            let rhs = &token[op_start + op_len..];
+            let resolved = array_assignment_index(left, entries.max(), env_vars);
+            if let ArrayAssignmentIndex::NegativeOutOfRange = resolved {
+                // GNU arrayfunc.c:804-809: `ind` is still below zero after
+                // the count-back at :802-803 (or the array is empty, so
+                // there is nothing to count back from), so err_badarraysub
+                // reports the whole element word, `any_failed` is counted
+                // and the scan breaks. The elements written above stay
+                // stored (arrayfunc.c:768-772 inserts as it scans).
+                bad_subscript = Some(token.clone());
+                break;
+            }
+            if op_len == 2 {
+                // `[sub]+=' append form.
+                if let ArrayAssignmentIndex::Index(index) = resolved {
+                    let current = entries.get(index).cloned().unwrap_or_default();
+                    let rhs = finalize_comsub_element(&dequote_compound_element_rhs(rhs));
+                    let value = if integer {
+                        // GNU make_array_variable_value (arrayfunc.c:173-195) with
+                        // ASS_APPEND: both operands go through make_variable_value
+                        // → evalexp (variables.c:2920-2946), the full evaluator.
+                        (eval_conditional_arith_value(&current, env_vars).unwrap_or(0)
+                            + eval_conditional_arith_value(&rhs, env_vars).unwrap_or(0))
+                        .to_string()
+                    } else {
+                        append_scalar_value(&current, &rhs)
+                    };
+                    if old_max.is_some_and(|max| index <= max) {
+                        appended_only = false;
+                    }
+                    entries.insert(index, value);
+                    next_index = index + 1;
+                    continue;
+                }
+                if array_assignment_has_subscript(left) {
+                    continue;
+                }
+            } else if let ArrayAssignmentIndex::Index(index) = resolved {
+                let decoded = finalize_comsub_element(&dequote_compound_element_rhs(rhs));
+                if old_max.is_some_and(|max| index <= max) {
+                    appended_only = false;
+                }
+                entries.insert(index, decoded);
+                next_index = index + 1;
+                continue;
+            } else if array_assignment_has_subscript(left) {
+                continue;
+            }
+        }
+
+        let command_subst_token = token.starts_with("\"$(") && token.ends_with('"');
+        // A compound word quoted with EITHER quote family stays one element
+        // ('a b' and "a b" each store a single element; only unquoted
+        // whitespace splits). Mirrors the declare storage copy. The check
+        // must be a real full-span scan, not starts_with+ends_with: GNU
+        // dequote_string (subst.c:4807) removes EVERY quote pair, so a
+        // mixed token like 'x'a"b"y' dequotes to xa"by — its first quote
+        // closes mid-word and the tail is unquoted. Treating it as fully
+        // quoted skipped quote removal and stored x'a"b"y' (issue #109
+        // nested-quoting class).
+        let quoted_token = token_is_fully_quoted(&token) && !command_subst_token;
+        if let Some(token) = token.strip_prefix(ARRAY_FIELD_SPLIT_MARKER) {
+            let token = unquote_storage_value(token);
+            match pathname_expand_array_token(&token, env_vars) {
+                crate::executor::glob::PathnameExpansion::Matches(matches) => {
+                    for value in matches {
+                        entries.insert(next_index, value);
+                        next_index += 1;
+                    }
+                }
+                crate::executor::glob::PathnameExpansion::NoMatch => {
+                    entries.insert(
+                        next_index,
+                        finalize_comsub_element(&crate::executor::markers::dequote_ctlesc_pairs(
+                            &token,
+                        )),
+                    );
+                    next_index += 1;
+                }
+                crate::executor::glob::PathnameExpansion::Fail(pattern) => {
+                    return Err(pattern);
+                }
+            }
+            continue;
+        }
+        // GNU field splitting for compound assignment tokens: only
+        // whitespace OUTSIDE quote pairs splits a field. `'a b'` is one
+        // element, and so is `'a b'c` -- the quoted span continues the
+        // same field after the closing quote (array6.sub
+        // a2=(-iname 'abc -iname 'def) stores (-iname, "abc -iname def")).
+        let split_needed = token_has_unquoted_whitespace(&token);
+        // A token is "partially quoted" only if it contains an UNESCAPED
+        // quote character. A `\"` from ANSI-C decoding ($'a"b') is data,
+        // not a quote operator, so it must not trigger the
+        // remove_shell_quotes path (issue #109: x=($'a"b') stored "ab"
+        // instead of "a\"b").
+        let partially_quoted = !quoted_token && has_unescaped_quote(&token);
+        // GNU order (niubash #103 follow-up): quote removal on the raw
+        // token, then restore the lexer carrier bytes, then unquote the
+        // storage escaping. Unquoting first collapsed `x=(q\"q)` to `qq`
+        // and left raw 0x18 carrier bytes in stored elements.
+        //
+        // scalar_append (`arr+=word`, no parens): the value arriving here
+        // is the assignment pipeline's FINAL expansion result —
+        // expand_string_assignment (subst.c:4345) already performed the one
+        // dequote and the rubash#218 ASSIGN_EXPANSION_BACKSLASH restore
+        // turned expansion backslashes back into real data bytes. GNU
+        // appends that text to element 0 (variables.c assign_array_element
+        // path) without any further quote removal, so a second
+        // unquote_storage_value pass re-read the data backslashes as
+        // escape syntax and ate them (`symbols+=$REPLY'⚡'` with
+        // REPLY='\[\e[33m\]' stored `[e[33m]⚡`, rubash#288).
+        let token = if scalar_append {
+            token
+        } else if partially_quoted
+            && !(token.starts_with("$'") && token.ends_with('\''))
+            && !token.starts_with(STORAGE_WORD_PREFIX)
+        {
+            restore_quote_carriers(&remove_shell_quotes(&token))
+        } else {
+            token
+        };
+        let token = if scalar_append {
+            token
+        } else {
+            unquote_storage_value(&token)
+        };
+        // GNU dequote_string (subst.c:4807) strips the CTLESC pairs from
+        // every word pathname expansion did not consume, so a stored
+        // element keeps the quoted `*` as plain data (`("p"/"*z")` stores
+        // `p/*z`, not a \x11 carrier pair).
+        let token = crate::executor::markers::dequote_ctlesc_pairs(&token);
+        if let Some(expanded_array) = token.strip_prefix(STORAGE_WORD_PREFIX) {
+            for value in field_split_values_with_ifs(expanded_array, ifs) {
+                match pathname_expand_array_token(&value, env_vars) {
+                    crate::executor::glob::PathnameExpansion::Matches(matches) => {
+                        for value in matches {
+                            entries.insert(next_index, value);
+                            next_index += 1;
+                        }
+                    }
+                    crate::executor::glob::PathnameExpansion::NoMatch => {
+                        entries.insert(
+                            next_index,
+                            finalize_comsub_element(
+                                &crate::executor::markers::dequote_ctlesc_pairs(&value),
+                            ),
+                        );
+                        next_index += 1;
+                    }
+                    crate::executor::glob::PathnameExpansion::Fail(pattern) => {
+                        return Err(pattern);
+                    }
+                }
+            }
+            continue;
+        }
+        // GNU `arr+=word` (no parens) binds ONE scalar value to element 0
+        // (variables.c assign_array_element): the word never field-splits —
+        // split_needed applies to compound `(...)` element words only.
+        if split_needed && !scalar_append {
+            for value in field_split_values_with_ifs(&token, ifs) {
+                entries.insert(
+                    next_index,
+                    finalize_comsub_element(&crate::executor::markers::dequote_ctlesc_pairs(
+                        &value,
+                    )),
+                );
+                next_index += 1;
+            }
+            continue;
+        }
+        if scalar_append && !entries.is_empty() {
+            let current = entries.get(0).cloned().unwrap_or_default();
+            let appended = if integer {
+                (eval_arith_value(&current) + eval_arith_value(&token)).to_string()
+            } else {
+                append_scalar_value(&current, &finalize_comsub_element(&token))
+            };
+            // `arr+=word` rewrites element 0 — never an append.
+            appended_only = false;
+            entries.insert(0, appended);
+        } else {
+            entries.insert(next_index, finalize_comsub_element(&token));
+            next_index += 1;
+        }
+    }
+
+    if integer {
+        // GNU arrayfunc.c:213 make_array_variable_value → variables.c:2920
+        // make_variable_value: an integer-attributed variable evaluates every
+        // assigned element with the FULL arithmetic evaluator (evalexp,
+        // expr.c) — `declare -i y; y+=(2*3)` stores [1]="6". The naive
+        // split('+') parser returned 0 for any `*`/`-`/`/` element. On a
+        // fatal evaluation GNU jumps out and aborts the assignment; storing
+        // the raw text (the ASS_NOLONGJMP `goto make_value' fallback,
+        // variables.c:2928) is the non-fatal approximation used here.
+        let mut entries = entries.materialize();
+        for element in entries.values_mut() {
+            if let Some(value) = eval_conditional_arith_value(element, env_vars) {
+                *element = value.to_string();
+            }
+        }
+        return Ok(IndexedAppendOutcome {
+            entries: Some(entries),
+            old_max,
+            appended: Vec::new(),
+            appended_only: false,
+            bad_subscript,
+        });
+    }
+
+    let appended = entries.appended_above(old_max);
+    // A pure append is described entirely by `appended`, which the caller can
+    // apply to the canonical mirror in place; only an overwrite (a subscript
+    // at or below `old_max`) needs the full element map for a render.
+    let entries = if appended_only {
+        None
+    } else {
+        Some(entries.materialize())
+    };
+    Ok(IndexedAppendOutcome {
+        entries,
+        old_max,
+        appended,
+        appended_only,
+        bad_subscript,
+    })
+}
+
+/// How a `[subscript]` element header resolved while scanning a compound
+/// assignment list.
+///
+/// GNU assign_compound_array_list computes `ind` and then, when a negative
+/// subscript still lands before the array start, reports `bad array
+/// subscript`, counts a failure and STOPS the list (arrayfunc.c:804-809;
+/// error.c:440 err_badarraysub prints arrayfunc.c:63 bash_badsub_errmsg).
+/// The elements it already wrote stay in place — it inserts as it scans
+/// (arrayfunc.c:768-772). Collapsing that into an `Option` conflated it with
+/// "this word is not a subscript at all", so the element was dropped in
+/// silence and the shell carried on (rubash#631).
+#[derive(Clone, Copy)]
+pub(super) enum ArrayAssignmentIndex {
+    /// `[expr]` resolved to an absolute element index.
+    Index(usize),
+    /// `[expr]` evaluated to a negative index with no element behind it
+    /// (or the array is empty, so there is nothing to count back from):
+    /// GNU reports `bad array subscript` and stops the list.
+    NegativeOutOfRange,
+    /// No `[subscript]` header, or its arithmetic already failed and reported
+    /// its own (fatal) diagnostic — nothing further is owed for this word.
+    Unresolved,
+}
+
+pub(super) fn array_assignment_index(
+    left: &str,
+    max_index: Option<usize>,
+    env_vars: &crate::shell::var_table::VarTable,
+) -> ArrayAssignmentIndex {
+    let Some(expression) = left
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return ArrayAssignmentIndex::Unresolved;
+    };
+    let Some(index) = eval_conditional_arith_value(expression, env_vars) else {
+        return ArrayAssignmentIndex::Unresolved;
+    };
+    if index >= 0 {
+        return match usize::try_from(index) {
+            Ok(index) => ArrayAssignmentIndex::Index(index),
+            Err(_) => ArrayAssignmentIndex::Unresolved,
+        };
+    }
+    // A negative subscript is relative to the array's current highest index
+    // (the callers pass `IndexedDecodeBase::max`), so this needs the max only
+    // — never the whole element map. `array_max_index + 1 + ind`
+    // (arrayfunc.c:802-803) still lands below zero when the index reaches
+    // past the array start; with no max at all there is nothing to count back
+    // from. Both are GNU's second `if (ind < 0)` at arrayfunc.c:804.
+    let resolved = max_index
+        .and_then(|max| i128::try_from(max).ok())
+        .and_then(|max| max.checked_add(1))
+        .and_then(|next| next.checked_add(index))
+        .and_then(|resolved| usize::try_from(resolved).ok());
+    match resolved {
+        Some(index) => ArrayAssignmentIndex::Index(index),
+        None => ArrayAssignmentIndex::NegativeOutOfRange,
+    }
+}
+
+pub(super) fn array_assignment_has_subscript(left: &str) -> bool {
+    left.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .is_some()
+}
+
+/// Quote removal for a `[sub]=value` element's value side. This function is
+/// the SINGLE owner of that removal: GNU performs exactly one
+/// expand_words_no_vars pass over the raw compound word list
+/// (arrayfunc.c:610 inside expand_compound_array_assignment:557), after
+/// which assign_compound_array_list stores `val = w + len + 2`
+/// (arrayfunc.c:839-842) verbatim — no second removal exists downstream.
+/// The old composition ran unquote_storage_value ON TOP of
+/// remove_shell_quotes output; a quoted element's backslashes (literal in
+/// `'...'` per parse.y:5305 read_token_word; `\e`/`\[` kept both chars in
+/// `"..."` per parse.y:5390-5393 + syntax.h:26 slashify_in_quotes) were
+/// re-read as escape syntax and eaten (`A=([0]='\[\e[33m\]Z')` stored
+/// `[e[33m]Z`, rubash#288).
+/// pub(crate): the executor-side assoc kvpair loop (assignment_helpers
+/// append_assoc_value) shares this dequote so an embedded `$'...'` span in
+/// a mixed kvpair word (`var=( two ab$'\001'cd )`) decodes like an indexed
+/// element instead of leaking its delimiters as data.
+pub(crate) fn dequote_compound_element_rhs(rhs: &str) -> String {
+    if has_unescaped_quote(rhs)
+        && !(rhs.starts_with("$'") && rhs.ends_with('\''))
+        && !rhs.starts_with(STORAGE_WORD_PREFIX)
+    {
+        // The raw element still carries quote syntax: one
+        // remove_shell_quotes pass is the whole removal. The trailing
+        // dequote drops the lexer's CTLESC sentinels before quoted glob
+        // metacharacters (`[0]="*y"` stores `*y`, GNU dequote_string:4807
+        // strips the pairs after globbing passes) and the
+        // expansion-whitespace tags their whitespace as data.
+        //
+        // The walker's expansion-result carriers (E30D/E30A/E30B — GNU
+        // subst.c:11862 add_quoted_string protection) decode only AFTER
+        // the quote-removal pass so remove_shell_quotes never read their
+        // backslashes as escape syntax (rubash#295: `H2=([0]=$X'Q')`
+        // with X='\[\e[33m\]' stored `[e[33m]Q').
+        // remove_shell_quotes can re-inject PARAM_NAME_END_MARKER where a
+        // quote boundary terminates an unbraced `$name` (lexer quotes.rs
+        // contract); storage never re-expands, so the transport-only
+        // marker must not survive into the element value.
+        decode_compound_expansion_carriers(&crate::executor::markers::restore_bare_sentinels(
+            &crate::executor::markers::dequote_ctlesc_pairs(&restore_quote_carriers(
+                &remove_shell_quotes(rhs),
+            ))
+            .replace(crate::executor::markers::IFS_GLUE, ""),
+            &[(crate::executor::markers::COMPOUND_EXPANSION_WS_TAG, "")],
+        ))
+        .replace(crate::executor::markers::PARAM_NAME_END_MARKER, "")
+    } else {
+        // No quote syntax ($'...' whole words, bare values, or internal
+        // storage forms): unquote_storage_value performs the one removal —
+        // ANSI-C decoding for `$'...'` (issue #109) and the unquoted
+        // `\x` -> x escape drop for bare text (parse.y:5368-5397).
+        decode_compound_expansion_carriers(&unquote_storage_value(
+            &crate::executor::markers::dequote_ctlesc_pairs(rhs),
+        ))
+    }
+}
+
+/// True when the token is exactly one quoted span: the opening quote's
+/// matching close is the last character. GNU quote removal
+/// (subst.c:4807 dequote_string -> dequote_escapes:4692) removes every
+/// quote pair in the word, so `'x'a"b'y'` is NOT fully quoted — its first
+/// `'` closes at index 2 and the rest is unquoted text. Inside `'` quotes
+/// a backslash is literal; inside `"` it escapes the next char
+/// (subst.c string_extract_double_quoted).
+pub(super) fn token_is_fully_quoted(token: &str) -> bool {
+    let mut chars = token.char_indices().peekable();
+    let Some((_, quote @ ('\'' | '"'))) = chars.next() else {
+        return false;
+    };
+    while let Some((index, ch)) = chars.next() {
+        if quote == '"' && ch == '\\' {
+            chars.next();
+            continue;
+        }
+        if ch == quote {
+            return index + ch.len_utf8() == token.len();
+        }
+    }
+    false
+}
+
+/// True when the raw token has whitespace outside every quote pair (GNU
+/// field splitting for compound assignment tokens): `'a b'` has none (one
+/// field), `'a b'c d` does (split after the quoted span), and
+/// `'a b'c` does not (the quoted span continues the same field).
+fn token_has_unquoted_whitespace(token: &str) -> bool {
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    // extglob-group depth (rubash#389): read_token_word copies the matched
+    // pair span into the word via strcpy (parse.y:5468-5475), so the group's
+    // literal interior — spaces included — is word DATA, never a field
+    // boundary; GNU never field-splits it (expand_words_no_vars splits only
+    // expansion output). A `(` directly after an unquoted, unescaped pattern
+    // operator `@ * + ? !` (syntax.h:90-92) opens such a group under the
+    // gate.
+    let extglob = crate::lexer::parse_extended_glob();
+    let mut extglob_depth = 0usize;
+    let mut prev_ch: Option<char> = None;
+    let mut prev_escaped = false;
+    // rubash#391: an element-LEADING `[` consumes its matched `[...]` span
+    // the same way (parse.y:5635-5651, parse_matched_pair P_ARRAYSUB +
+    // strcpy) — the span's interior is word data, so its spaces are not
+    // field boundaries either (`[ empty ]` is ONE element that pathname
+    // expansion owns). The hoisted quote sentinels (E307/E302,
+    // expand_assignment_value_hoisting) count as quotes in the span walk.
+    let dq: char = crate::executor::markers::ASSIGN_DATA_DQUOTE;
+    let sq: char = crate::executor::markers::ASSIGN_HOISTED_SQUOTE;
+    let chars: Vec<char> = token.chars().collect();
+    let shadow: Vec<char> = chars
+        .iter()
+        .map(|c| match c {
+            c if *c == sq => '\'',
+            c if *c == dq => '"',
+            other => *other,
+        })
+        .collect();
+    let mut skip: Option<usize> = None;
+    if !shadow.is_empty() && shadow[0] == '[' {
+        if let Some(end) = crate::lexer::arraysub_span_len(&shadow) {
+            skip = Some(end);
+        }
+    }
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if let Some(end) = skip {
+            if index < end {
+                continue;
+            }
+        }
+        if escaped {
+            escaped = false;
+            prev_ch = Some(ch);
+            prev_escaped = true;
+            continue;
+        }
+        if extglob_depth > 0 {
+            match ch {
+                '\\' if !single => escaped = true,
+                '\'' if !double => single = !single,
+                '"' if !single => double = !double,
+                '(' if !single && !double => extglob_depth += 1,
+                ')' if !single && !double => extglob_depth -= 1,
+                _ => {}
+            }
+            prev_ch = Some(ch);
+            prev_escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !single => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '(' if extglob
+                && !single
+                && !double
+                && !prev_escaped
+                && matches!(prev_ch, Some('@' | '*' | '+' | '?' | '!')) =>
+            {
+                extglob_depth += 1
+            }
+            c if c.is_whitespace() && !single && !double => return true,
+            _ => {}
+        }
+        prev_ch = Some(ch);
+        prev_escaped = false;
+    }
+    false
+}
+
+/// Check if the token contains an unescaped quote character (single or
+/// double). A `\"` (backslash-escaped double quote) is data, not a quote
+/// operator, so it does not count. This prevents `remove_shell_quotes`
+/// from stripping data quotes that came from ANSI-C decoding (issue #109:
+/// x=($'a"b') stored "ab" instead of "a\"b").
+fn has_unescaped_quote(token: &str) -> bool {
+    let mut escaped = false;
+    for ch in token.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '\'' | '"' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+pub(super) fn array_assignment_tokens(value: &str) -> Vec<String> {
+    let Some(inner) = value
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return if value.is_empty() {
+            Vec::new()
+        } else {
+            vec![value.to_string()]
+        };
+    };
+
+    let tokens: Vec<String> = split_storage_words(inner).collect();
+    tokens
+}
+
+pub(super) fn array_parameter_slice(
+    value: &str,
+    offset: isize,
+    length: Option<usize>,
+) -> Vec<String> {
+    // GNU array_subrange (array.c:377-419) with the offset resolution from
+    // subst.c:8432-8449: the offset is an ARRAY INDEX, not a position in the
+    // value list. The slice is every element whose index >= start; unset
+    // holes are skipped and empty-string elements still count toward the
+    // length. A negative offset counts back from one past the maximum index
+    // (subst.c:8446: len = array_max_index(a) + (*e1p < 0); *e1p += len),
+    // and a start below the smallest index yields nothing.
+    let entries = indexed_array_entries(value);
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let max_index = *entries.keys().next_back().expect("non-empty entries");
+    let start: i128 = if offset < 0 {
+        max_index as i128 + 1 + offset as i128
+    } else {
+        offset as i128
+    };
+    if start < 0 {
+        return Vec::new();
+    }
+
+    entries
+        .into_iter()
+        .filter(|(index, _)| *index as i128 >= start)
+        .take(length.unwrap_or(usize::MAX))
+        .map(|(_, element)| element)
+        .collect()
+}
+
+pub(super) fn slice_array_values(
+    values: Vec<String>,
+    offset: isize,
+    length: Option<usize>,
+) -> Vec<String> {
+    let start = if offset < 0 {
+        values.len().saturating_sub(offset.unsigned_abs())
+    } else {
+        offset as usize
+    };
+
+    values
+        .into_iter()
+        .skip(start)
+        .take(length.unwrap_or(usize::MAX))
+        .collect()
+}
+
+pub(super) fn is_noassign_bash_array(name: &str) -> bool {
+    matches!(
+        name,
+        "BASH_ARGC" | "BASH_ARGV" | "BASH_LINENO" | "BASH_SOURCE" | "FUNCNAME" | "PIPESTATUS"
+    )
+}

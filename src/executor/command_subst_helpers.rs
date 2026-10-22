@@ -1,0 +1,383 @@
+use crate::executor::markers::DATA_DOLLAR;
+use crate::executor::substitution_metadata::bytes_to_shell_text;
+
+pub(in crate::executor) fn collect_braced_parameter_name(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> String {
+    collect_braced_parameter_body(chars).0
+}
+
+/// Collects the `${`-body and reports whether the closing `}` was found.
+/// GNU subst.c parameter_brace_expand verdicts an unterminated `${body`
+/// (`PS1='a${bad'`) as `bad substitution` naming the whole word; the
+/// prompt pass needs the termination bit to raise that verdict (the
+/// ordinary word paths keep their historical silent behavior).
+pub(in crate::executor) fn collect_braced_parameter_body(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> (String, bool) {
+    let mut name = String::new();
+    let terminated = collect_braced_parameter_body_into(chars, &mut name);
+    (name, terminated)
+}
+
+/// Appending form of [`collect_braced_parameter_body`]: the caller supplies
+/// the buffer so hot walkers can collect straight into a pooled synthetic
+/// `${...}` word instead of staging a per-fragment `String` (GNU
+/// subst.c:9777 parameter_brace_expand scans the same body inline — the
+/// intermediate is a port artifact, not GNU state).
+pub(in crate::executor) fn collect_braced_parameter_body_into(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    body: &mut String,
+) -> bool {
+    let mut nested = 0usize;
+    let mut single = false;
+    let mut double = false;
+    let mut ansi_c = false;
+    while let Some(ch) = chars.next() {
+        // Inside single quotes everything is literal, including backslashes;
+        // only the next single quote ends the quoted region.
+        if single {
+            if ch == '\'' {
+                single = false;
+            }
+            body.push(ch);
+            continue;
+        }
+        // Inside a $'...' ANSI-C span a backslash escapes the following
+        // character, so '\'' is data rather than the closing quote (GNU parse.y
+        // extract_dollar_brace_string). Without this the escaped quote ends the span
+        // early and the trailing '}' is swallowed, leaving a heredoc body
+        // such as 7: ${x%'$'a\t\\'b'}' unexpanded.
+        if ansi_c {
+            body.push(ch);
+            if ch == '\\' {
+                if let Some(escaped) = chars.next() {
+                    body.push(escaped);
+                }
+            } else if ch == '\'' {
+                ansi_c = false;
+            }
+            continue;
+        }
+        if double {
+            if ch == '"' {
+                double = false;
+                body.push(ch);
+                continue;
+            }
+            if ch == '\\' {
+                body.push(ch);
+                if let Some(escaped) = chars.next() {
+                    body.push(escaped);
+                }
+                continue;
+            }
+            body.push(ch);
+            continue;
+        }
+        // GNU Bash scans `\` plus the following character as one unit
+        // (extract_dollar_brace_string advances by two). `\\` is a literal
+        // backslash, `\}` a literal closing brace; neither closes the name.
+        if ch == '\\' {
+            if let Some(escaped) = chars.next() {
+                body.push('\\');
+                body.push(escaped);
+            } else {
+                body.push('\\');
+            }
+            continue;
+        }
+        if ch == '$' && chars.peek().copied() == Some('\'') {
+            // $'...' is an ANSI-C quoted span, a quoting mode distinct
+            // from a plain single quote: backslashes inside it escape data.
+            chars.next();
+            ansi_c = true;
+            body.push('$');
+            body.push('\'');
+            continue;
+        }
+        if ch == '\'' {
+            single = true;
+            body.push(ch);
+            continue;
+        }
+        if ch == '"' {
+            double = true;
+            body.push(ch);
+            continue;
+        }
+        if ch == '[' {
+            body.push(ch);
+            continue;
+        }
+        if ch == ']' {
+            body.push(ch);
+            continue;
+        }
+        if ch == '$' && chars.peek().copied() == Some('{') {
+            chars.next();
+            nested += 1;
+            body.push('$');
+            body.push('{');
+            continue;
+        }
+        if ch == '}' {
+            if nested == 0 {
+                return true;
+            }
+            nested -= 1;
+            body.push(ch);
+            continue;
+        }
+        body.push(ch);
+    }
+    false
+}
+
+pub(in crate::executor) fn decode_old_style_backtick_source(source: &str) -> String {
+    let mut output = String::new();
+    let mut chars = source.chars().peekable();
+    let mut single = false;
+    let mut double = false;
+    while let Some(ch) = chars.next() {
+        if ch == '\'' && !double {
+            single = !single;
+            output.push(ch);
+            continue;
+        }
+
+        if ch == '"' && !single {
+            double = !double;
+            output.push(ch);
+            continue;
+        }
+
+        if ch != '\\' {
+            push_backtick_source_char(&mut output, ch, single);
+            continue;
+        }
+
+        // rubash#745: inside a backtick body the backslash is consumed only
+        // before `$`, a backtick or another backslash; everything else keeps
+        // it (parse.y parse_matched_pair under P_BACKQUOTE: "backslash is
+        // only special if it precedes $, `, or \"). `\"` therefore stays,
+        // and the double-quoted case is handled one layer up in
+        // lexer::quotes (a backtick inside a double-quoted word receives the
+        // already-consumed quote).
+        //
+        //   recho `echo 'a\' b`        -> argv[1]=<a\>  (backslash kept)
+        //   recho `echo "(\")"`        -> (" )           (kept, dquote rules apply)
+        //
+        // The old arms special-cased `\\"` and `\"` while `double` was set
+        // and emitted DATA_DQUOTE directly, which skipped this step, so
+        // `"\\\\"` (four backslashes in double quotes) decoded to `\"`
+        // instead of `\`.
+        match chars.next() {
+            Some(next @ ('$' | '`' | '\\')) => {
+                push_backtick_source_char(&mut output, next, single);
+            }
+            Some('\n') => {}
+            Some('\r') if chars.peek().copied() == Some('\n') => {
+                chars.next();
+            }
+            Some(next) => {
+                output.push('\\');
+                push_backtick_source_char(&mut output, next, single);
+            }
+            None => output.push('\\'),
+        }
+    }
+    // rubash#745: a word-final ODD run of backslashes. GNU hands the body to
+    // parse_and_execute with EOF immediately after it, so a lone trailing
+    // `\\` stays literal (`\`printf '%s' \\`` yields one backslash). The
+    // re-parse here terminates the text with a newline instead, where `\\`
+    // plus newline is a line continuation and the character disappears.
+    // Double it so the parser's own escape pass lands on the same single
+    // backslash; an even run already terminates on a literal backslash.
+    if output.chars().rev().take_while(|ch| *ch == '\\').count() % 2 == 1 {
+        output.push('\\');
+    }
+    output
+}
+
+fn push_backtick_source_char(output: &mut String, ch: char, single: bool) {
+    if single && ch == '$' {
+        output.push(DATA_DOLLAR);
+    } else {
+        output.push(ch);
+    }
+}
+
+pub(super) fn unescape_remaining_shell_escapes(value: &str) -> String {
+    unescape_remaining_shell_escapes_cow(value).into_owned()
+}
+
+/// Borrowing form: the escape-consuming loop only rewrites positions at a
+/// `\`; a value with none copies through verbatim, so the marker-restore
+/// chains on the expansion hot path can borrow instead of staging an output
+/// String (GNU dequote_string walks the string in place).
+pub(super) fn unescape_remaining_shell_escapes_cow(value: &str) -> std::borrow::Cow<'_, str> {
+    if !value.contains('\\') {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    std::borrow::Cow::Owned(unescape_remaining_shell_escapes_inner(value))
+}
+
+fn unescape_remaining_shell_escapes_inner(value: &str) -> String {
+    let mut output = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            let mut lookahead = chars.clone();
+            if lookahead.next() == Some('\\') && lookahead.next() == Some('\'') {
+                chars.next();
+                chars.next();
+                output.push('\'');
+                continue;
+            }
+            if let Some(
+                next @ ('\'' | '"' | '\\' | '$' | '`' | '(' | ')' | '{' | '}' | ';' | '&' | '|'
+                | '<' | '>' | '!' | '*' | '?' | '#' | ' '),
+            ) = chars.peek().copied()
+            {
+                chars.next();
+                output.push(next);
+                continue;
+            }
+        }
+        output.push(ch);
+    }
+    output
+}
+
+/// Command-substitution capture: strips the line terminator(s) GNU bash
+/// removes from a substitution's output.
+///
+/// GNU (subst.c command_substitute) deletes every trailing newline and keeps
+/// any other trailing byte, so on Unix `o=$(printf 'a\r\n')` is `a\r`
+/// (WSL 5.3.0 baseline confirms: od prints `a \r`). Windows additionally
+/// treats a CRLF pair as one terminator: niubash runs Windows-native tools
+/// whose CRT text mode turns every `\n` into `\r\n` (measured: gawk, GoAWK's
+/// awk, ugrep, python, jq, xz, curl, 7z), and a native shell reads those
+/// pipes without the MSYS text-mode translation that turns `\r\n` back into
+/// `\n`. The stray `\r` therefore survives into `$o` and breaks
+/// `[ "$o" = x ]`, `case` labels, array keys and concatenated paths with an
+/// invisible byte (niubash #120).
+///
+/// Rule: strip every trailing `\n`; on Windows also a `\r` that immediately
+/// precedes a stripped `\n` (part of the CRLF terminator). A lone trailing
+/// `\r` not followed by `\n` is preserved everywhere, so the GNU-fidelity
+/// case is intact. This is the same policy the lexer applies to CRLF script
+/// lines (niubash #106) and the same one `read` applies to its input.
+pub(in crate::executor) trait CaptureTerminator {
+    fn trim_capture_terminator(&self) -> &str;
+}
+
+impl CaptureTerminator for str {
+    fn trim_capture_terminator(&self) -> &str {
+        let bytes = self.as_bytes();
+        let mut end = bytes.len();
+        while end > 0 && bytes[end - 1] == b'\n' {
+            end -= 1;
+            if cfg!(windows) && end > 0 && bytes[end - 1] == b'\r' {
+                end -= 1;
+            }
+        }
+        &self[..end]
+    }
+}
+
+/// Byte-level form of the same rule, for capture paths that carry `Vec<u8>`
+/// until the final text conversion (GNU subst.c read_comsub).
+pub(in crate::executor) fn trim_capture_terminator_bytes(bytes: &mut Vec<u8>) {
+    while bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if cfg!(windows) && bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+}
+
+pub(in crate::executor) fn echo_command_substitution_output(args: &[String]) -> String {
+    let mut bytes = echo_raw_output_bytes(args);
+    bytes.retain(|byte| *byte != 0);
+    bytes_to_shell_text(&bytes)
+        .trim_capture_terminator()
+        .to_string()
+}
+
+fn echo_raw_output_bytes(args: &[String]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let _ = crate::builtins::echo::write_echo(args.iter().map(String::as_str), &mut output);
+    output
+}
+
+/// True when any word is a shell control/redirection operator that the
+/// word-based command-substitution shortcuts cannot interpret. GNU subst.c
+/// parses the whole substitution body into a command list before executing
+/// it; a word shortcut that assumes a lone simple command would hand the
+/// operators to the command as literal arguments (`$(f a b | wc -l)` runs
+/// f with `| wc -l` in its positional params, issue #70).
+pub(in crate::executor) fn command_substitution_words_have_operators(words: &[String]) -> bool {
+    words.iter().any(|word| command_word_is_operator(word))
+}
+
+/// True when the word itself carries redirection syntax: either a bare
+/// operator token or an attached form without whitespace (`2>/dev/null`,
+/// `>out`, `<in`, `<<EOF`).
+pub(in crate::executor) fn command_word_carries_redirect(word: &str) -> bool {
+    let body = word.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    body.starts_with('<') || body.starts_with('>')
+}
+
+fn command_word_is_operator(word: &str) -> bool {
+    match word {
+        "|" | "|&" | "||" | "&&" | "&" | ";" | ";;" | ";&" | ";;&" => true,
+        "<" | ">" | ">>" | ">|" | "<>" | "<<" | "<<<" | "<&" | ">&" | "&>" | "&>>" | "1>"
+        | "1>>" | "1>|" | "1<&" | "1>&" | "2>" | "2>>" | "2>|" | "2<&" | "2>&" => true,
+        _ => command_word_carries_redirect(word) || word.contains('|'),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn echo_command_substitution_uses_builtin_escape_rules() {
+        assert_eq!(
+            echo_command_substitution_output(&args(&["-e", "a\\nb"])),
+            "a\nb"
+        );
+        assert_eq!(
+            echo_command_substitution_output(&args(&["-e", "\\xz"])),
+            "\\xz"
+        );
+        assert_eq!(
+            echo_command_substitution_output(&args(&["--help"])),
+            "--help"
+        );
+    }
+
+    #[test]
+    fn echo_command_substitution_removes_nul_bytes() {
+        assert_eq!(
+            echo_command_substitution_output(&args(&["-e", "a\\0b"])),
+            "ab"
+        );
+    }
+
+    #[test]
+    fn braced_parameter_collection_closes_at_first_brace_in_bracket_pattern() {
+        // GNU parse.y uses P_FIRSTCLOSE for ${...}: the first unquoted '}'
+        // closes the expression, even inside a bracket pattern. The
+        // remaining `]` is literal text outside the expansion.
+        let mut chars = "o%[}]}]".chars().peekable();
+        assert_eq!(collect_braced_parameter_name(&mut chars), "o%[");
+        assert_eq!(chars.collect::<String>(), "]}]");
+    }
+}

@@ -1,0 +1,142 @@
+use super::*;
+use crate::lexer::Token;
+
+pub(super) fn parse_loop_command(
+    tokens: &[Token],
+    start: usize,
+    source: Option<&std::rc::Rc<str>>,
+    source_line_offset: usize,
+) -> Option<(CommandNode, usize)> {
+    let (kind, until) = if is_keyword(tokens, start, "while") {
+        (LoopKind::While, false)
+    } else if is_keyword(tokens, start, "until") {
+        (LoopKind::Until, true)
+    } else {
+        return None;
+    };
+
+    let do_index = find_loop_do(tokens, start + 1)?;
+    let condition =
+        parse_loop_body_commands(&tokens[start + 1..do_index], source, source_line_offset);
+    if condition.is_empty() {
+        return None;
+    }
+    let condition_terminator = condition_terminator_before(tokens, do_index);
+    let condition_terminator_metadata = condition_terminator_metadata_before(tokens, do_index);
+    let (body, done_index) = parse_loop_body(tokens, do_index + 1, source, source_line_offset)?;
+    // GNU parse.y:867-872: `DO compound_list DONE` — the loop body cannot
+    // be empty; `do done` reports near `done', `do ; done' near `;'
+    // (rubash#221). parse_loop_body_commands drops separator-only bodies,
+    // so an empty body here is exactly the empty-compound_list case.
+    if body.is_empty() {
+        if let Some(error) = empty_compound_body_error_node(tokens, do_index + 1, done_index) {
+            return Some((error, done_index + 1));
+        }
+    }
+
+    let mut command = CommandNode::new();
+    command.line = tokens.get(start).map(|token| token.position);
+    command.logical_line = tokens.get(start).map(|token| token.logical_line);
+    command.loop_command = Some(LoopCommand {
+        keyword: tokens[start].value.clone(),
+        keyword_metadata: build_loop_keyword_metadata(&tokens[start]),
+        condition,
+        condition_terminator,
+        condition_terminator_metadata,
+        do_keyword: tokens[do_index].value.clone(),
+        do_keyword_metadata: build_loop_keyword_metadata(&tokens[do_index]),
+        body_open_delimiter: tokens[do_index].value.clone(),
+        body_open_delimiter_metadata: build_loop_keyword_metadata(&tokens[do_index]),
+        body_close_delimiter: tokens[done_index].value.clone(),
+        body_close_delimiter_metadata: build_loop_keyword_metadata(&tokens[done_index]),
+        body,
+        end_keyword: tokens[done_index].value.clone(),
+        end_keyword_metadata: build_loop_keyword_metadata(&tokens[done_index]),
+        kind,
+        until,
+    });
+
+    Some(finish_compound_command(command, tokens, done_index + 1))
+}
+
+fn find_loop_do(tokens: &[Token], start: usize) -> Option<usize> {
+    let mut stack = Vec::new();
+    let mut index = start;
+    while index < tokens.len() {
+        if stack.is_empty()
+            && command_boundary_keyword_allowed(tokens, index)
+            && is_keyword(tokens, index, "do")
+        {
+            return Some(index);
+        }
+        update_compound_boundary_stack(tokens, index, &mut stack);
+        index += 1;
+    }
+    None
+}
+
+fn parse_loop_body(
+    tokens: &[Token],
+    start: usize,
+    source: Option<&std::rc::Rc<str>>,
+    source_line_offset: usize,
+) -> Option<(Vec<CommandNode>, usize)> {
+    let mut stack = Vec::new();
+    let mut index = start;
+    while index < tokens.len() {
+        if stack.is_empty()
+            && command_boundary_keyword_allowed(tokens, index)
+            && is_keyword(tokens, index, "done")
+        {
+            break;
+        }
+        if stack.is_empty()
+            && command_boundary_keyword_allowed(tokens, index)
+            && is_keyword(tokens, index, "do")
+        {
+            return None;
+        }
+        update_compound_boundary_stack(tokens, index, &mut stack);
+        index += 1;
+    }
+
+    if !is_keyword(tokens, index, "done") {
+        return None;
+    }
+    Some((
+        parse_loop_body_commands(&tokens[start..index], source, source_line_offset),
+        index,
+    ))
+}
+
+fn parse_loop_body_commands(
+    tokens: &[Token],
+    source: Option<&std::rc::Rc<str>>,
+    source_line_offset: usize,
+) -> Vec<CommandNode> {
+    super::parse_loop::parse_body_with_diagnostics(tokens, source, source_line_offset)
+        .into_iter()
+        .filter(|command| !command_is_empty(command))
+        .collect()
+}
+
+fn condition_terminator_before(tokens: &[Token], do_index: usize) -> Option<String> {
+    tokens
+        .get(do_index.saturating_sub(1))
+        .filter(|token| token.kind == crate::lexer::TokenKind::Semicolon)
+        .map(|token| token.value.clone())
+}
+
+fn condition_terminator_metadata_before(
+    tokens: &[Token],
+    do_index: usize,
+) -> Option<Box<WordMetadata>> {
+    tokens
+        .get(do_index.saturating_sub(1))
+        .filter(|token| token.kind == crate::lexer::TokenKind::Semicolon)
+        .map(build_loop_keyword_metadata)
+}
+
+fn build_loop_keyword_metadata(token: &Token) -> Box<WordMetadata> {
+    Box::new(build_word_metadata(0, &token.value, &token.raw))
+}

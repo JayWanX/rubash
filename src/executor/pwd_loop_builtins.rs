@@ -1,0 +1,226 @@
+use super::*;
+
+impl Executor {
+    pub(in crate::executor) fn execute_pwd(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<i32, ExecuteError> {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = self.execute_pwd_with_io(&cmd.words[1..], &mut stdout, &mut stderr)?;
+        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+        // GNU pwd.def returns sh_chkwrite(EXECUTION_SUCCESS): a failed
+        // flush (closed fd) turns the builtin's status into failure.
+        if self.take_builtin_write_failed() {
+            return Ok(1);
+        }
+        Ok(status)
+    }
+
+    pub(in crate::executor) fn execute_pwd_with_io<W, E>(
+        &mut self,
+        args: &[String],
+        stdout: &mut W,
+        stderr: &mut E,
+    ) -> io::Result<i32>
+    where
+        W: Write,
+        E: Write,
+    {
+        if args.is_empty() || args.first().map(String::as_str) == Some("-L") {
+            if let Some(pwd) = self.shell_state.env_vars.get("PWD") {
+                if pwd.starts_with('/') {
+                    writeln!(stdout, "{pwd}")?;
+                    return Ok(0);
+                }
+            }
+        }
+
+        crate::builtins::pwd::execute_with_env_and_io(
+            args.iter().map(String::as_str),
+            &self.shell_state.env_vars,
+            stdout,
+            stderr,
+        )
+    }
+
+    pub(in crate::executor) fn execute_loop_control(
+        &mut self,
+        cmd: &CommandNode,
+        kind: LoopControlKind,
+    ) -> Result<(), ExecuteError> {
+        let mut stderr = Vec::new();
+        if self.shell_state.loop_depth == 0 {
+            // GNU break.def check_loop_level (BREAK_COMPLAINS): the
+            // out-of-loop diagnostic is suppressed in posix mode; the status
+            // stays zero either way (func5.sub posix testfunc `break`).
+            if !self.posix_mode_enabled() {
+                writeln!(
+                    &mut stderr,
+                    "{}{}: only meaningful in a `for', `while', or `until' loop",
+                    self.diagnostic_prefix(),
+                    kind.name()
+                )?;
+            }
+            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+            // Bash emits the diagnostic but leaves the command status at zero
+            // when an out-of-loop break/continue is followed by another
+            // command in the same list.
+            self.exit_code = 0;
+            return Ok(());
+        }
+
+        match loop_control_level(&cmd.words[1..]) {
+            Ok(level) => {
+                let level = level.min(self.shell_state.loop_depth);
+                // GNU break.def/continue.def return EXECUTION_SUCCESS for an
+                // in-range count — the builtin has no user-visible status of
+                // its own. Establish that status before unwinding (rubash#702):
+                // the loop's CONDITION status is still in self.exit_code here
+                // (it ran with errexit suppressed and nothing replaced it), and
+                // the dispatcher's post-command errexit / ERR-trap gate reads
+                // self.exit_code — so an `until` whose condition failed would
+                // otherwise attribute that failure to a body whose first
+                // command is `break`/`continue` (or a group starting with one).
+                // `until false; do break; done` must leave $? = 0, and
+                // `until (exit 7); do break; done` must not leak the 7.
+                self.exit_code = 0;
+                match kind {
+                    LoopControlKind::Break => Err(ExecuteError::Break(level)),
+                    LoopControlKind::Continue => Err(ExecuteError::Continue(level)),
+                }
+            }
+            Err(LoopControlError::TooManyArguments) => {
+                writeln!(
+                    &mut stderr,
+                    "{}{}: too many arguments",
+                    self.diagnostic_prefix(),
+                    kind.name()
+                )?;
+                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                self.exit_code = 1;
+                Ok(())
+            }
+            Err(LoopControlError::OutOfRange(value)) => {
+                writeln!(
+                    &mut stderr,
+                    "{}{}: {value}: loop count out of range",
+                    self.diagnostic_prefix(),
+                    kind.name()
+                )?;
+                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                // GNU break.def:80-91 / continue.def:120-131: even when the
+                // count is out of range, `breaking`/`continuing` is set to
+                // loop_level — the loop STILL unwinds — and the builtin
+                // returns EXECUTION_FAILURE, so the loop's exit status is 1
+                // (rubash#395: the Break unwind resets exit_code at every
+                // loop boundary; the failure status rides the Cell to the
+                // innermost consumer arm). For `continue 0`,
+                // `continuing = loop_level` with a count of 0 effectively
+                // breaks the loop (the rest of the body is skipped and the
+                // loop does not advance to the next iteration), so both
+                // cases return Break.
+                self.break_failure_status.set(Some(1));
+                self.exit_code = 1;
+                let level = self.shell_state.loop_depth;
+                Err(ExecuteError::Break(level))
+            }
+            Err(LoopControlError::NotNumeric(value)) => {
+                writeln!(
+                    &mut stderr,
+                    "{}{}: {value}: numeric argument required",
+                    self.diagnostic_prefix(),
+                    kind.name()
+                )?;
+                self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+                // GNU break.def:76 get_numeric_arg(list, interactive ? 2 : 1)
+                // (builtins/common.c:488-510): a non-numeric count reports
+                // sh_neednumarg and NEVER RETURNS — non-interactive fatal=1
+                // is set_exit_status(EX_BADUSAGE=2) + jump_to_top_level
+                // (EXITPROG): the whole shell exits 2 (verified WSL GNU
+                // 5.3.0: a script dies at the first `break 2x`, rc 2);
+                // interactive fatal=2 is DISCARD — the current command list
+                // is abandoned and the reader continues.
+                if self.get_env("__RUBASH_INTERACTIVE").as_deref() == Some("1") {
+                    return Err(ExecuteError::ExpansionFailure(2));
+                }
+                Err(ExecuteError::ExitCode(2))
+            }
+        }
+    }
+
+    /// rubash#395: the status a failed loop-control builtin (break 0 /
+    /// continue 0 / break -1) parked for the innermost Break consumer; a
+    /// normal `break n` unwinds with None (status 0).
+    pub(in crate::executor) fn take_break_failure_status(&self) -> Option<i32> {
+        self.break_failure_status.take()
+    }
+
+    pub(in crate::executor) fn execute_return(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<(), ExecuteError> {
+        let args = &cmd.words[1..];
+        let mut stderr = Vec::new();
+        let status = if let Some(value) = args.first() {
+            match value.parse::<i128>() {
+                Ok(value) => crate::builtins::exit::normalize_status(value),
+                Err(_) => {
+                    writeln!(
+                        &mut stderr,
+                        "{}return: {value}: numeric argument required",
+                        self.diagnostic_prefix()
+                    )?;
+                    2
+                }
+            }
+        } else {
+            // A bare return inside a running signal trap action gets the
+            // pre-trap $? only when it terminates the trap action itself
+            // (posix interp 1602); a return in a function called by the
+            // action uses the current $? (trap9.sub: handler's return sees
+            // setexit's 111, not the pre-trap status).
+            let action_depth = self
+                .shell_state
+                .env_vars
+                .get("__RUBASH_SIGNAL_TRAP_DEPTH")
+                .and_then(|value| value.parse::<usize>().ok());
+            let in_trap_action = action_depth == Some(self.shell_state.function_depth);
+            if in_trap_action {
+                self.shell_state
+                    .env_vars
+                    .get("__RUBASH_SIGNAL_TRAP_STATUS")
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .unwrap_or(self.exit_code)
+            } else {
+                self.exit_code
+            }
+        };
+
+        let in_function = self.shell_state.function_depth > 0;
+        let in_source = self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_IN_SOURCE")
+            .map(String::as_str)
+            == Some("1");
+        if in_function || in_source {
+            self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+            return Err(ExecuteError::Return(status));
+        }
+
+        writeln!(
+            &mut stderr,
+            "{}return: can only `return' from a function or sourced script",
+            self.diagnostic_prefix()
+        )?;
+        self.write_buffered_builtin_output(cmd, &[], &stderr)?;
+        self.exit_code = 2;
+        // GNU return.def:74 returns EX_USAGE (258 > EX_SHERRBASE=256), so
+        // execute_cmd.c:4888 sets special_builtin_failed for `return` (a
+        // POSIX special builtin). In POSIX non-interactive mode this causes
+        // the shell to exit (execute_cmd.c:1004-1017).
+        self.special_builtin_failed.set(true);
+        Ok(())
+    }
+}

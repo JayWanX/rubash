@@ -1,0 +1,779 @@
+use super::super::*;
+use std::fs;
+
+#[test]
+fn test_wait_for_last_background_pid_returns_child_status() {
+    let _cwd_guard = CwdGuard::take();
+    let status_path = "target/rubash-wait-last-background-status.txt";
+    let error_path = "target/rubash-wait-last-background-error.txt";
+    let _ = fs::remove_file(status_path);
+    let _ = fs::remove_file(error_path);
+    let input = format!("false & wait $! 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "1\n");
+    assert_eq!(fs::read_to_string(error_path).unwrap(), "");
+    let _ = fs::remove_file(status_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_wait_for_background_jobspec_returns_child_status_and_removes_job() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-wait-jobspec-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "false & wait %1; printf 'wait:%s\\n' \"$?\" > {output_path}; jobs >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "wait:1\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_wait_for_current_jobspec_uses_last_background_job() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-wait-current-jobspec-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "true & wait %+; printf 'wait:%s\\n' \"$?\" > {output_path}; jobs >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "wait:0\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_wait_for_multiple_background_operands_returns_last_status() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-wait-multiple-background-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "true & first=$!; false & wait \"$first\" %2; printf 'wait:%s\\n' \"$?\" > {output_path}; jobs >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "wait:1\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_wait_f_accepts_multiple_background_jobspecs() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-wait-f-multiple-jobspec-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "true & false & wait -f -- %1 %2; printf 'wait:%s\\n' \"$?\" > {output_path}; jobs >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "wait:1\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_wait_n_waits_one_background_job() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-wait-n-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "false & wait -n; printf 'wait:%s\\n' \"$?\" > {output_path}; jobs >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "wait:1\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_jobs_refreshes_completed_background_status() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-jobs-completed-status-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("false & sleep 0.2; jobs -l > {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(
+        output.contains("Exit 1"),
+        "unexpected jobs output: {output:?}"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_wait_n_prefers_a_completed_job_over_an_earlier_running_job() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-wait-n-completed-first-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "sleep 3 & slow=$!; false & fast=$!; sleep 1; wait -n; printf 'status:%s\\n' \"$?\" > {output_path}; wait \"$slow\""
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "status:1\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_wait_n_preserves_status_for_later_explicit_pid_wait() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-wait-n-explicit-pid-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "false & first=$!; true & second=$!; wait -n; printf 'first:%s\\n' \"$?\" > {output_path}; wait $first; printf 'first_wait:%s\\n' \"$?\" >> {output_path}; wait $second; printf 'second_wait:%s\\n' \"$?\" >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "first:1\nfirst_wait:1\nsecond_wait:0\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_wait_n_accepts_requested_jobspec() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-wait-n-jobspec-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "true & wait -n %1; printf 'wait:%s\\n' \"$?\" > {output_path}; jobs >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "wait:0\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_wait_n_p_assigns_completed_pid() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-wait-n-p-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "true & launched=$!; wait -n -p done_pid; printf 'wait:%s pid:%s launched:%s\\n' \"$?\" \"$done_pid\" \"$launched\" > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    let rest = output.trim_end().strip_prefix("wait:0 pid:").unwrap();
+    let (pid, launched) = rest.split_once(" launched:").unwrap();
+    assert!(pid.parse::<u32>().is_ok());
+    assert_eq!(pid, launched);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_wait_np_assigns_requested_jobspec_pid() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-wait-np-jobspec-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "true & launched=$!; wait -np done_pid %1; printf 'wait:%s pid:%s launched:%s\\n' \"$?\" \"$done_pid\" \"$launched\" > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    let rest = output.trim_end().strip_prefix("wait:0 pid:").unwrap();
+    let (pid, launched) = rest.split_once(" launched:").unwrap();
+    assert!(pid.parse::<u32>().is_ok());
+    assert_eq!(pid, launched);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_wait_np_compact_var_assigns_requested_jobspec_pid() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-wait-np-compact-var-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "true & launched=$!; wait -npdone_pid %1; printf 'wait:%s pid:%s launched:%s\\n' \"$?\" \"$done_pid\" \"$launched\" > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    let rest = output.trim_end().strip_prefix("wait:0 pid:").unwrap();
+    let (pid, launched) = rest.split_once(" launched:").unwrap();
+    assert!(pid.parse::<u32>().is_ok());
+    assert_eq!(pid, launched);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_kill_background_jobspec_removes_job() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-jobspec-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "while true; do true; done & kill %1; printf 'kill:%s\\n' \"$?\" > {output_path}; jobs >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "kill:0\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_kill_current_jobspec_uses_last_background_job() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-current-jobspec-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "while true; do true; done & kill %+; printf 'kill:%s\\n' \"$?\" > {output_path}; jobs >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "kill:0\n");
+    let _ = fs::remove_file(output_path);
+}
+
+/// rubash#796 differential (GNU 5.3.0 probe, 2026-10-13): a jobspec kill's
+/// death is the kill builtin's own doing — GNU's non-interactive reader
+/// suppresses the completion notice (jobs.c notify_of_job_status
+/// DONT_REPORT_SIGTERM arm: nothing printed, the dead job is cleaned up),
+/// so `kill %1; jobs` lists nothing and no `[1]+ Exit 143` line fires at
+/// the wait. The signal status stays resolvable through the completed
+/// status (pinning that contract is the pid-operand test below).
+#[test]
+fn test_kill_jobspec_leaves_no_completion_notice() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-no-notice-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "while true; do true; done & kill %1; printf 'kill:%s\\n' \"$?\" > {output_path}; jobs >> {output_path}; wait; echo \"after:$?\" >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "kill:0\nafter:0\n",
+        "no job-completion notice and no jobs listing for a jobspec kill"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+/// The kill builtin stashes the signal status before dropping the table
+/// entry, so the #737 contract survives the #796 notice fix: a pid-shaped
+/// wait after the kill still resolves the signal status (GNU 5.3.0:
+/// `kill $!; wait $!` reports 143).
+#[test]
+fn test_kill_pid_operand_then_wait_reports_signal_status() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-pid-wait-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "while true; do true; done & j=$!; kill $j; wait $j; printf 's:%s\\n' \"$?\" > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "s:143\n",
+        "wait after a pid kill still resolves the signal status"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_kill_zero_checks_jobspec_without_removing_job() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-zero-jobspec-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "while true; do true; done & pid=$!; kill -0 %1; printf 'check:%s pid:%s\\n' \"$?\" \"$pid\" > {output_path}; jobs -p %1 >> {output_path}; kill %1"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    let mut lines = output.lines();
+    let first = lines.next().unwrap();
+    let jobs_pid = lines.next().unwrap();
+    assert!(lines.next().is_none());
+    let launched = first.strip_prefix("check:0 pid:").unwrap();
+    assert_eq!(jobs_pid, launched);
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_kill_unknown_jobspec_reports_failure() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-kill-unknown-jobspec-error.txt";
+    let status_path = "target/rubash-kill-unknown-jobspec-status.txt";
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("kill %1 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "1\n");
+    assert!(fs::read_to_string(error_path)
+        .unwrap()
+        .contains("kill: %1: no such job"));
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_wait_for_unknown_pid_returns_notfound() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-wait-pid-error.txt";
+    let status_path = "target/rubash-wait-pid-status.txt";
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("wait 999999 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "127\n");
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("wait: pid 999999 is not a child of this shell"));
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_wait_invalid_operand_returns_failure() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-wait-invalid-error.txt";
+    let status_path = "target/rubash-wait-invalid-status.txt";
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("wait abc 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "1\n");
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("wait: `abc': not a pid or valid job spec"));
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_wait_invalid_option_returns_usage() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-wait-invalid-option-error.txt";
+    let status_path = "target/rubash-wait-invalid-option-status.txt";
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("wait -x 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "2\n");
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("wait: -x: invalid option"));
+    assert!(error.contains("wait: usage: wait [-fn] [-p var] [id ...]"));
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_fg_without_job_control_returns_failure() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-fg-error.txt";
+    let status_path = "target/rubash-fg-status.txt";
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("fg 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "1\n");
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("fg: no job control"));
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_fg_invalid_option_without_job_control_returns_failure() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-fg-invalid-option-error.txt";
+    let status_path = "target/rubash-fg-invalid-option-status.txt";
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("fg -Z 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "1\n");
+    assert_eq!(
+        fs::read_to_string(error_path).unwrap(),
+        // wt33 (#374): GNU -c diagnostic form (probe H06_fg_wording).
+        "bash: line 1: fg: no job control\n"
+    );
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_bg_without_job_control_returns_failure() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-bg-error.txt";
+    let status_path = "target/rubash-bg-status.txt";
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("bg 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "1\n");
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("bg: no job control"));
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+}
+
+// rubash#400 (probe wt37-374 K033 / wt38 p400h M2): in a script (no job
+// control) `fg "$pid"` errors before any operand processing, and the job
+// table then reports the finished background job — GNU 5.3.0 prints
+// `fg:1` then `[1]+  Exit 1                     false` (jobs.def:154-160
+// "no job control"; jobs.c printable_job_status JDEAD -> "Exit %d").
+// The sleep is the observation delay: GNU's fork-subshell for `false &`
+// is dead by the next command, while the Windows child needs tens of ms
+// (test_jobs_refreshes_completed_background_status pattern). The marker
+// column is nondeterministic in GNU (reset_current race), so the jobs
+// line is asserted with contains.
+#[test]
+fn test_fg_background_pid_waits_and_removes_job() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-fg-pid-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "false & pid=$!; fg \"$pid\"; printf 'fg:%s\\n' \"$?\" > {output_path}; sleep 0.3; jobs >> {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    let lines = output.lines().collect::<Vec<_>>();
+    assert_eq!(lines[0], "fg:1");
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines[1].contains("Exit 1") && lines[1].contains("false"),
+        "unexpected jobs output: {output:?}"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+// rubash#400 (probe wt37-374 K034 / wt38 p400h M1): `bg "$pid"` errors
+// with rc 1 in a script, the listing reports `[1]+  Done  true` and —
+// POSIX cleanup (jobs.def:138-139 notify_and_cleanup) — removes the dead
+// job, so the following `disown "$pid"` fails with "no such job" rc 1
+// (jobs.def:283-289 -> jobs.c:1878 find_job: live table only). GNU 5.3.0
+// probed: bg:1 / Done true / disown:1. Sleep = observation delay (above);
+// markers are nondeterministic in GNU, asserted with contains.
+#[test]
+fn test_bg_background_pid_succeeds_and_keeps_job() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-bg-pid-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!("true & pid=$!; bg \"$pid\"; echo bg:$? > {output_path}; sleep 0.3; jobs >> {output_path}; disown \"$pid\"; echo disown:$? >> {output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    let output = fs::read_to_string(output_path).unwrap();
+    let lines = output.lines().collect::<Vec<_>>();
+    assert_eq!(lines[0], "bg:1");
+    assert_eq!(lines.len(), 3);
+    assert!(
+        lines[1].contains("Done") && lines[1].contains("true"),
+        "unexpected jobs output: {output:?}"
+    );
+    assert_eq!(lines[2], "disown:1");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_suspend_without_job_control_returns_failure() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-suspend-error.txt";
+    let status_path = "target/rubash-suspend-status.txt";
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("suspend 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "1\n");
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("suspend: cannot suspend: no job control"));
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_suspend_invalid_option_returns_usage() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-suspend-invalid-error.txt";
+    let status_path = "target/rubash-suspend-invalid-status.txt";
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("suspend -x 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "2\n");
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("suspend: -x: invalid option"));
+    assert!(error.contains("suspend: usage: suspend [-f]"));
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_history_without_entries_returns_success() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-history-empty-output.txt";
+    let status_path = "target/rubash-history-empty-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("history > {output_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "");
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "0\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_history_clear_returns_success() {
+    let _cwd_guard = CwdGuard::take();
+    let status_path = "target/rubash-history-clear-status.txt";
+    let _ = fs::remove_file(status_path);
+    let input = format!("history -c; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "0\n");
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_history_invalid_option_returns_usage() {
+    let _cwd_guard = CwdGuard::take();
+    let error_path = "target/rubash-history-invalid-error.txt";
+    let status_path = "target/rubash-history-invalid-status.txt";
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!("history -x 2> {error_path}; echo $? > {status_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "2\n");
+    let error = fs::read_to_string(error_path).unwrap();
+    assert!(error.contains("history: -x: invalid option"));
+    assert!(error.contains("history: usage: history [-c] [-d offset]"));
+    let _ = fs::remove_file(error_path);
+    let _ = fs::remove_file(status_path);
+}
+
+#[test]
+fn test_kill_stop_continue_preserves_job_lifecycle() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-kill-stop-jobs-pid.txt";
+    let status_path = "target/rubash-kill-stop-status.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+    let input = format!(
+        "while true; do sleep 1; done & pid=$!; kill -STOP $pid; jobs -p %1 > {output_path}; kill -CONT $pid; kill -9 $pid; wait $pid; echo $? > {status_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert!(fs::read_to_string(output_path)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .is_ok());
+    assert_eq!(fs::read_to_string(status_path).unwrap(), "137\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(status_path);
+}

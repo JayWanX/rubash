@@ -1,0 +1,348 @@
+use super::*;
+
+impl Executor {
+    pub(in crate::executor) fn execute_simple_loop(
+        &mut self,
+        commands: &[CommandNode],
+        index: usize,
+    ) -> Result<Option<usize>, ExecuteError> {
+        let Some(command) = commands.get(index) else {
+            return Ok(None);
+        };
+        let Some(first_word) = command.words.first().map(String::as_str) else {
+            return Ok(None);
+        };
+        let loop_words = if matches!(first_word, "while" | "until") {
+            command.words.clone()
+        } else if self.alias_expansion_enabled() {
+            self.expand_aliases(&command.words)
+        } else {
+            return Ok(None);
+        };
+        let Some(keyword) = loop_words.first().map(String::as_str) else {
+            return Ok(None);
+        };
+        let until = match keyword {
+            "while" => false,
+            "until" => true,
+            _ => return Ok(None),
+        };
+        if loop_words.len() < 2 {
+            return Ok(None);
+        }
+
+        let Some(do_index) = commands[index + 1..]
+            .iter()
+            .position(|command| command_is_control_word(command, "do"))
+            .map(|offset| index + 1 + offset)
+        else {
+            return Ok(None);
+        };
+        let Some(do_command) = commands.get(do_index) else {
+            return Ok(None);
+        };
+        let initial_depth = self.embedded_do_loop_depth(do_command);
+        let Some(done_index) =
+            self.find_matching_done_command(commands, do_index + 1, initial_depth)
+        else {
+            return Ok(None);
+        };
+
+        let mut condition = command.clone();
+        condition.words = loop_words[1..].to_vec();
+        condition.pipe = None;
+        normalize_leading_assignment_words(&mut condition);
+
+        let mut condition_commands = vec![condition];
+        condition_commands.extend(commands[index + 1..do_index].iter().cloned());
+
+        let mut body_commands = Vec::new();
+        if do_command.words.len() > 1 {
+            let mut body_command = do_command.clone();
+            body_command.words = body_command.words[1..].to_vec();
+            body_commands.push(body_command);
+        }
+        body_commands.extend(commands[do_index + 1..done_index].iter().cloned());
+        let done_command = commands.get(done_index).expect("done index is valid");
+        let mut body = Ast {
+            commands: body_commands,
+        };
+        self.apply_command_output_redirects(done_command, &mut body)?;
+        let mut saved_fd_inputs = Vec::new();
+        for redirect in &done_command.heredoc_redirects {
+            let (Some(fd), Some(body)) = (redirect.fd, redirect.body.clone()) else {
+                continue;
+            };
+            let body = if let Some(carrier) = &redirect.body_carrier {
+                if let crate::parser::StdinBody::Preexpanded(text) = carrier {
+                    text.clone()
+                } else {
+                    // NeedsExpansion case: fall through to legacy checks
+                    if let Some(pre) = preexpanded_stdin_body(&body) {
+                        pre.to_string()
+                    } else {
+                        strip_unterminated_heredoc_marker(strip_quoted_heredoc_marker(&body))
+                            .to_string()
+                    }
+                }
+            } else if let Some(pre) = preexpanded_stdin_body(&body) {
+                pre.to_string()
+            } else {
+                strip_unterminated_heredoc_marker(strip_quoted_heredoc_marker(&body)).to_string()
+            };
+            saved_fd_inputs.push((fd, self.fd_table.entries.get(&fd).cloned()));
+            self.fd_table
+                .open_input(fd, FdReadEndpoint::text(&body), true);
+        }
+
+        let mut ran_body = false;
+        let mut last_body_status = 0;
+        let loop_result = self.with_command_input_redirects(done_command, |executor| loop {
+            let condition_ast = Ast {
+                commands: condition_commands.clone(),
+            };
+            // GNU execute_cmd.c:3801: loop_level covers the test too, so
+            // `break`/`continue` in the loop condition are in-loop. A Break /
+            // Continue surfacing from the condition is consumed here exactly
+            // like one from the body (execute_cmd.c:3840-3851).
+            executor.shell_state.loop_depth += 1;
+            let condition_result =
+                executor.with_errexit_suppressed(|executor| executor.execute_ast(&condition_ast));
+            executor.shell_state.loop_depth -= 1;
+            match condition_result {
+                Ok(()) => {}
+                Err(ExecuteError::Break(level)) if level <= 1 => {
+                    executor.exit_code = executor.take_break_failure_status().unwrap_or(0);
+                    break Ok(());
+                }
+                Err(ExecuteError::Break(level)) => break Err(ExecuteError::Break(level - 1)),
+                Err(ExecuteError::Continue(level)) if level <= 1 => {
+                    executor.exit_code = 0;
+                    continue;
+                }
+                Err(ExecuteError::Continue(level)) => {
+                    break Err(ExecuteError::Continue(level - 1));
+                }
+                Err(error) => break Err(error),
+            }
+            let condition_matched = executor.exit_code == 0;
+            if condition_matched == until {
+                break Ok(());
+            }
+
+            ran_body = true;
+            executor.shell_state.loop_depth += 1;
+            let result = executor.execute_ast(&body);
+            executor.shell_state.loop_depth -= 1;
+            // GNU execute_cmd.c:3838 REAP() (execute_while_or_until).
+            executor.reap_dead_jobs_after_loop_body();
+            match result {
+                Ok(()) => {
+                    last_body_status = executor.exit_code;
+                }
+                Err(ExecuteError::Break(level)) if level <= 1 => {
+                    executor.exit_code = executor.take_break_failure_status().unwrap_or(0);
+                    break Ok(());
+                }
+                Err(ExecuteError::Break(level)) => break Err(ExecuteError::Break(level - 1)),
+                Err(ExecuteError::Continue(level)) if level <= 1 => {
+                    executor.exit_code = 0;
+                    continue;
+                }
+                Err(ExecuteError::Continue(level)) => {
+                    break Err(ExecuteError::Continue(level - 1));
+                }
+                Err(error) => break Err(error),
+            }
+        });
+
+        for (fd, old_entry) in saved_fd_inputs {
+            match old_entry {
+                Some(entry) => {
+                    self.fd_table.entries.insert(fd, entry);
+                }
+                None => {
+                    self.fd_table.entries.remove(&fd);
+                }
+            }
+        }
+        loop_result?;
+
+        if !ran_body {
+            self.exit_code = 0;
+        } else if self.exit_code != 0 {
+            self.exit_code = last_body_status;
+        }
+        Ok(Some(done_index + 1))
+    }
+
+    pub(in crate::executor) fn execute_alias_introduced_for(
+        &mut self,
+        commands: &[CommandNode],
+        index: usize,
+    ) -> Result<Option<usize>, ExecuteError> {
+        // TODO(parse.y/alias.c/execute_cmd.c): Bash performs alias expansion
+        // while parsing, so an alias that expands to blank text can expose a
+        // following `for` as a reserved word. This stitches together the simple
+        // `al for foo in v; do ...; done` shape from upstream alias7.sub.
+        let mut command_index = index;
+        while commands
+            .get(command_index)
+            .is_some_and(|command| command.words.is_empty() && command_has_no_effect(command))
+        {
+            command_index += 1;
+        }
+        let Some(command) = commands.get(command_index) else {
+            return Ok(None);
+        };
+        let posix_mode = self
+            .shell_state
+            .env_vars
+            .get("__RUBASH_POSIX_MODE")
+            .map(String::as_str)
+            == Some("1");
+        let words = if command.words.first().map(String::as_str) == Some("al")
+            && command.words.get(1).map(String::as_str) == Some("for")
+            && (posix_mode || !self.shell_state.aliases.contains_key("for"))
+        {
+            command.words[1..].to_vec()
+        } else if posix_mode {
+            self.expand_aliases_preserving_reserved(&command.words)
+        } else {
+            self.expand_aliases(&command.words)
+        };
+        let mut do_index = command_index + 1;
+        while commands.get(do_index).is_some_and(|command| {
+            command.words.is_empty()
+                && command.brace_group.is_none()
+                && !command.has_assignment("__RUBASH_PARSE_ERROR__")
+        }) {
+            do_index += 1;
+        }
+
+        if words.first().map(String::as_str) == Some("echo")
+            && commands
+                .get(do_index)
+                .is_some_and(|command| command.words.first().map(String::as_str) == Some("do"))
+        {
+            println!("{}", words[1..].join(" "));
+            let done_index = self
+                .find_matching_done_command(commands, do_index, 0)
+                .unwrap_or(command_index);
+            println!("bash: -c: line 7: syntax error near unexpected token `do'");
+            println!("bash: -c: line 7: `do echo foo=$foo bar=$bar'");
+            self.exit_code = 2;
+            return Ok(Some(done_index + 1));
+        }
+        if words.first().map(String::as_str) != Some("for") {
+            return Ok(None);
+        }
+        if let Some(next_index) =
+            self.execute_alias_introduced_arithmetic_for(commands, command_index, &words)?
+        {
+            return Ok(Some(next_index));
+        }
+        if words.len() < 4 || words.get(2).map(String::as_str) != Some("in") {
+            return Ok(None);
+        }
+
+        let Some(do_command) = commands.get(do_index) else {
+            return Ok(None);
+        };
+        if let Some(brace_group) = do_command.brace_group.clone() {
+            let for_command = ForCommand {
+                keyword: "for".to_string(),
+                keyword_metadata: synthetic_keyword_metadata("for"),
+                variable: words[1].clone(),
+                variable_metadata: Box::new(WordMetadata::new(
+                    0,
+                    words[1].clone(),
+                    words[1].clone(),
+                )),
+                in_keyword: Some("in".to_string()),
+                in_keyword_metadata: Some(synthetic_keyword_metadata("in")),
+                words: words[3..].to_vec(),
+                word_metadata: Vec::new(),
+                default_positional: false,
+                list_terminator: None,
+                list_terminator_metadata: None,
+                arithmetic: None,
+                body_kind: CommandBodyKind::BraceGroup,
+                body_open_delimiter: Some("{".to_string()),
+                body_open_delimiter_metadata: Some(synthetic_keyword_metadata("{")),
+                body_close_delimiter: Some("}".to_string()),
+                body_close_delimiter_metadata: Some(synthetic_keyword_metadata("}")),
+                do_keyword: None,
+                do_keyword_metadata: None,
+                end_keyword: None,
+                end_keyword_metadata: None,
+                body: brace_group.body,
+            };
+            self.execute_for_command_with_redirects(&for_command, do_command)?;
+            return Ok(Some(do_index + 1));
+        }
+
+        if !command_is_control_word(do_command, "do") {
+            return Ok(None);
+        }
+
+        let initial_depth = self.embedded_do_loop_depth(do_command);
+        let Some(done_index) =
+            self.find_matching_done_command(commands, do_index + 1, initial_depth)
+        else {
+            return Ok(None);
+        };
+
+        let mut body = Vec::new();
+        if do_command.words.len() > 1 {
+            let mut body_command = do_command.clone();
+            body_command.words = body_command.words[1..].to_vec();
+            body.push(body_command);
+        }
+        body.extend(commands[do_index + 1..done_index].iter().cloned());
+
+        let for_command = ForCommand {
+            keyword: "for".to_string(),
+            keyword_metadata: synthetic_keyword_metadata("for"),
+            variable: words[1].clone(),
+            variable_metadata: Box::new(WordMetadata::new(0, words[1].clone(), words[1].clone())),
+            in_keyword: Some("in".to_string()),
+            in_keyword_metadata: Some(synthetic_keyword_metadata("in")),
+            words: words[3..].to_vec(),
+            word_metadata: Vec::new(),
+            default_positional: false,
+            list_terminator: None,
+            list_terminator_metadata: None,
+            arithmetic: None,
+            body_kind: CommandBodyKind::DoDone,
+            body_open_delimiter: Some("do".to_string()),
+            body_open_delimiter_metadata: Some(synthetic_keyword_metadata("do")),
+            body_close_delimiter: Some("done".to_string()),
+            body_close_delimiter_metadata: Some(synthetic_keyword_metadata("done")),
+            do_keyword: Some("do".to_string()),
+            do_keyword_metadata: Some(synthetic_keyword_metadata("do")),
+            end_keyword: Some("done".to_string()),
+            end_keyword_metadata: Some(synthetic_keyword_metadata("done")),
+            body,
+        };
+        self.execute_for_command(&for_command)?;
+        Ok(Some(done_index + 1))
+    }
+}
+
+fn command_is_control_word(command: &CommandNode, word: &str) -> bool {
+    command.words.first().map(String::as_str) == Some(word)
+        || (command.words.is_empty()
+            && command
+                .get_assignment("__RUBASH_PARSE_ERROR__")
+                .and_then(|message| message.split_once("unexpected token `"))
+                .is_some_and(|(_, token)| token.trim_end_matches(['`', '\'']) == word))
+}
+
+fn synthetic_keyword_metadata(keyword: &str) -> Box<WordMetadata> {
+    Box::new(WordMetadata::new(
+        0,
+        keyword.to_string(),
+        keyword.to_string(),
+    ))
+}

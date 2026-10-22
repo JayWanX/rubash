@@ -1,0 +1,196 @@
+use super::*;
+
+/// Decode U+E000 raw-byte marker pairs in builtin output back to real
+/// bytes (substitution_metadata.rs owner contract: this is an exact-once
+/// consumer boundary). Slices that are not valid UTF-8 (already raw bytes)
+/// or that contain no marker sentinel pass through unchanged, so the helper
+/// is safe for every builtin caller.
+fn decode_raw_byte_marker_bytes(bytes: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return bytes.to_vec();
+    };
+    if !text
+        .chars()
+        .any(|ch| ch as u32 == crate::executor::substitution_metadata::RAW_BYTE_MARKER_ESCAPE)
+    {
+        return bytes.to_vec();
+    }
+    crate::executor::substitution_metadata::shell_text_to_raw_bytes(text)
+}
+
+impl Executor {
+    pub(in crate::executor) fn write_buffered_builtin_output(
+        &mut self,
+        cmd: &CommandNode,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) -> Result<(), ExecuteError> {
+        // Exact-once consumer boundary for U+E000 raw-byte markers carried
+        // in word data (ANSI-C \xHH / octal bytes >= 0x80, raw-byte
+        // substitution payloads). Builtins write to the real byte sinks
+        // here, so the markers must decode to their original bytes now;
+        // marker-free and non-UTF-8 slices pass through untouched.
+        let stdout = decode_raw_byte_marker_bytes(stdout);
+        let stderr = decode_raw_byte_marker_bytes(stderr);
+        if self.route_builtin_buffered_output(cmd, &stdout, &stderr)? {
+            return Ok(());
+        }
+
+        if let Some(redirect) = &cmd.redirect_out {
+            let target = self.expand_redirect_target(redirect);
+            if is_closed_redirect_target(&target) {
+            } else if self.write_output_fd_redirect(&target, &stdout)? {
+            } else if redirect_target_fd(&target) == Some(2) {
+                super::write_stderr_bytes(&stdout)?;
+            } else if redirect_target_fd(&target) == Some(1) {
+                super::write_stdout_bytes(&stdout)?;
+            } else {
+                let mut file = self.create_redirect_output(&target, redirect.clobber)?;
+                file.write_all(&stdout)?;
+            }
+        } else if let Some(redirect) = &cmd.append {
+            // Injected group redirect already bound on fd 1: write through
+            // the shared open file description (see
+            // injected_redirect_fd_is_bound).
+            if self.injected_redirect_fd_is_bound(redirect, 1) {
+                self.write_default_stdout(&stdout)?;
+            } else {
+                let target = self.expand_redirect_target(redirect);
+                if is_closed_redirect_target(&target) {
+                } else if self.write_output_fd_redirect(&target, &stdout)? {
+                } else if redirect_target_fd(&target) == Some(2) {
+                    super::write_stderr_bytes(&stdout)?;
+                } else if redirect_target_fd(&target) == Some(1) {
+                    super::write_stdout_bytes(&stdout)?;
+                } else {
+                    let mut file = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+                    file.write_all(&stdout)?;
+                }
+            }
+        } else {
+            self.write_default_stdout(&stdout)?;
+        }
+
+        if let Some(redirect) = &cmd.redirect_err {
+            let target = self.expand_redirect_target(redirect);
+            if is_closed_redirect_target(&target) {
+            } else if self.write_output_fd_redirect(&target, &stderr)? {
+            } else if redirect_target_fd(&target) == Some(1) {
+                if let Some(capture) = &mut self.stdout_capture {
+                    capture.write_all(&stderr)?;
+                } else {
+                    super::write_stdout_bytes(&stderr)?;
+                }
+            } else if !is_null_device(&target) {
+                let mut file = self.create_redirect_output(&target, redirect.clobber)?;
+                file.write_all(&stderr)?;
+            }
+        } else if let Some(redirect) = &cmd.redirect_err_append {
+            // Injected group redirect already bound on fd 2: write through
+            // the shared open file description.
+            if self.injected_redirect_fd_is_bound(redirect, 2) {
+                self.write_default_stderr(&stderr)?;
+            } else {
+                let target = self.expand_redirect_target(redirect);
+                if is_closed_redirect_target(&target) {
+                } else if self.write_output_fd_redirect(&target, &stderr)? {
+                } else if redirect_target_fd(&target) == Some(1) {
+                    if let Some(capture) = &mut self.stdout_capture {
+                        capture.write_all(&stderr)?;
+                    } else {
+                        super::write_stdout_bytes(&stderr)?;
+                    }
+                } else {
+                    let mut file = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?;
+                    file.write_all(&stderr)?;
+                }
+            }
+        } else {
+            self.write_default_stderr(&stderr)?;
+        }
+
+        Ok(())
+    }
+
+    pub(in crate::executor) fn execute_trap(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<i32, ExecuteError> {
+        self.note_return_trap_scope(&cmd.words[1..]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = crate::builtins::trap::execute_with_io(
+            &cmd.words[1..],
+            &mut self.shell_state.env_vars,
+            &mut stdout,
+            &mut stderr,
+        )?;
+        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+        // GNU execute_cmd.c:4886-4888: a special builtin whose status exceeds
+        // EX_SHERRBASE has it converted (EX_USAGE 258 -> EX_BADUSAGE 2) and
+        // sets special_builtin_failed, so a POSIX non-interactive shell exits
+        // on `trap USR1` (the usage failure the posix reset-by-name rule
+        // raises). Mirrors the execute_set/unset wrappers. The direct/late
+        // dispatch arms for `trap` do not consult the flag, so this wrapper
+        // applies the execute_cmd.c:1004-1017 gate itself.
+        if status > 256 {
+            self.special_builtin_failed.set(true);
+            let converted = match status {
+                258..=259 => 2, // EX_USAGE, EX_BADSYNTAX -> EX_BADUSAGE
+                _ => 1,         // EX_UTILERROR etc. -> EXECUTION_FAILURE
+            };
+            if self.posix_mode_enabled()
+                && self
+                    .shell_state
+                    .env_vars
+                    .get("__RUBASH_INTERACTIVE")
+                    .map(String::as_str)
+                    != Some("1")
+            {
+                self.exit_code = converted;
+                return Err(ExecuteError::ExitCode(converted));
+            }
+            return Ok(converted);
+        }
+        Ok(status)
+    }
+
+    pub(in crate::executor) fn execute_help(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<i32, ExecuteError> {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status =
+            crate::builtins::help::execute_with_io(&cmd.words[1..], &mut stdout, &mut stderr)?;
+        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+        Ok(status)
+    }
+
+    pub(in crate::executor) fn execute_stack_builtin(
+        &mut self,
+        cmd: &CommandNode,
+        builtin: crate::builtins::pushd::StackBuiltin,
+    ) -> Result<i32, ExecuteError> {
+        let diagnostic_prefix = self.diagnostic_prefix();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = crate::builtins::pushd::execute_with_io(
+            builtin,
+            cmd.words[1..].iter().map(String::as_str),
+            &mut self.shell_state.env_vars,
+            &diagnostic_prefix,
+            &mut stdout,
+            &mut stderr,
+        )?;
+        self.write_buffered_builtin_output(cmd, &stdout, &stderr)?;
+        self.sync_cd_variables();
+        Ok(status)
+    }
+}

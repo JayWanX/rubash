@@ -1,0 +1,374 @@
+use super::super::*;
+use std::fs;
+
+#[test]
+fn test_compound_array_assignment_expands_glob_matches_as_values() {
+    let _cwd_guard = CwdGuard::take();
+    let dir_path = target_test_path("rubash-array-glob-values");
+    let output_path = target_test_path("rubash-array-glob-values-output.txt");
+    let shell_dir_path = shell_test_path(&dir_path);
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_dir_all(&dir_path);
+    let _ = fs::remove_file(&output_path);
+    fs::create_dir_all(&dir_path).unwrap();
+    let input = format!(
+        "cd {shell_dir_path}; touch '[3]=abcde' r s t u v; \
+         x=(*); echo \"${{x[3]}}\" > {shell_output_path}; echo \"${{x[@]}}\" >> {shell_output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "t\n[3]=abcde r s t u v\n"
+    );
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_dir_all(dir_path);
+}
+
+#[test]
+fn test_compound_array_assignment_expands_brace_elements() {
+    let _cwd_guard = CwdGuard::take();
+    let dir_path = target_test_path("rubash-array-brace-values");
+    let output_path = target_test_path("rubash-array-brace-values-output.txt");
+    let shell_dir_path = shell_test_path(&dir_path);
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_dir_all(&dir_path);
+    let _ = fs::remove_file(&output_path);
+    fs::create_dir_all(&dir_path).unwrap();
+    let input = format!(
+        "cd {shell_dir_path}; touch a.rs b.rs c.txt; \
+         arr=(pre{{a,b}} {{a,b}}.rs); \
+         printf '%s:<%s>:<%s>:<%s>:<%s>\\n' \
+         \"${{#arr[@]}}\" \"${{arr[0]}}\" \"${{arr[1]}}\" \"${{arr[2]}}\" \"${{arr[3]}}\" > {shell_output_path}; \
+         set +B; literal=({{x,y}}); printf '<%s>\\n' \"${{literal[0]}}\" >> {shell_output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "4:<prea>:<preb>:<a.rs>:<b.rs>\n<{x,y}>\n"
+    );
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_dir_all(dir_path);
+}
+
+#[test]
+fn test_quoted_expansions_suppress_pathname_expansion() {
+    let _cwd_guard = CwdGuard::take();
+    let dir_path = target_test_path("rubash-quoted-expansion-glob");
+    let output_path = target_test_path("rubash-quoted-expansion-glob-output.txt");
+    let shell_dir_path = shell_test_path(&dir_path);
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_dir_all(&dir_path);
+    let _ = fs::remove_file(&output_path);
+    fs::create_dir_all(&dir_path).unwrap();
+    let input = format!(
+        "cd {shell_dir_path}; touch a.rs b.rs c.txt; \
+         v='*.rs'; printf 'quoted<%s>\\n' \"$v\" > {shell_output_path}; \
+         printf 'unquoted<%s>\\n' $v >> {shell_output_path}; \
+         printf 'comsub<%s>\\n' \"$(printf '%s\\n' '*.rs')\" >> {shell_output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "quoted<*.rs>\nunquoted<a.rs>\nunquoted<b.rs>\ncomsub<*.rs>\n"
+    );
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_dir_all(dir_path);
+}
+
+#[test]
+fn test_for_word_globs_after_quoted_prefix() {
+    let _cwd_guard = CwdGuard::take();
+    let dir_path = target_test_path("rubash-for-quoted-prefix-glob");
+    let output_path = target_test_path("rubash-for-quoted-prefix-glob-output.txt");
+    let shell_dir_path = shell_test_path(&dir_path);
+    let shell_output_path = shell_test_path(&output_path);
+    let prefix_dir = dir_path.join("prefix dir").join("lib");
+    let _ = fs::remove_dir_all(&dir_path);
+    let _ = fs::remove_file(&output_path);
+    fs::create_dir_all(&prefix_dir).unwrap();
+    fs::write(prefix_dir.join("alpha.winux"), "").unwrap();
+    fs::write(prefix_dir.join("beta.winux"), "").unwrap();
+    fs::write(prefix_dir.join("skip.txt"), "").unwrap();
+    let input = format!(
+        "cd {shell_dir_path}; prefix='prefix dir'; \
+         printf 'cmd<%s>\\n' \"$prefix\"/lib/*.winux > {shell_output_path}; \
+         for path in \"$prefix\"/lib/*.winux; do printf 'mixed<%s>\\n' \"$path\"; done >> {shell_output_path}; \
+         for path in \"$prefix/lib/*.winux\"; do printf 'quoted<%s>\\n' \"$path\"; done >> {shell_output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "cmd<prefix dir/lib/alpha.winux>\n\
+         cmd<prefix dir/lib/beta.winux>\n\
+         mixed<prefix dir/lib/alpha.winux>\n\
+         mixed<prefix dir/lib/beta.winux>\n\
+         quoted<prefix dir/lib/*.winux>\n"
+    );
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_dir_all(dir_path);
+}
+
+#[test]
+fn test_indexed_array_quoted_variable_subscript_evaluates_arithmetic() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-array-quoted-var-subscript-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let input =
+        format!("TOOLKIT=(1 2 3); ARRAY=1; echo ${{TOOLKIT[\"$ARRAY\"]}} > {shell_output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(&output_path).unwrap(), "2\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_declare_indexed_array_assignment_preserves_explicit_indices() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-declare-indexed-array-sparse-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "declare -a arr=([2]=two [0]=zero middle); declare -a arr+=([5]=five tail); \
+         printf '%s / %s\\n' \"${{!arr[*]}}\" \"${{arr[*]}}\" > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "0 1 2 5 6 / zero middle two five tail\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_declare_invalid_array_names_do_not_panic() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-declare-invalid-array-names-output.txt";
+    let sink_path = "target/rubash-declare-invalid-array-names-sink.txt";
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(sink_path);
+    let input = format!(
+        "declare -r []=asdf > {sink_path}; declare -r a[]=asdf >> {sink_path}; \
+         echo survived > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "survived\n");
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(sink_path);
+}
+
+// rubash#401 (probe wt37-374 K015 / wt38 run401 p401m M2): the
+// assignment-form conversion `declare -A arr=()` fails in the NESTED bind
+// during word expansion (GNU subst.c:12949 expand_declaration_argument ->
+// subst.c:13033 exp_jump_to_top_level DISCARD): the diagnostic goes to the
+// shell's stderr — the command's own `2>` redirect is never set up — and
+// the rest of the failing source line is discarded with $? 1. The script
+// continues on the NEXT line, so `echo status:$?` records 1 and the
+// variable keeps its indexed shape (`declare -a arr=()`). GNU 5.3.0 probed
+// byte-identical (wt38 run401 matrix m2, plus the one-line abort shape m3
+// where the same-line echo is skipped and next-line $? is 1).
+#[test]
+fn test_declare_rejects_indexed_to_assoc_conversion() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-declare-indexed-to-assoc-output.txt");
+    let error_path = target_test_path("rubash-declare-indexed-to-assoc-error.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let shell_error_path = shell_test_path(&error_path);
+    let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_file(&error_path);
+    let input = format!(
+        "declare -a arr=()\ndeclare -A arr=() 2> {shell_error_path}\n\
+         echo status:$? > {shell_output_path}\ndeclare -p arr >> {shell_output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "status:1\ndeclare -a arr=()\n"
+    );
+    // The failure precedes the command's redirection setup: the error file
+    // is never created (GNU m2.err absent; the message is on shell stderr).
+    assert!(!std::path::Path::new(&error_path).exists());
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+}
+
+// rubash#401 (probe wt37-374 K014 / wt38 run401 p401m M1): mirror of the
+// indexed->assoc case — `declare -a assoc=()` on an existing associative
+// variable fails in the nested bind before redirections exist, discards
+// the rest of the failing line with $? 1, and the next line records
+// status:1 with the variable keeping its assoc shape (GNU m1).
+#[test]
+fn test_declare_rejects_assoc_to_indexed_conversion() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-declare-assoc-to-indexed-output.txt");
+    let error_path = target_test_path("rubash-declare-assoc-to-indexed-error.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let shell_error_path = shell_test_path(&error_path);
+    let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_file(&error_path);
+    let input = format!(
+        "declare -A assoc\ndeclare -a assoc=() 2> {shell_error_path}\n\
+         echo status:$? > {shell_output_path}\ndeclare -p assoc >> {shell_output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "status:1\ndeclare -A assoc\n"
+    );
+    // Pre-redirection failure: the error file is never created (GNU m1.err
+    // absent; the message is on the shell's stderr).
+    assert!(!std::path::Path::new(&error_path).exists());
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(error_path);
+}
+
+#[test]
+fn test_declare_readonly_assoc_array_prints_combined_attrs() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-declare-readonly-assoc-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let input = format!("declare -rA FOOBAR=([foo]=bar); declare -p FOOBAR > {shell_output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "declare -Ar FOOBAR=([foo]=\"bar\" )\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_declare_indexed_array_arithmetic_subscript_names_default_to_zero() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = target_test_path("rubash-declare-indexed-named-subscript-output.txt");
+    let shell_output_path = shell_test_path(&output_path);
+    let _ = fs::remove_file(&output_path);
+    let input =
+        format!("declare -ra FOOBAR2=([foo]=bar); declare -p FOOBAR2 > {shell_output_path}");
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "declare -ar FOOBAR2=([0]=\"bar\")\n"
+    );
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_declare_indexed_array_assignment_resolves_negative_indices() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-declare-indexed-array-negative-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "declare -a arr=([2]=two [5]=five); declare -a arr+=([-1]=FIVE [-4]=TWO); \
+         printf '%s / %s\\n' \"${{!arr[*]}}\" \"${{arr[*]}}\" > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(fs::read_to_string(output_path).unwrap(), "2 5 / TWO FIVE\n");
+    let _ = fs::remove_file(output_path);
+}
+
+#[test]
+fn test_declare_integer_array_assignment_preserves_indices() {
+    let _cwd_guard = CwdGuard::take();
+    let output_path = "target/rubash-declare-integer-array-sparse-output.txt";
+    let _ = fs::remove_file(output_path);
+    let input = format!(
+        "declare -ai arr=([2]=1+2 [0]=3+4 middle); declare -ai arr+=([2]+=5 [5]=2+6 tail); \
+         printf '%s / %s\\n' \"${{!arr[*]}}\" \"${{arr[*]}}\" > {output_path}"
+    );
+    let tokens = tokenize(&input);
+    let ast = parse(&tokens);
+    let mut executor = Executor::new();
+
+    let result = executor.execute_ast(&ast);
+
+    assert!(result.is_ok());
+    assert_eq!(executor.last_exit_code(), 0);
+    assert_eq!(
+        fs::read_to_string(output_path).unwrap(),
+        "0 1 2 5 6 / 7 0 8 8 0\n"
+    );
+    let _ = fs::remove_file(output_path);
+}

@@ -1,0 +1,857 @@
+use super::*;
+use crate::executor::markers::DATA_DOLLAR;
+
+// Private markers used by the patsub replacement pipeline. They survive
+// expand_embedded_parameters untouched and are resolved by
+// finish_patsub_replacement into the final replacement text.
+//
+// rubash#843: user replacement data may legally BE one of these codepoints
+// (`${v/b/$'\uE312x'}` must substitute the U+E312 glyph, GNU prints it
+// verbatim). The scan pass therefore E400-escapes every literal
+// registry-zone char it copies (push_replacement_literal, the #735
+// mechanism) and the ANSI-C span decoder escapes typed glyphs at body
+// collection, so a bare E310-E313 in the marked text is always pipeline
+// protocol and an escaped pair is always user data; finish_patsub_
+// replacement consumes the former, copies the latter verbatim, and its
+// leak probe (strip_escape_pairs) asserts only live markers.
+const PATSUB_QUOTED_VALUE_START: char = crate::executor::markers::PATSUB_QUOTED_VALUE_START;
+const PATSUB_QUOTED_VALUE_END: char = crate::executor::markers::PATSUB_QUOTED_VALUE_END;
+const PATSUB_QUOTED_AMP: char = crate::executor::markers::PATSUB_QUOTED_AMP;
+const PATSUB_QUOTED_BACKSLASH: char = crate::executor::markers::PATSUB_QUOTED_BACKSLASH;
+
+// Mirrors GNU's expand_no_split_dollar_star (subst.c:237) for the `=`/`:=`
+// operator context: when set, unquoted `$*` with null IFS joins with IFS[0]
+// (string_list_dollar_star) instead of space (string_list_dollar_at).
+// parameter_brace_expand_word sets this for op == '=' (subst.c:4487).
+thread_local! {
+    pub(in crate::executor) static ASSIGNMENT_RHS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scalar values of the single-char special parameters usable as pattern
+/// substitution names (subst.c:9837-9852 VALID_SPECIAL_LENGTH_PARAM plus
+/// `$`/`0`/`!`). `@`/`*` are handled by the positional-list arm above.
+fn patsub_special_parameter_value(exec: &Executor, var_name: &str) -> Option<String> {
+    match var_name {
+        "#" => Some(exec.shell_state.positional_window().len().to_string()),
+        "?" => Some(exec.dollar_question_status().to_string()),
+        "-" => Some(exec.shell_option_flags()),
+        "$" => Some(exec.shell_pid_value().to_string()),
+        "0" => Some(exec.script_name_value()),
+        "!" => Some(exec.parameter_operator_value("!").unwrap_or_default()),
+        _ => None,
+    }
+}
+
+impl Executor {
+    pub(in crate::executor) fn expand_braced_replacement_parameter(
+        &self,
+        name: &str,
+    ) -> Option<String> {
+        let (var_name, pattern, replacement, global) = parse_parameter_replacement(name)?;
+        // GNU subst.c match_upattern applies FNMATCH_IGNCASE when nocasematch
+        // is set, so pattern substitution honors the shopt (bash 4.3+).
+        let pattern = self.expand_parameter_pattern_word(
+            &pattern
+                .replace(r"\/", "/")
+                .replace(crate::executor::markers::DATA_BACKSLASH, "/")
+                .replace(crate::executor::markers::DATA_DQUOTE, "/"),
+        );
+        let replacement = self.expand_patsub_replacement_text(replacement);
+        if let Some(value) =
+            self.indirect_replacement_parameter(var_name, &pattern, &replacement, global)
+        {
+            return Some(value);
+        }
+        if matches!(var_name, "@" | "*") {
+            // GNU pos_params_pat_subst (subst.c:9322) ->
+            // string_list_pos_params (subst.c:3030-3074): `*` joins through
+            // string_list_dollar_star (IFS[0]) when
+            // expand_no_split_dollar_star is set — expand_string_assignment
+            // (subst.c:4365) raises it for the whole assignment RHS, so
+            // `b=${*/a/x}` joins with `+` under IFS=+ (array20.sub). An
+            // unquoted `*` with IFS unset/empty takes string_list_dollar_at
+            // -> ' ' outside assignment RHS; inside it the MATCH_ASSIGNRHS
+            // upgrade (subst.c:9340-9341) re-quotes to dollar_star, which
+            // joins with IFS[0] — '' for `IFS=` (concat, `${c=${*/}}` ->
+            // `12`, exp11.sub) and the default ' ' for unset IFS.
+            // `@` always goes through string_list_dollar_at
+            // (subst.c:3058-3072), whose separator is ' ' under
+            // PF_ASSIGNRHS or null IFS and IFS[0] otherwise.
+            //
+            // expand_no_split_dollar_star has two RB carriers: the
+            // `inside_assignment_rhs` field for expand_string_assignment
+            // (whole `b=...` RHS, subst.c:4365) and the ASSIGNMENT_RHS
+            // thread-local for the `=`/`:=` brace-op RHS (subst.c:4487).
+            let assign_rhs =
+                self.inside_assignment_rhs.get() || ASSIGNMENT_RHS.with(|flag| flag.get());
+            let separator = match self.shell_state.env_vars.get("IFS").map(String::as_str) {
+                // IFS set and non-empty: dollar_star -> IFS[0] for `*`,
+                // dollar_at -> IFS[0] for `@` only outside assignment RHS.
+                Some(ifs) if !ifs.is_empty() => {
+                    let sep = ifs.chars().next().unwrap().to_string();
+                    if var_name == "*" || !assign_rhs {
+                        sep
+                    } else {
+                        " ".to_string()
+                    }
+                }
+                // IFS= (empty): `*` in assignment RHS concatenates through
+                // the re-quoted dollar_star path; every other shape is ' '.
+                Some(_) if var_name == "*" && assign_rhs => String::new(),
+                _ => " ".to_string(),
+            };
+            return Some(
+                self.shell_state
+                    .positional_window()
+                    .iter()
+                    .map(|value| self.replace_patsub_pattern(value, &pattern, &replacement, global))
+                    .collect::<Vec<_>>()
+                    .join(&separator),
+            );
+        }
+        if let Ok(index) = var_name.parse::<usize>() {
+            return Some(
+                self.shell_state
+                    .positional_window()
+                    .get(index.saturating_sub(1))
+                    .map(|value| {
+                        self.replace_patsub_pattern(
+                            &value.replace(crate::executor::markers::QUOTED_WORD_PREFIX, ""),
+                            &pattern,
+                            &replacement,
+                            global,
+                        )
+                    })
+                    .unwrap_or_default(),
+            );
+        }
+        if let Some(value) = patsub_special_parameter_value(self, var_name) {
+            // subst.c:9837-9852: the single-char specials (`#`, `?`, `-`,
+            // `@`, `*`, `$`, `0`, `!`) are valid pattern-substitution
+            // names — `${#/x/y}` substitutes on $#.
+            return Some(self.replace_patsub_pattern(&value, &pattern, &replacement, global));
+        }
+        if let Some(value) = self.array_element_parameter_value(var_name) {
+            return Some(self.replace_patsub_pattern(&value, &pattern, &replacement, global));
+        }
+        if let Some(array_name) = var_name
+            .strip_suffix("[@]")
+            .or_else(|| var_name.strip_suffix("[*]"))
+        {
+            return Some(
+                self.shell_state
+                    .env_vars
+                    .get(array_name)
+                    .map(|value| {
+                        let values = array_values(value)
+                            .into_iter()
+                            .map(|value| {
+                                self.replace_patsub_pattern(&value, &pattern, &replacement, global)
+                            })
+                            .collect::<Vec<_>>();
+                        self.join_expanded_array_values(values, var_name)
+                    })
+                    .unwrap_or_default(),
+            );
+        }
+        if is_shell_name(var_name) {
+            // GNU variables.c get_string_value: a bare array name expands to
+            // element [0], so pattern substitution must operate on that
+            // element (${av/??/xx} -> "xxcd"), not the raw typed storage
+            // (previously leaked `xx[0]="abcd"` fragments). This also keeps
+            // the nameref chain resolution the old inline code performed.
+            return Some(
+                self.parameter_pattern_scalar_value(var_name)
+                    .map(|value| {
+                        self.replace_patsub_pattern(&value, &pattern, &replacement, global)
+                    })
+                    .unwrap_or_default(),
+            );
+        }
+        None
+    }
+
+    /// One entry point for pattern substitution: reads nocasematch and the
+    /// patsub_replacement shopt (default on in bash 5.2) and runs the single
+    /// replacement pass in parameter_replace.rs.
+    pub(in crate::executor) fn replace_patsub_pattern(
+        &self,
+        value: &str,
+        pattern: &str,
+        replacement: &str,
+        global: bool,
+    ) -> String {
+        replace_parameter_pattern(
+            value,
+            pattern,
+            replacement,
+            global,
+            self.nocasematch_enabled(),
+            crate::builtins::shopt::option_enabled(
+                &self.shell_state.env_vars,
+                "patsub_replacement",
+            ),
+            self.extglob_enabled(),
+        )
+    }
+
+    /// Expands the replacement side of a pat-substitution in one pass,
+    /// mirroring GNU subst.c parameter_brace_patsub:9424-9444. The
+    /// replacement is expanded with its own quote state intact
+    /// (expand_string_for_patsub); a leading tilde is expanded
+    /// (expand_string_for_pat); and quote_string_for_repl (subst.c:3891)
+    /// turns quoted `&`/backslash into the `\&`/`\\` data consumed by the
+    /// strcreplace pass in pat_subst.
+    pub(in crate::executor) fn expand_patsub_replacement_text(&self, replacement: &str) -> String {
+        let patsub_replacement = crate::builtins::shopt::option_enabled(
+            &self.shell_state.env_vars,
+            "patsub_replacement",
+        );
+        let chars: Vec<char> = replacement.chars().collect();
+        // GNU expands a leading tilde in the replacement string regardless
+        // of outer quoting and of the shopt state (new-exp16.sub P1/P2).
+        if chars.first() == Some(&'~') && (replacement == "~" || replacement.starts_with("~/")) {
+            if let Some(expanded) =
+                tilde_expand::expand_word_prefix(replacement, &self.shell_state.env_vars)
+            {
+                let expanded = self.expand_embedded_parameters(&expanded);
+                return self.finish_patsub_replacement(&expanded, patsub_replacement);
+            }
+        }
+        let marked = Self::mark_patsub_replacement_quotes(&chars);
+        let expanded = self.expand_embedded_parameters(&marked);
+        self.finish_patsub_replacement(&expanded, patsub_replacement)
+    }
+
+    /// Pre-expansion pass: remove the replacement's own quotes while
+    /// recording which `&`/backslash characters were quoted (markers), and
+    /// protect literal `$`/quote/backtick characters from the expander.
+    fn mark_patsub_replacement_quotes(chars: &[char]) -> String {
+        let mut marked = String::with_capacity(chars.len() + 8);
+        let mut index = 0;
+        while index < chars.len() {
+            let ch = chars[index];
+            match ch {
+                '\'' => {
+                    // Single-quoted span: no expansions inside; `&` and `\`
+                    // become quoted replacement data (CTLESC in GNU).
+                    index += 1;
+                    while index < chars.len() && chars[index] != '\'' {
+                        push_single_quoted_replacement_char(&mut marked, chars[index], false);
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                '"' => {
+                    index += 1;
+                    while index < chars.len() && chars[index] != '"' {
+                        index = push_double_quoted_replacement_char(&mut marked, chars, index);
+                    }
+                    index += 1;
+                }
+                '\\' => {
+                    index = push_unquoted_escape(&mut marked, chars, index);
+                }
+                crate::executor::markers::DATA_BACKSLASH => {
+                    // Lexer marker for an escaped backslash: one literal,
+                    // quoted backslash.
+                    marked.push(PATSUB_QUOTED_BACKSLASH);
+                    index += 1;
+                }
+                crate::executor::markers::DATA_SQUOTE => {
+                    marked.push(crate::executor::markers::DATA_SQUOTE);
+                    index += 1;
+                }
+                crate::executor::markers::DATA_DQUOTE => {
+                    marked.push(crate::executor::markers::DATA_DQUOTE);
+                    index += 1;
+                }
+                '$' => {
+                    // $'...' inside the ${...} body is ANSI-C quoting: the
+                    // body is its own quoting context (GNU parameter_brace_patsub
+                    // expands the replacement with its internal quote state).
+                    // Decode it here into quoted replacement data.
+                    if chars.get(index + 1) == Some(&'\'') {
+                        index = push_ansi_c_replacement_span(&mut marked, chars, index);
+                    } else {
+                        index = push_replacement_dollar(&mut marked, chars, index, false);
+                    }
+                }
+                '`' => {
+                    let end = backtick_replacement_span_end(chars, index);
+                    marked.extend(chars[index..end].iter());
+                    index = end;
+                }
+                other => {
+                    push_replacement_literal(&mut marked, other);
+                    index += 1;
+                }
+            }
+        }
+        marked
+    }
+
+    /// Resolve the pipeline markers into the final replacement text. With
+    /// patsub_replacement on, quoted `&`/backslash become the `\&`/`\\`
+    /// data consumed by strcreplace (quote_string_for_repl, subst.c:3921);
+    /// with the shopt off, plain quote removal applies and `&` stays
+    /// literal data.
+    ///
+    /// Escape pairs ride verbatim (rubash#843): the replacement carries
+    /// user data that may legally be a registry-zone glyph (`${v/b/$'\uE312'}`
+    /// is an E312 character for GNU, not a marker), so the scan pass
+    /// E400-escapes every literal zone char and expansion results arrive
+    /// pair-encoded from storage. A pair member must therefore never be
+    /// read as a live PATSUB marker here — the E400/E000 lead arms copy
+    /// lead + payload intact and the Output boundary decodes the escape
+    /// exactly once.
+    fn finish_patsub_replacement(&self, expanded: &str, patsub_replacement: bool) -> String {
+        let mut output = String::with_capacity(expanded.len());
+        let mut in_quoted_value = false;
+        let mut chars = expanded.chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                crate::executor::markers::LITERAL_CHAR_ESCAPE => {
+                    // E400 + c: literal-char escape (markers::push_literal_char)
+                    // for user registry-zone data — copy the pair verbatim.
+                    output.push(ch);
+                    if let Some(next) = chars.next() {
+                        output.push(next);
+                    }
+                }
+                c if c as u32 == crate::executor::markers::RAW_BYTE_MARKER_ESCAPE => {
+                    // E000 + payload: raw-byte marker pair (bytes that ride
+                    // the owner-tagged transport, e.g. $'\x10' decoded from
+                    // an ANSI-C replacement span, or a stored value's
+                    // non-UTF-8 byte). Copy intact — a payload landing in
+                    // E310..=E313 must not be eaten as a PATSUB marker.
+                    output.push(c);
+                    if let Some(next) = chars.next() {
+                        output.push(next);
+                    }
+                }
+                PATSUB_QUOTED_VALUE_START => in_quoted_value = true,
+                PATSUB_QUOTED_VALUE_END => in_quoted_value = false,
+                PATSUB_QUOTED_AMP => {
+                    if patsub_replacement {
+                        output.push_str("\\&");
+                    } else {
+                        output.push('&');
+                    }
+                }
+                PATSUB_QUOTED_BACKSLASH => {
+                    if patsub_replacement {
+                        output.push_str("\\\\");
+                    } else {
+                        output.push('\\');
+                    }
+                }
+                '&' | '\\' if in_quoted_value && patsub_replacement => {
+                    // Expanded value characters inside a quoted region are
+                    // quoted data for the strcreplace pass (CTLESC in GNU).
+                    if ch == '&' {
+                        output.push_str("\\&");
+                    } else {
+                        output.push_str("\\\\");
+                    }
+                }
+                other => output.push(other),
+            }
+        }
+        // Golden assertion (#838): live PATSUB markers must never leak to
+        // patsub output. Escape pairs are excluded from the probe first
+        // (strip_escape_pairs): since rubash#843 an E400-escaped marker
+        // codepoint in the output is restored user data — `${v/b/$'\uE312'}`
+        // must emit U+E312 — not a decode failure. The function-local PUA
+        // markers (U+E310-E313) have no external boundary; if a BARE one
+        // appears here, the decode pass failed.
+        let live = strip_escape_pairs(&output);
+        debug_assert!(
+            !live.contains(PATSUB_QUOTED_VALUE_START),
+            "PATSUB_QUOTED_VALUE_START leaked to patsub output"
+        );
+        debug_assert!(
+            !live.contains(PATSUB_QUOTED_VALUE_END),
+            "PATSUB_QUOTED_VALUE_END leaked to patsub output"
+        );
+        debug_assert!(
+            !live.contains(PATSUB_QUOTED_AMP),
+            "PATSUB_QUOTED_AMP leaked to patsub output"
+        );
+        debug_assert!(
+            !live.contains(PATSUB_QUOTED_BACKSLASH),
+            "PATSUB_QUOTED_BACKSLASH leaked to patsub output"
+        );
+        output
+    }
+
+    fn indirect_replacement_parameter(
+        &self,
+        var_name: &str,
+        pattern: &str,
+        replacement: &str,
+        global: bool,
+    ) -> Option<String> {
+        let indirect_name = var_name.strip_prefix('!')?;
+        if let Some(target_name) = self.nameref_target_name(indirect_name) {
+            return Some(self.replace_patsub_pattern(&target_name, pattern, replacement, global));
+        }
+
+        let target_expr = self.shell_state.env_vars.get(indirect_name)?;
+        let values = self.indirect_target_values(target_expr);
+        if values.is_empty() {
+            return Some(String::new());
+        }
+
+        let values = values
+            .into_iter()
+            .map(|value| self.replace_patsub_pattern(&value, pattern, replacement, global))
+            .collect::<Vec<_>>();
+        Some(self.join_expanded_array_values(values, target_expr))
+    }
+}
+
+/// Copy one literal replacement-content char into the marked transport
+/// text (rubash#843). Registry-zone glyphs (U+E000..=U+E401) ride the E400
+/// literal-char escape (#735 mechanism): bare, a user `$'\uE312'`-style
+/// glyph — typed directly into the replacement or decoded inside a plain
+/// `'...'` span — is indistinguishable from the pipeline's own PATSUB
+/// markers, and finish_patsub_replacement consumes it (E312 rendered as
+/// `&`, E310/E311 dropped, E313 as `\`). The raw-byte introducer E000 is
+/// copied verbatim: it owns the raw-byte pair protocol, and an E400 prefix
+/// would split a pair (the rubash#296 frozen-carrier class). Plain chars
+/// pass through unchanged.
+fn push_replacement_literal(marked: &mut String, ch: char) {
+    if ch as u32 == crate::executor::markers::RAW_BYTE_MARKER_ESCAPE {
+        marked.push(ch);
+        return;
+    }
+    crate::executor::markers::push_literal_char(marked, ch);
+}
+
+/// Copy a char from a single-quoted replacement span: `$` and backticks are
+/// literal (no expansion inside single quotes), `&` and backslash become
+/// quoted replacement data.
+///
+/// `decoded_ansi_c` marks content that already went through the canonical
+/// ANSI-C decoder (push_ansi_c_replacement_span): its zone glyphs arrive
+/// E400-escaped and its bytes as raw-byte pairs, so those ride `other`
+/// verbatim — re-escaping would double-encode the pair (the decode
+/// boundary restores it exactly once).
+fn push_single_quoted_replacement_char(marked: &mut String, ch: char, decoded_ansi_c: bool) {
+    match ch {
+        '&' => marked.push(PATSUB_QUOTED_AMP),
+        '\\' | crate::executor::markers::DATA_BACKSLASH => marked.push(PATSUB_QUOTED_BACKSLASH),
+        '$' => marked.push(DATA_DOLLAR),
+        '`' => marked.push(crate::executor::markers::DATA_BACKTICK),
+        // Decoded quote data must survive the expander, which drops a bare
+        // quote as an unclosed span.
+        '\'' | crate::executor::markers::DATA_SQUOTE => {
+            marked.push(crate::executor::markers::DATA_SQUOTE)
+        }
+        '"' | crate::executor::markers::DATA_DQUOTE => {
+            marked.push(crate::executor::markers::DATA_DQUOTE)
+        }
+        other if decoded_ansi_c => marked.push(other),
+        other => push_replacement_literal(marked, other),
+    }
+}
+
+/// Copy one char of a double-quoted replacement span; returns the next
+/// index. Backslashes escape only `$`, backtick, `"`, and `\`; every
+/// other backslash is a literal, quoted backslash.
+fn push_double_quoted_replacement_char(marked: &mut String, chars: &[char], index: usize) -> usize {
+    match chars[index] {
+        '\\' => match chars.get(index + 1) {
+            Some('$') => {
+                let end = dollar_expression_end(chars, index + 1);
+                marked.push(PATSUB_QUOTED_VALUE_START);
+                marked.extend(chars[index + 1..end].iter());
+                marked.push(PATSUB_QUOTED_VALUE_END);
+                end
+            }
+            Some('`') => {
+                marked.push('`');
+                index + 2
+            }
+            Some('"') => {
+                marked.push(crate::executor::markers::DATA_DQUOTE);
+                index + 2
+            }
+            Some('\\') | Some(&crate::executor::markers::DATA_BACKSLASH) => {
+                marked.push(PATSUB_QUOTED_BACKSLASH);
+                index + 2
+            }
+            Some(other) => {
+                marked.push(PATSUB_QUOTED_BACKSLASH);
+                match *other {
+                    // Quote data inside a double-quoted replacement span must
+                    // reach the expander protected (GNU subst.c
+                    // string_extract_double_quoted keeps \' literally; a bare
+                    // quote here would be eaten as a span delimiter).
+                    '\'' | crate::executor::markers::DATA_SQUOTE => {
+                        marked.push(crate::executor::markers::DATA_SQUOTE)
+                    }
+                    '&' => marked.push(PATSUB_QUOTED_AMP),
+                    other => push_replacement_literal(marked, other),
+                }
+                index + 2
+            }
+            None => {
+                marked.push(PATSUB_QUOTED_BACKSLASH);
+                index + 1
+            }
+        },
+        '$' => push_replacement_dollar(marked, chars, index, true),
+        '&' => {
+            // Inside double quotes `&` is quoted replacement data.
+            marked.push(PATSUB_QUOTED_AMP);
+            index + 1
+        }
+        '`' => {
+            let end = backtick_replacement_span_end(chars, index);
+            marked.extend(chars[index..end].iter());
+            end
+        }
+        crate::executor::markers::DATA_BACKSLASH => {
+            marked.push(PATSUB_QUOTED_BACKSLASH);
+            index + 1
+        }
+        crate::executor::markers::DATA_SQUOTE => {
+            marked.push(crate::executor::markers::DATA_SQUOTE);
+            index + 1
+        }
+        crate::executor::markers::DATA_DQUOTE => {
+            marked.push(crate::executor::markers::DATA_DQUOTE);
+            index + 1
+        }
+        '\'' | crate::executor::markers::DATA_SQUOTE => {
+            // Quote data inside a double-quoted replacement span: protect it
+            // from the expander, which drops a bare quote as a span
+            // delimiter (GNU keeps dquoted ' as literal data).
+            marked.push(crate::executor::markers::DATA_SQUOTE);
+            index + 1
+        }
+        other => {
+            push_replacement_literal(marked, other);
+            index + 1
+        }
+    }
+}
+
+/// Emit an ANSI-C `$'...'` span starting at `index` (the `$`) as quoted
+/// replacement data; returns the index after the closing quote.
+///
+/// The body decodes through the SAME canonical decoder as every other
+/// `$'...'` context (lexer ansi.rs decode_ansi_c_quoted — the port of GNU
+/// lib/sh/strtrans.c:51 ansicstr with its full escape table: \a \b \e \E
+/// \f \n \r \t \v, octal \NNN, \xHH, \u/\U, \cX, quote escapes, and
+/// backslash-preserving passthrough for unrecognized escapes). The
+/// hand-rolled table here previously knew only \xHH, \' and \, so the
+/// common C escapes stayed two-character literal text — `${s//,/$'\n'}` /
+/// `$'\t'` stored backslash+n instead of a newline (rubash#323; GNU
+/// subst.c:3950 expand_string_for_patsub hands the replacement through
+/// expand_word_internal, whose $' handling calls ansicstr on the whole
+/// table).
+fn push_ansi_c_replacement_span(marked: &mut String, chars: &[char], index: usize) -> usize {
+    // Find the closing quote: a backslash escapes the next character
+    // (parse_matched_pair semantics for $'...'), so \' and \ never
+    // close the span.
+    let mut cursor = index + 2; // skip $ and opening '
+    let mut body = String::new();
+    while cursor < chars.len() {
+        let ch = chars[cursor];
+        if ch == '\\' && cursor + 1 < chars.len() {
+            body.push(ch);
+            // rubash#843: a LITERAL registry-zone glyph typed inside the
+            // span body rides the canonical decoder verbatim (only
+            // `\u`-decoded codepoints get the E400 escape there). Escape it
+            // at collection so the decoded output is pair-safe and the
+            // finish pass never reads user data as a PATSUB marker.
+            push_replacement_literal(&mut body, chars[cursor + 1]);
+            cursor += 2;
+            continue;
+        }
+        if ch == '\'' || ch == crate::executor::markers::DATA_SQUOTE {
+            let decoded = crate::lexer::decode_ansi_c_quoted(&body);
+            for decoded_char in decoded.chars() {
+                push_single_quoted_replacement_char(marked, decoded_char, true);
+            }
+            return cursor + 1;
+        }
+        push_replacement_literal(&mut body, ch);
+        cursor += 1;
+    }
+    // Unterminated $' span: decode what is there (GNU parse_matched_pair
+    // would report an unterminated quote; the caller's expander handles
+    // that diagnostic) — keep the old fall-through behavior of emitting
+    // the consumed text.
+    let decoded = crate::lexer::decode_ansi_c_quoted(&body);
+    for decoded_char in decoded.chars() {
+        push_single_quoted_replacement_char(marked, decoded_char, true);
+    }
+    cursor
+}
+
+/// Handle an unquoted backslash in a replacement: GNU quote removal
+/// consumes the escape; `&` and backslash become quoted data markers,
+/// `$`/quote/backtick become their literal protected forms.
+fn push_unquoted_escape(marked: &mut String, chars: &[char], index: usize) -> usize {
+    match chars.get(index + 1) {
+        Some('\'') | Some(&crate::executor::markers::DATA_SQUOTE) => {
+            marked.push(crate::executor::markers::DATA_SQUOTE);
+            index + 2
+        }
+        Some('"') | Some(&crate::executor::markers::DATA_DQUOTE) => {
+            marked.push(crate::executor::markers::DATA_DQUOTE);
+            index + 2
+        }
+        Some('\\') | Some(&crate::executor::markers::DATA_BACKSLASH) => {
+            marked.push(PATSUB_QUOTED_BACKSLASH);
+            index + 2
+        }
+        Some('&') => {
+            marked.push(PATSUB_QUOTED_AMP);
+            index + 2
+        }
+        Some('$') => {
+            marked.push(DATA_DOLLAR);
+            index + 2
+        }
+        Some('`') => {
+            marked.push(crate::executor::markers::DATA_BACKTICK);
+            index + 2
+        }
+        Some(_) => {
+            push_replacement_literal(marked, chars[index + 1]);
+            index + 2
+        }
+        None => {
+            marked.push(PATSUB_QUOTED_BACKSLASH);
+            index + 1
+        }
+    }
+}
+
+/// Emit the `$`-expression starting at `index`. Variable expansions inside
+/// a double-quoted span are wrapped in quoted-value markers so their
+/// results count as quoted replacement data (GNU CTLESC-quoting); unquoted
+/// expansions pass through raw so their results stay active.
+fn push_replacement_dollar(
+    marked: &mut String,
+    chars: &[char],
+    index: usize,
+    quoted_value: bool,
+) -> usize {
+    let next = chars.get(index + 1).copied();
+    let expands = match next {
+        Some('{') | Some('(') | Some('[') => true,
+        Some(c) => {
+            is_shell_name_start(c)
+                || c.is_ascii_digit()
+                || matches!(c, '#' | '@' | '*' | '$' | '!' | '?' | '-')
+        }
+        None => false,
+    };
+    if !expands {
+        // An unexpandable `$` stays literal next to the following char;
+        // protect that char from being reinterpreted as quoting by the
+        // expander.
+        marked.push('$');
+        return match chars.get(index + 1) {
+            Some('\'') => {
+                marked.push(crate::executor::markers::DATA_SQUOTE);
+                index + 2
+            }
+            Some('"') => {
+                marked.push(crate::executor::markers::DATA_DQUOTE);
+                index + 2
+            }
+            Some('\\') | Some(&crate::executor::markers::DATA_BACKSLASH) => {
+                push_unquoted_escape(marked, chars, index + 1)
+            }
+            Some('`') => {
+                marked.push(crate::executor::markers::DATA_BACKTICK);
+                index + 2
+            }
+            Some(other) => {
+                push_replacement_literal(marked, *other);
+                index + 2
+            }
+            None => index + 1,
+        };
+    }
+    let end = dollar_expression_end(chars, index);
+    let value_expansion = !matches!(next, Some('(') | Some('['));
+    if quoted_value && value_expansion {
+        marked.push(PATSUB_QUOTED_VALUE_START);
+        marked.extend(chars[index..end].iter());
+        marked.push(PATSUB_QUOTED_VALUE_END);
+    } else {
+        marked.extend(chars[index..end].iter());
+    }
+    end
+}
+
+/// End index (exclusive) of the `$`-expression starting at `start`.
+fn dollar_expression_end(chars: &[char], start: usize) -> usize {
+    match chars.get(start + 1) {
+        None => start + 1,
+        Some('{') => braced_replacement_body_end(chars, start + 1),
+        Some('(') => dollar_paren_end(chars, start + 1),
+        Some('[') => dollar_bracket_end(chars, start + 1),
+        Some(c) if is_shell_name_start(*c) => {
+            let mut end = start + 1;
+            while chars.get(end).is_some_and(|ch| is_shell_name_char(*ch)) {
+                end += 1;
+            }
+            end
+        }
+        Some(c) if c.is_ascii_digit() => start + 2,
+        Some(c) if matches!(c, '#' | '@' | '*' | '$' | '!' | '?' | '-') => start + 2,
+        Some(_) => start + 1,
+    }
+}
+
+/// End index of a `${...}` body opened at `open` (the `{`), honoring
+/// quotes, backslash escapes, and nested `${` depth.
+fn braced_replacement_body_end(chars: &[char], open: usize) -> usize {
+    let mut depth = 1usize;
+    let mut index = open + 1;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\\' => index += 2,
+            '\'' => {
+                in_single = true;
+                index += 1;
+            }
+            '"' => {
+                in_double = !in_double;
+                index += 1;
+            }
+            '$' if chars.get(index + 1) == Some(&'{') => {
+                depth += 1;
+                index += 2;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return index + 1;
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    chars.len()
+}
+
+/// End index of a `$(...)` body opened at `open` (the `(`), honoring
+/// quotes and nested parens.
+fn dollar_paren_end(chars: &[char], open: usize) -> usize {
+    let mut depth = 1usize;
+    let mut index = open + 1;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\\' => index += 2,
+            '\'' => {
+                in_single = true;
+                index += 1;
+            }
+            '"' => {
+                in_double = !in_double;
+                index += 1;
+            }
+            '`' => index = backtick_replacement_span_end(chars, index),
+            '(' => {
+                depth += 1;
+                index += 1;
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return index + 1;
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    chars.len()
+}
+
+/// End index of a `$[...]` body opened at `open` (the `[`).
+fn dollar_bracket_end(chars: &[char], open: usize) -> usize {
+    let mut depth = 1usize;
+    let mut index = open + 1;
+    while index < chars.len() {
+        match chars[index] {
+            '[' => {
+                depth += 1;
+                index += 1;
+            }
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return index + 1;
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    chars.len()
+}
+
+/// End index of a backtick command substitution starting at `start`.
+fn backtick_replacement_span_end(chars: &[char], start: usize) -> usize {
+    let mut index = start + 1;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => index += 2,
+            '`' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    chars.len()
+}
+
+/// Drop E400/E000 escape pairs (lead + following char) so the finish-pass
+/// leak probe sees only LIVE markers: since rubash#843 an escaped marker
+/// codepoint in the output is restored user data (`${v/b/$'\uE312'}` emits
+/// U+E312), not a decode failure. A trailing lead with no payload is
+/// skipped with the pair.
+fn strip_escape_pairs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == crate::executor::markers::LITERAL_CHAR_ESCAPE
+            || ch as u32 == crate::executor::markers::RAW_BYTE_MARKER_ESCAPE
+        {
+            chars.next();
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}

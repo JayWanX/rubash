@@ -1,0 +1,290 @@
+use super::{
+    ARRAY_VARS, ASSOC_VARS, EXECUTION_FAILURE, EXECUTION_SUCCESS, NAMEREF_VARS, READONLY_VARS,
+};
+use std::io::{self, Write};
+
+/// GNU shell.h:76 `EX_UTILERROR = 263` — a Posix special builtin utility error
+/// (> EX_SHERRBASE = 256). `unset_builtin` returns this when `posix_utility_error`
+/// is set (readonly variable, invalid identifier, non-unsettable variable).
+/// execute_cmd.c:4888 then sets `special_builtin_failed`, causing a
+/// non-interactive POSIX shell to exit.
+pub(crate) const EX_UTILERROR: i32 = 263;
+
+/// GNU shell.h:71 `EX_USAGE = 258` — the pre-builtin_status usage error
+/// status (> EX_SHERRBASE = 256). `unset_builtin` returns this for invalid
+/// options; execute_cmd.c:4888 sets `special_builtin_failed`.
+const EX_USAGE_ORIG: i32 = 258;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UnsetOptions {
+    functions: bool,
+    variables: bool,
+    nameref: bool,
+}
+
+/// Execute `unset` with arguments after the command name.
+pub fn unset(args: &[String], env_vars: &mut crate::shell::var_table::VarTable) -> io::Result<i32> {
+    let mut stderr = io::stderr().lock();
+    unset_with_stderr(args.iter().map(String::as_str), env_vars, &mut stderr)
+}
+
+pub(crate) fn unset_with_stderr<'a, I, W>(
+    args: I,
+    env_vars: &mut crate::shell::var_table::VarTable,
+    stderr: &mut W,
+) -> io::Result<i32>
+where
+    I: IntoIterator<Item = &'a str>,
+    W: Write,
+{
+    let args: Vec<&str> = args.into_iter().collect();
+    let (options, first_name) = match parse_unset_options(&args, env_vars, stderr)? {
+        Ok(parsed) => parsed,
+        Err(status) => return Ok(status),
+    };
+
+    if options.functions && options.variables {
+        writeln!(
+            stderr,
+            "{}unset: cannot simultaneously unset a function and a variable",
+            diagnostic_prefix(env_vars)
+        )?;
+        return Ok(EXECUTION_FAILURE);
+    }
+
+    let mut status = EXECUTION_SUCCESS;
+    for name in &args[first_name..] {
+        let name_status = unset_name(name, options, env_vars, stderr)?;
+        if name_status != EXECUTION_SUCCESS {
+            // Preserve error statuses > EX_SHERRBASE (256) so the executor can
+            // set special_builtin_failed; fall back to EXECUTION_FAILURE.
+            status = if name_status > 256 {
+                name_status
+            } else {
+                EXECUTION_FAILURE
+            };
+        }
+    }
+
+    Ok(status)
+}
+
+fn parse_unset_options<W>(
+    args: &[&str],
+    env_vars: &crate::shell::var_table::VarTable,
+    stderr: &mut W,
+) -> io::Result<Result<(UnsetOptions, usize), i32>>
+where
+    W: Write,
+{
+    let mut options = UnsetOptions::default();
+    let mut index = 0;
+
+    while let Some(arg) = args.get(index) {
+        if *arg == "--" {
+            return Ok(Ok((options, index + 1)));
+        }
+
+        if !arg.starts_with('-') || *arg == "-" {
+            break;
+        }
+
+        for option in arg[1..].chars() {
+            match option {
+                'f' => options.functions = true,
+                'v' => options.variables = true,
+                'n' => options.nameref = true,
+                other => {
+                    writeln!(
+                        stderr,
+                        "{}unset: -{}: invalid option",
+                        diagnostic_prefix(env_vars),
+                        other
+                    )?;
+                    writeln!(stderr, "unset: usage: unset [-f] [-v] [-n] [name ...]")?;
+                    // GNU set.def:855 returns EX_USAGE (258 > EX_SHERRBASE).
+                    return Ok(Err(EX_USAGE_ORIG));
+                }
+            }
+        }
+
+        index += 1;
+    }
+
+    Ok(Ok((options, index)))
+}
+
+fn unset_name<W>(
+    name: &str,
+    options: UnsetOptions,
+    env_vars: &mut crate::shell::var_table::VarTable,
+    stderr: &mut W,
+) -> io::Result<i32>
+where
+    W: Write,
+{
+    if options.functions {
+        return Ok(EXECUTION_SUCCESS);
+    }
+
+    // `unset name[subscript]`: bash only removes an element from an actual
+    // array/associative variable. A subscript on an undeclared name is a
+    // silent no-op (GNU exit 0); on a declared scalar it errors
+    // "unset: <name>: not an array variable". Real array/assoc element
+    // removal is handled upstream in the executor; this covers the
+    // scalar/undeclared cases and the builtin-only diagnostic path.
+    if let Some((base, _subscript)) = parse_unset_subscript(name) {
+        let declared = env_vars.contains_key(base);
+        let is_array = is_marked_variable(env_vars, ARRAY_VARS, base)
+            || is_marked_variable(env_vars, ASSOC_VARS, base);
+        if !declared || is_array {
+            return Ok(EXECUTION_SUCCESS);
+        }
+        writeln!(
+            stderr,
+            "{}unset: {base}: not an array variable",
+            diagnostic_prefix(env_vars)
+        )?;
+        return Ok(EXECUTION_FAILURE);
+    }
+
+    if !valid_identifier(name) {
+        // GNU builtins/set.def:899-920: when neither -f nor -v was given, a
+        // name that is not a valid identifier is treated as a potential
+        // function name and unset silently (no diagnostic, success). Only
+        // `unset -v NAME` reports sh_invalidid ("`NAME': not a valid
+        // identifier") through the builtin_error prologue.
+        if !options.variables {
+            return Ok(EXECUTION_SUCCESS);
+        }
+        // Single write: GNU emits the prologue + message as one stderr
+        // record; splitting the write lets a concurrent stdout flush (e.g.
+        // under WSL-interop combined capture) tear the prefix off the line.
+        let diagnostic = format!(
+            "{}unset: `{name}': not a valid identifier\n",
+            diagnostic_prefix(env_vars)
+        );
+        stderr.write_all(diagnostic.as_bytes())?;
+        // GNU set.def:917-918 increments posix_utility_error → EX_UTILERROR.
+        return Ok(EX_UTILERROR);
+    }
+
+    // GNU builtins/set.def:990-1010 (unset_builtin): `unset -v` of a nameref
+    // follows the reference: a plain identifier cell unbinds the referenced
+    // variable and keeps the nameref itself; an array-reference cell unbinds
+    // the referenced element and keeps the nameref; a valueless or invalid
+    // cell falls back to unbinding the nameref variable itself.
+    let nameref_cell: Option<String> =
+        if !options.nameref && is_marked_variable(env_vars, NAMEREF_VARS, name) {
+            env_vars.get(name).cloned()
+        } else {
+            None
+        };
+    let (unset_name, _keep_nameref) = match nameref_cell {
+        Some(ref cell) if valid_identifier(cell) => (cell.as_str(), true),
+        Some(ref cell) if parse_unset_subscript(cell).is_some() => {
+            // Element unbinding through the reference happens in the
+            // executor path (execute_unset_with_stderr); the builtin-only
+            // path keeps the nameref and reports success.
+            return Ok(EXECUTION_SUCCESS);
+        }
+        _ => (name, false),
+    };
+
+    if is_unsettable_bash_variable(unset_name) {
+        writeln!(
+            stderr,
+            "{}unset: {unset_name}: cannot unset",
+            diagnostic_prefix(env_vars)
+        )?;
+        // GNU set.def:930-931 increments posix_utility_error → EX_UTILERROR.
+        return Ok(EX_UTILERROR);
+    }
+
+    if is_marked_variable(env_vars, READONLY_VARS, unset_name) {
+        writeln!(
+            stderr,
+            "{}unset: {unset_name}: cannot unset: readonly variable",
+            diagnostic_prefix(env_vars)
+        )?;
+        // GNU set.def:965-966 increments posix_utility_error → EX_UTILERROR.
+        return Ok(EX_UTILERROR);
+    }
+
+    // GNU builtins/set.def:1024 + variables.c:3807-3815 unbind_nameref:
+    // under -n the variable is removed only when it is itself a nameref;
+    // other names are a silent no-op (the readonly/non-unsettable checks
+    // above still apply to them).
+    if options.nameref && !options.functions && !is_marked_variable(env_vars, NAMEREF_VARS, name) {
+        return Ok(EXECUTION_SUCCESS);
+    }
+
+    let unset_name = unset_name.to_string();
+    // GNU variables.c:5778 { "GLOBIGNORE", sv_globignore } ->
+    // pathexp.c:507-515 setup_glob_ignore: unsetting GLOBIGNORE takes the
+    // `v == 0` branch and turns dotfile matching OFF — the effect shares
+    // the dotglob cell with the shopt, so the write lands in the same
+    // option storage (it clobbers even an explicit `shopt -s dotglob`).
+    if unset_name == "GLOBIGNORE" {
+        crate::builtins::shopt::set_option(env_vars, "dotglob", false);
+    }
+    env_vars.remove(&unset_name);
+    // Process-env removal is existence-gated, not name-gated (#916/#917):
+    // ordinary names were never mirrored by writes, but an inherited copy
+    // predates the mirror and must be dropped so table-miss fallbacks do
+    // not resurrect it. Runs before the unmark calls below.
+    crate::executor::local_helpers::unset_process_env(&unset_name);
+    // #916: one attrs.remove clears all SHELL_VAR bits instead of ten
+    // attr_of + write_flag round-trips (ASSOC_128 string dropped inside).
+    env_vars.remove_unset_marks(&unset_name);
+    Ok(EXECUTION_SUCCESS)
+}
+
+pub(super) fn is_marked_variable(
+    env_vars: &crate::shell::var_table::VarTable,
+    key: &str,
+    name: &str,
+) -> bool {
+    // Structured flags are authoritative (lazy strings are not maintained);
+    // is_marked falls back to the string only for names with no flag entry,
+    // which a lazy write can never leave behind.
+    env_vars.is_marked(key, name)
+}
+
+pub(super) fn valid_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// Split `name[subscript]` into `(base, subscript)`, returning `None` when
+/// the name is not a subscripted form or the base is not a valid identifier
+/// (so genuinely invalid names still fall through to the `valid_identifier`
+/// rejection above).
+fn parse_unset_subscript(name: &str) -> Option<(&str, &str)> {
+    let (base, rest) = name.split_once('[')?;
+    let subscript = rest.strip_suffix(']')?;
+    if !valid_identifier(base) {
+        return None;
+    }
+    Some((base, subscript))
+}
+
+fn is_unsettable_bash_variable(name: &str) -> bool {
+    matches!(name, "BASH_LINENO" | "BASH_SOURCE")
+}
+
+fn diagnostic_prefix(env_vars: &crate::shell::var_table::VarTable) -> String {
+    if let (Some(script), Some(line)) = (
+        env_vars.get("__RUBASH_SCRIPT_NAME"),
+        env_vars.get("__RUBASH_CURRENT_LINE"),
+    ) {
+        return format!("{script}: line {line}: ");
+    }
+
+    "rubash: ".to_string()
+}

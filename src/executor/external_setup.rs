@@ -1,0 +1,1313 @@
+use super::*;
+use crate::executor::markers::STORAGE_WORD_PREFIX;
+
+#[derive(Debug, Default)]
+pub(in crate::executor) struct ProcessSubstitutionFiles {
+    inputs: Vec<PathBuf>,
+    outputs: Vec<OutputProcessSubstitution>,
+}
+
+#[derive(Debug)]
+struct OutputProcessSubstitution {
+    path: PathBuf,
+    source: String,
+}
+
+fn exec_keeps_output_process_substitution(words: &[String], redirect: &Redirect) -> bool {
+    if !redirect
+        .target
+        .strip_prefix(">(")
+        .is_some_and(|target| target.ends_with(')'))
+    {
+        return false;
+    }
+    matches!(words, [command] if command == "exec")
+        || matches!(words, [command, fd] if command == "exec" && dynamic_fd_word(fd).is_some())
+}
+
+pub(in crate::executor) fn command_needs_process_substitution_materialization(
+    cmd: &CommandNode,
+) -> bool {
+    // Shell-owned `read` must consume virtual descriptors directly. Its
+    // ordinary `<&N` redirects are not process substitutions; materializing
+    // them into a temporary file would advance or replace the descriptor on
+    // every loop iteration.
+    if cmd.words.first().map(String::as_str) == Some("read")
+        && cmd.process_substitutions.is_empty()
+        && !cmd
+            .redirects
+            .iter()
+            .any(|redirect| redirect.target.starts_with("<(") || redirect.target.starts_with(">("))
+    {
+        return false;
+    }
+    // Persistent fd-prefixed output substitutions are opened by the exec
+    // builtin and must retain their backing file across later commands.
+    if cmd.words.first().map(String::as_str) == Some("exec")
+        && cmd.redirects.iter().any(|redirect| {
+            matches!(
+                redirect.kind,
+                crate::parser::RedirectKind::Output
+                    | crate::parser::RedirectKind::Append
+                    | crate::parser::RedirectKind::ClobberOutput
+            ) && redirect.target.starts_with(">(")
+                && redirect.target.ends_with(')')
+        })
+    {
+        return false;
+    }
+
+    if cmd.redirects.is_empty()
+        && cmd.redirect_in.is_none()
+        && cmd.redirect_out.is_none()
+        && cmd.append.is_none()
+        && cmd.redirect_err.is_none()
+        && cmd.redirect_err_append.is_none()
+        && cmd.heredoc.is_none()
+        && cmd.heredoc_redirects.is_empty()
+        && cmd.here_string.is_none()
+        && cmd.process_substitutions.is_empty()
+        && !cmd
+            .word_metadata
+            .iter()
+            .any(word_metadata_needs_process_substitution_materialization)
+    {
+        return cmd.words.iter().enumerate().any(|(index, word)| {
+            if cmd.word_metadata.get(index).is_some() {
+                return false;
+            }
+            word.strip_prefix("<(")
+                .or_else(|| word.strip_prefix(">("))
+                .is_some_and(|word| word.ends_with(')'))
+        });
+    }
+
+    true
+}
+
+fn word_metadata_needs_process_substitution_materialization(metadata: &WordMetadata) -> bool {
+    !metadata.process_substitutions.is_empty()
+        || raw_word_contains_process_substitution(&metadata.raw)
+}
+
+pub(in crate::executor) fn shared_combined_output_process_substitution(
+    first: Option<&Redirect>,
+    second: Option<&Redirect>,
+) -> Option<String> {
+    let first = first?;
+    let second = second?;
+    if first.target != second.target
+        || !matches!(first.operator.as_str(), "&>" | "&>>")
+        || first.operator != second.operator
+    {
+        return None;
+    }
+    first
+        .target
+        .strip_prefix(">(")
+        .and_then(|target| target.strip_suffix(')'))
+        .map(str::to_string)
+}
+
+fn dynamic_fd_word(word: &str) -> Option<&str> {
+    let name = word.strip_prefix('{')?.strip_suffix('}')?;
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric()))
+    .then_some(name)
+}
+
+impl Executor {
+    pub(in crate::executor) fn apply_external_stdin_redirect(
+        &mut self,
+        cmd: &CommandNode,
+        process: &mut Command,
+    ) -> Result<(), ExecuteError> {
+        // fd-0 stdin source obeys GNU left-to-right redirect order
+        // (redir.c do_redirections): the last fd-0 input redirect wins,
+        // so `cat <<A <file` must NOT pipe heredoc bytes over the file.
+        let stdin_body_wins = match crate::executor::shell_options::fd0_stdin_redirect_winner(cmd) {
+            Some(kind) => matches!(
+                kind,
+                crate::parser::RedirectKind::HereDoc | crate::parser::RedirectKind::HereString
+            ),
+            // No ordered redirect info: legacy field checks.
+            None => {
+                cmd.heredoc.is_some()
+                    || cmd.here_string.is_some()
+                    || cmd
+                        .heredoc_redirects
+                        .iter()
+                        .any(|redirect| redirect.fd == Some(0))
+            }
+        };
+        if stdin_body_wins {
+            // GNU applies every redirection in order (redir.c
+            // do_redirections): an earlier fd-0 `< file` still runs its
+            // open even though a later `<<` overrides fd 0, so a missing
+            // file aborts the command rather than silently yielding the
+            // heredoc body. `<> file` runs its O_RDWR|O_CREAT open
+            // (make_cmd.c:682) the same way (rubash#264).
+            for redirect in cmd.redirects.iter() {
+                if redirect.fd.unwrap_or(0) == 0
+                    && matches!(
+                        redirect.kind,
+                        crate::parser::RedirectKind::Input | crate::parser::RedirectKind::ReadWrite
+                    )
+                {
+                    let target = self.expand_redirect_target(redirect);
+                    if redirect_target_fd(&target).is_none() && !is_closed_redirect_target(&target)
+                    {
+                        if redirect.kind == crate::parser::RedirectKind::ReadWrite {
+                            self.probe_input_redirect_readwrite(&target)?;
+                        } else {
+                            self.probe_input_redirect(&target)?;
+                        }
+                    }
+                }
+            }
+            process.stdin(Stdio::piped());
+        } else if let Some(ref redirect) = cmd.redirect_in {
+            let target = self.expand_redirect_target(redirect);
+            if redirect.fd.unwrap_or(0) == 0 {
+                // `<&N` and the move form `<&N-` (make_cmd.c:704-718) both
+                // hand the child a dup of fd N's open file description; the
+                // move's close of fd N is scoped to the command in the
+                // parent (GNU RX_UNDOABLE) and the child's dup survives
+                // independently (redir.c:1153-1166). Only `&`-prefixed
+                // operands take this arm — /dev/stdin-style fd-alias NAMES
+                // keep their dedicated piped-stdin handling below
+                // (niubash#118).
+                if let Some((fd, _move_fd)) =
+                    redirect_target_fd_and_move(&target).filter(|_| target.starts_with('&'))
+                {
+                    match self.fd_table.read_endpoint(fd) {
+                        Some(FdReadEndpoint::CoprocStdout { fd: pipe, .. }) => {
+                            let dup = crate::fd::duplicate_handle_inheritable(pipe.handle)
+                                .map_err(|_| {
+                                    io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "coprocess output is closed",
+                                    )
+                                })?;
+                            process.stdin(Stdio::from(crate::fd::handle_to_file(dup)));
+                            return Ok(());
+                        }
+                        // `< /dev/fd/N` (and `<&N`) on a file-backed fd dup
+                        // the open file into the child's stdin (GNU redir.c
+                        // dup2 semantics through the /dev/fd device layer):
+                        // DuplicateHandle keeps the shared file offset, so a
+                        // partially-read fd feeds the child only the rest.
+                        Some(FdReadEndpoint::File(file_fd)) => {
+                            let dup = crate::fd::duplicate_handle(file_fd.handle)?;
+                            process.stdin(Stdio::from(crate::fd::handle_to_file(dup)));
+                            return Ok(());
+                        }
+                        // Text/process-substitution endpoints materialize to
+                        // a temp file; inherited stdin dups the real handle.
+                        // The child drains the stream, so consume the
+                        // parent's copy too (shared-offset semantics).
+                        Some(_) => {
+                            let file = self.open_fd_read_endpoint(fd, &target)?;
+                            self.fd_table.consume_all_text(fd);
+                            process.stdin(Stdio::from(file));
+                            return Ok(());
+                        }
+                        // `cmd <&N` with N closed/absent — GNU redir.c
+                        // dup2 fails EBADF; the open never happens.
+                        None => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("{fd}: Bad file descriptor"),
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+            if is_closed_redirect_target(&target) {
+                if redirect.fd.unwrap_or(0) == 0 {
+                    process.stdin(Stdio::null());
+                }
+                return Ok(());
+            }
+            // `< /dev/stdin` / `<&0` duplicate fd 0 — GNU dup2 keeps the
+            // stage's *current* stdin, which here lives in the virtual
+            // FUNCTION_STDIN/fd-table channel, not the process's own stdin
+            // handle (niubash#118: piping into `cat < /dev/stdin` must feed
+            // the pipe, not block on the console).
+            if redirect.fd.unwrap_or(0) == 0
+                && redirect_target_fd(&target) == Some(0)
+                && (self.shell_state.env_vars.contains_key(FUNCTION_STDIN)
+                    || self.virtual_fd_stdin_remaining(0).is_some())
+            {
+                process.stdin(Stdio::piped());
+                return Ok(());
+            }
+            if redirect.fd.unwrap_or(0) == 0 && self.input_fd_redirects_to_process_stdin(&target) {
+                return Ok(());
+            }
+            let file = if redirect.append {
+                OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .open(shell_path_to_windows(&target, &self.shell_state.env_vars))?
+            } else {
+                self.open_input_redirect(&target)?
+            };
+            if redirect.fd.unwrap_or(0) == 0 {
+                process.stdin(Stdio::from(file));
+            }
+        } else if self.shell_state.env_vars.contains_key(FUNCTION_STDIN)
+            || self.virtual_fd_stdin_remaining(0).is_some()
+        {
+            process.stdin(Stdio::piped());
+        } else if let Some(
+            FdReadEndpoint::File(file_fd) | FdReadEndpoint::CoprocStdout { fd: file_fd, .. },
+        ) = self.fd_table.read_endpoint(0)
+        {
+            // GNU: fd 0 is a real descriptor and the child inherits the open
+            // file description, file offset included (`exec 0<f; tr ...`
+            // reads f from the current position). DuplicateHandle shares the
+            // file pointer just like dup2.
+            let dup = crate::fd::duplicate_handle(file_fd.handle)?;
+            process.stdin(Stdio::from(crate::fd::handle_to_file(dup)));
+        } else if self.fd_table.is_closed(0)
+            || (self.fd_table.has_entry(0) && !self.fd_table.is_open_for_read(0))
+        {
+            process.stdin(Stdio::null());
+        }
+
+        Ok(())
+    }
+
+    pub(in crate::executor) fn execute_external(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<(), ExecuteError> {
+        // rubash#815 profiler: the external-spawn seam (GNU execute_cmd.c
+        // dispatches disk commands through execute_command_internal's
+        // simple-command tail; this is the fork face of the attribution
+        // three-way split). Drop guard covers every exit form; the off path
+        // is one relaxed AtomicBool load.
+        let _profiler_external =
+            super::profiler::enter_external(cmd.words.first().map(String::as_str).unwrap_or("?"));
+        let (mut cmd, mut process_substitutions) =
+            self.command_with_process_substitution_files(cmd)?;
+        self.apply_default_external_stdin_file(&mut cmd, &mut process_substitutions)?;
+        let result = self.execute_external_inner(&cmd);
+        // GNU execute_cmd.c: external commands fork before do_redirections
+        // — a `{var}` bind happened only in the child, so the parent's
+        // variable is untouched and the allocated descriptor dies there.
+        self.undo_child_fd_var_redirects();
+        self.finish_process_substitutions(process_substitutions)?;
+        result
+    }
+
+    pub(in crate::executor) fn command_with_process_substitution_files(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<(CommandNode, ProcessSubstitutionFiles), ExecuteError> {
+        let mut rewritten = cmd.clone();
+        let mut files = ProcessSubstitutionFiles::default();
+        let mut redirect_target_rewrites = Vec::new();
+        // GNU subst.c: an unquoted `name=<( )` word is an assignment whose
+        // value is the process substitution (make_dev_fd_filename,
+        // subst.c:6362+). The first parse splits that word into `name=` and
+        // a procsub token when it appears as an eval argument, which turned
+        // the materialized temp path into a command word and lost the
+        // assignment (procsub.tests:25 `eval f=<(echo test4) "; cat \$f"`).
+        // Re-merge the pair so the word materializes into the assignment
+        // value the way a direct `name=<( )` statement parses.
+        let mut merge_index = 0;
+        while merge_index + 1 < rewritten.words.len() {
+            let assignment_word = &rewritten.words[merge_index];
+            let is_bare_assignment = assignment_word.ends_with('=')
+                && !assignment_word.contains(' ')
+                && is_shell_name(&assignment_word[..assignment_word.len() - 1]);
+            let procsub_word = rewritten.words[merge_index + 1].clone();
+            let is_whole_procsub = (procsub_word.starts_with("<(")
+                || procsub_word.starts_with(">("))
+                && procsub_word.ends_with(')');
+            if is_bare_assignment && is_whole_procsub {
+                let next_metadata = rewritten.word_metadata.get(merge_index + 1).cloned();
+                rewritten.words[merge_index].push_str(&procsub_word);
+                // Drop the absorbed procsub word and hand its metadata to
+                // the merged word so the loop below materializes the
+                // substitution inside the assignment value.
+                rewritten.words.remove(merge_index + 1);
+                if merge_index + 1 < rewritten.word_metadata.len() {
+                    rewritten.word_metadata.remove(merge_index + 1);
+                }
+                if let Some(metadata) = next_metadata {
+                    if merge_index < rewritten.word_metadata.len() {
+                        rewritten.word_metadata[merge_index] = metadata;
+                    } else {
+                        rewritten.word_metadata.push(metadata);
+                    }
+                }
+                continue;
+            }
+            merge_index += 1;
+        }
+        for word_index in 0..rewritten.words.len() {
+            let metadata = rewritten.word_metadata.get(word_index).cloned();
+            let substitutions = metadata
+                .as_ref()
+                .map(|metadata| metadata.process_substitutions.clone())
+                .unwrap_or_default();
+            let substitutions = if substitutions.is_empty()
+                && metadata
+                    .as_ref()
+                    .is_some_and(|metadata| raw_word_contains_process_substitution(&metadata.raw))
+            {
+                WordMetadata::new(
+                    word_index,
+                    rewritten.words[word_index].clone(),
+                    rewritten.words[word_index].clone(),
+                )
+                .process_substitutions
+            } else {
+                substitutions
+            };
+            if substitutions.is_empty() {
+                if metadata.is_none() {
+                    self.materialize_standalone_process_substitution_word(
+                        &mut rewritten.words[word_index],
+                        &mut files,
+                    )?;
+                }
+            } else {
+                self.materialize_process_substitution_word(
+                    &mut rewritten.words[word_index],
+                    substitutions,
+                    &mut files,
+                )?;
+            }
+        }
+        if let Some(redirect) = &mut rewritten.redirect_in {
+            if let Some(source) = redirect
+                .target
+                .strip_prefix("<(")
+                .and_then(|target| target.strip_suffix(')'))
+            {
+                if let Some(output) = self.process_substitution_output_bytes(source) {
+                    let path = self.write_process_substitution_temp_bytes(&output)?;
+                    let old_target = redirect.target.clone();
+                    redirect.target = shell_display_path(&path.to_string_lossy());
+                    redirect_target_rewrites.push((old_target, redirect.target.clone()));
+                    files.inputs.push(path);
+                }
+            }
+            if redirect.fd.unwrap_or(0) == 0 {
+                let target = self.expand_redirect_target(redirect);
+                if let Some(fd) = redirect_target_fd(&target) {
+                    if self.fd_table.is_open_for_read(fd) {
+                        if let Some(input) = self.virtual_fd_stdin_remaining_bytes(fd) {
+                            let path = self.write_process_substitution_temp_bytes(&input)?;
+                            let input_len = self.virtual_fd_stdin_len(fd);
+                            self.fd_table.consume_all_text(fd);
+                            self.shell_state
+                                .env_vars
+                                .insert(fd_stdin_offset_key(fd), input_len);
+                            redirect.target = shell_display_path(&path.to_string_lossy());
+                            files.inputs.push(path);
+                        }
+                        // File-backed fds keep `&N`: the spawn layer dups
+                        // the real handle (shared offset) — a path rewrite
+                        // would reopen the file at offset 0.
+                    } else if let Some(input) = self.external_fd_heredoc_input(cmd, fd) {
+                        let path = self.write_process_substitution_temp(&input)?;
+                        redirect.target = shell_display_path(&path.to_string_lossy());
+                        files.inputs.push(path);
+                    }
+                }
+            }
+        }
+        let exec_words = rewritten.words.clone();
+        if let Some(source) = shared_combined_output_process_substitution(
+            rewritten.redirect_out.as_ref(),
+            rewritten.redirect_err_append.as_ref(),
+        ) {
+            let path = self.empty_process_substitution_temp()?;
+            let display_path = shell_display_path(&path.to_string_lossy());
+            if let Some(redirect) = &mut rewritten.redirect_out {
+                let old_target = redirect.target.clone();
+                redirect.target = display_path.clone();
+                redirect_target_rewrites.push((old_target, redirect.target.clone()));
+            }
+            if let Some(redirect) = &mut rewritten.redirect_err_append {
+                let old_target = redirect.target.clone();
+                redirect.target = display_path;
+                redirect_target_rewrites.push((old_target, redirect.target.clone()));
+            }
+            files
+                .outputs
+                .push(OutputProcessSubstitution { path, source });
+        }
+        if let Some(source) = shared_combined_output_process_substitution(
+            rewritten.append.as_ref(),
+            rewritten.redirect_err_append.as_ref(),
+        ) {
+            let path = self.empty_process_substitution_temp()?;
+            let display_path = shell_display_path(&path.to_string_lossy());
+            if let Some(redirect) = &mut rewritten.append {
+                let old_target = redirect.target.clone();
+                redirect.target = display_path.clone();
+                redirect_target_rewrites.push((old_target, redirect.target.clone()));
+            }
+            if let Some(redirect) = &mut rewritten.redirect_err_append {
+                let old_target = redirect.target.clone();
+                redirect.target = display_path;
+                redirect_target_rewrites.push((old_target, redirect.target.clone()));
+            }
+            files
+                .outputs
+                .push(OutputProcessSubstitution { path, source });
+        }
+        if let Some(redirect) = &mut rewritten.redirect_out {
+            if !exec_keeps_output_process_substitution(&exec_words, redirect) {
+                if let Some(source) = redirect
+                    .target
+                    .strip_prefix(">(")
+                    .and_then(|target| target.strip_suffix(')'))
+                {
+                    let source = source.to_string();
+                    let path = self.empty_process_substitution_temp()?;
+                    let old_target = redirect.target.clone();
+                    redirect.target = shell_display_path(&path.to_string_lossy());
+                    redirect_target_rewrites.push((old_target, redirect.target.clone()));
+                    files
+                        .outputs
+                        .push(OutputProcessSubstitution { path, source });
+                }
+            }
+        }
+        if let Some(redirect) = &mut rewritten.append {
+            if !exec_keeps_output_process_substitution(&exec_words, redirect) {
+                if let Some(source) = redirect
+                    .target
+                    .strip_prefix(">(")
+                    .and_then(|target| target.strip_suffix(')'))
+                {
+                    let source = source.to_string();
+                    let path = self.empty_process_substitution_temp()?;
+                    let old_target = redirect.target.clone();
+                    redirect.target = shell_display_path(&path.to_string_lossy());
+                    redirect_target_rewrites.push((old_target, redirect.target.clone()));
+                    files
+                        .outputs
+                        .push(OutputProcessSubstitution { path, source });
+                }
+            }
+        }
+        if let Some(redirect) = &mut rewritten.redirect_err {
+            if !exec_keeps_output_process_substitution(&exec_words, redirect) {
+                if let Some(source) = redirect
+                    .target
+                    .strip_prefix(">(")
+                    .and_then(|target| target.strip_suffix(')'))
+                {
+                    let source = source.to_string();
+                    let path = self.empty_process_substitution_temp()?;
+                    let old_target = redirect.target.clone();
+                    redirect.target = shell_display_path(&path.to_string_lossy());
+                    redirect_target_rewrites.push((old_target, redirect.target.clone()));
+                    files
+                        .outputs
+                        .push(OutputProcessSubstitution { path, source });
+                }
+            }
+        }
+        if let Some(redirect) = &mut rewritten.redirect_err_append {
+            if !exec_keeps_output_process_substitution(&exec_words, redirect) {
+                if let Some(source) = redirect
+                    .target
+                    .strip_prefix(">(")
+                    .and_then(|target| target.strip_suffix(')'))
+                {
+                    let source = source.to_string();
+                    let path = self.empty_process_substitution_temp()?;
+                    let old_target = redirect.target.clone();
+                    redirect.target = shell_display_path(&path.to_string_lossy());
+                    redirect_target_rewrites.push((old_target, redirect.target.clone()));
+                    files
+                        .outputs
+                        .push(OutputProcessSubstitution { path, source });
+                }
+            }
+        }
+        for redirect in &mut rewritten.redirects {
+            if let Some((_, new_target)) = redirect_target_rewrites
+                .iter()
+                .find(|(old_target, _)| redirect.target == *old_target)
+            {
+                redirect.target = new_target.clone();
+            }
+        }
+        // The rewritten command no longer carries process-substitution
+        // syntax in its words or redirect targets. Clear the consumed
+        // markers so a second pass over the same node (pipeline stage
+        // helpers re-enter through their own materialization call) is a
+        // no-op instead of re-running every substitution source.
+        rewritten.process_substitutions.clear();
+        for metadata in &mut rewritten.word_metadata {
+            metadata.process_substitutions.clear();
+        }
+        sync_ordered_redirect_targets(&mut rewritten);
+        Ok((rewritten, files))
+    }
+
+    fn materialize_standalone_process_substitution_word(
+        &mut self,
+        word: &mut String,
+        files: &mut ProcessSubstitutionFiles,
+    ) -> Result<(), ExecuteError> {
+        if let Some(source) = word
+            .strip_prefix("<(")
+            .and_then(|word| word.strip_suffix(')'))
+        {
+            let Some(output) = self.process_substitution_output_bytes(source) else {
+                return Ok(());
+            };
+            let path = self.write_process_substitution_temp_bytes(&output)?;
+            *word = self.process_substitution_fd_word(&output);
+            files.inputs.push(path);
+        } else if let Some(source) = word
+            .strip_prefix(">(")
+            .and_then(|word| word.strip_suffix(')'))
+        {
+            let source = source.to_string();
+            let path = self.empty_process_substitution_temp()?;
+            *word = self.process_substitution_output_fd_word(&path);
+            files
+                .outputs
+                .push(OutputProcessSubstitution { path, source });
+        }
+        Ok(())
+    }
+
+    fn materialize_process_substitution_word(
+        &mut self,
+        word: &mut String,
+        substitutions: Vec<crate::parser::ProcessSubstitution>,
+        files: &mut ProcessSubstitutionFiles,
+    ) -> Result<(), ExecuteError> {
+        for substitution in substitutions {
+            if substitution.output {
+                let path = self.empty_process_substitution_temp()?;
+                files.outputs.push(OutputProcessSubstitution {
+                    path: path.clone(),
+                    source: substitution.source,
+                });
+                let display_path = self.process_substitution_output_fd_word(&path);
+                *word = word.replacen(&substitution.target, &display_path, 1);
+            } else {
+                let Some(output) = self.process_substitution_output_bytes(&substitution.source)
+                else {
+                    continue;
+                };
+                let path = self.write_process_substitution_temp_bytes(&output)?;
+                files.inputs.push(path.clone());
+                let display_path = self.process_substitution_fd_word(&output);
+                *word = word.replacen(&substitution.target, &display_path, 1);
+            };
+        }
+        Ok(())
+    }
+
+    /// Materialize the process substitutions of an assignment RHS from its
+    /// VERBATIM raw text.
+    ///
+    /// GNU subst.c:11349-11378 (`expand_word_internal`, cases '<'/'>'): an
+    /// unquoted `<(`/`>(` in a word is extracted by `extract_process_subst`
+    /// (subst.c:1311, via `xparse_dolparen` — the body keeps its own quoting
+    /// because the span is pulled out of the word string before any quote
+    /// removal) and executed by `process_substitute` (subst.c:6362), whose
+    /// `/dev/fd/N` result replaces the span in the expanding word. This runs
+    /// in assignment position exactly like argument position (W_NOPROCSUB is
+    /// never set for assignment words).
+    ///
+    /// Rubash's lexer de-quotes the whole `name=<(...)` token at once
+    /// (`finish_word_token`), so the executor's assignment value arrives with
+    /// the substitution body's quotes already stripped; the parser keeps the
+    /// verbatim RHS in `CommandNode::assignment_raws`. Running the body from
+    /// the de-quoted text corrupts it (`x=<(printf '\377')` would execute
+    /// `printf \377` and print `377`); this entry re-derives the body from
+    /// the raw RHS so the substitution sees the same text GNU extracts.
+    /// Everything outside the span keeps its raw quoting, which the normal
+    /// assignment-expansion chain then processes as usual.
+    pub(in crate::executor) fn materialize_assignment_process_substitutions_from_raw(
+        &mut self,
+        raw: &str,
+    ) -> Result<String, ExecuteError> {
+        let substitutions = crate::parser::WordMetadata::new(0, raw.to_string(), raw.to_string())
+            .process_substitutions;
+
+        let mut word = raw.to_string();
+        for substitution in substitutions {
+            if substitution.output {
+                let path = self.empty_process_substitution_temp()?;
+                let word_form = self.process_substitution_output_fd_word(&path);
+                self.assignment_output_process_substitutions
+                    .insert(word_form.clone(), substitution.source);
+                word = word.replacen(&substitution.target, &word_form, 1);
+            } else {
+                let Some(output) = self.process_substitution_output_bytes(&substitution.source)
+                else {
+                    continue;
+                };
+                self.write_process_substitution_temp_bytes(&output)?;
+                let word_form = self.process_substitution_fd_word(&output);
+                word = word.replacen(&substitution.target, &word_form, 1);
+            }
+        }
+        Ok(word)
+    }
+
+    pub(in crate::executor) fn materialize_assignment_process_substitutions(
+        &mut self,
+        value: &str,
+    ) -> Result<String, ExecuteError> {
+        if !value.contains("<(") && !value.contains(">(") {
+            return Ok(value.to_string());
+        }
+
+        let mut word = value.to_string();
+        let substitutions =
+            crate::parser::WordMetadata::new(0, value.to_string(), value.to_string())
+                .process_substitutions;
+
+        for substitution in substitutions {
+            if substitution.output {
+                let path = self.empty_process_substitution_temp()?;
+                let word_form = self.process_substitution_output_fd_word(&path);
+                self.assignment_output_process_substitutions
+                    .insert(word_form.clone(), substitution.source);
+                word = word.replacen(&substitution.target, &word_form, 1);
+            } else {
+                let Some(output) = self.process_substitution_output_bytes(&substitution.source)
+                else {
+                    continue;
+                };
+                self.write_process_substitution_temp_bytes(&output)?;
+                let word_form = self.process_substitution_fd_word(&output);
+                word = word.replacen(&substitution.target, &word_form, 1);
+            }
+        }
+        Ok(word)
+    }
+
+    fn apply_default_external_stdin_file(
+        &mut self,
+        rewritten: &mut CommandNode,
+        files: &mut ProcessSubstitutionFiles,
+    ) -> Result<(), ExecuteError> {
+        if rewritten.redirect_in.is_some()
+            || rewritten.heredoc.is_some()
+            || rewritten.here_string.is_some()
+            || self.virtual_fd_stdin_remaining_bytes(0).is_none()
+        {
+            return Ok(());
+        }
+
+        let input = self.virtual_fd_stdin_remaining_bytes(0).unwrap_or_default();
+        let path = self.write_process_substitution_temp_bytes(&input)?;
+        let input_len = self.virtual_fd_stdin_len(0);
+        self.fd_table.consume_all_text(0);
+        self.shell_state
+            .env_vars
+            .insert(fd_stdin_offset_key(0), input_len);
+        let target = shell_display_path(&path.to_string_lossy());
+        rewritten.redirect_in = Some(Redirect {
+            fd: Some(0),
+            fd_var: None,
+            operator: "<".to_string(),
+            operator_metadata: Box::new(crate::parser::WordMetadata::new(
+                0,
+                "<".to_string(),
+                "<".to_string(),
+            )),
+            kind: crate::parser::RedirectKind::Input,
+            target_metadata: Box::new(crate::parser::WordMetadata::new(
+                0,
+                target.clone(),
+                target.clone(),
+            )),
+            target,
+            append: false,
+            clobber: false,
+        });
+        files.inputs.push(path);
+        Ok(())
+    }
+
+    pub(in crate::executor) fn finish_process_substitutions(
+        &mut self,
+        files: ProcessSubstitutionFiles,
+    ) -> Result<(), ExecuteError> {
+        let mut error = None;
+        for output in &files.outputs {
+            if error.is_none() {
+                if let Err(output_error) = self.execute_output_process_substitution(output) {
+                    error = Some(output_error);
+                }
+            }
+        }
+        self.cleanup_process_substitution_files(files);
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// rubash#545 (cell 3): run the `>(...)` bodies queued by `[[ ]]`
+    /// operand realization — each reads its temp carrier as stdin, the way
+    /// the simple-command finish path executes output process
+    /// substitutions.
+    pub(in crate::executor) fn finish_conditional_output_procsubs(
+        &mut self,
+    ) -> Result<(), ExecuteError> {
+        for (path, source) in std::mem::take(&mut self.conditional_output_procsubs) {
+            self.execute_output_process_substitution(&OutputProcessSubstitution { path, source })?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::executor) fn finish_assignment_output_process_substitutions_for_command(
+        &mut self,
+        cmd: &CommandNode,
+    ) -> Result<(), ExecuteError> {
+        if self.assignment_output_process_substitutions.is_empty() {
+            return Ok(());
+        }
+
+        let targets = [
+            cmd.redirect_out.as_ref(),
+            cmd.append.as_ref(),
+            cmd.redirect_err.as_ref(),
+            cmd.redirect_err_append.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|redirect| {
+            let target = self.expand_redirect_target(redirect);
+            self.assignment_output_process_substitutions
+                .contains_key(&target)
+                .then_some(target)
+        })
+        .collect::<Vec<_>>();
+
+        for target in targets {
+            self.finish_assignment_output_process_substitution_target(&target)?;
+        }
+
+        let remaining_targets = self
+            .assignment_output_process_substitutions
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for target in remaining_targets {
+            self.finish_assignment_output_process_substitution_target(&target)?;
+        }
+
+        Ok(())
+    }
+
+    fn finish_assignment_output_process_substitution_target(
+        &mut self,
+        target: &str,
+    ) -> Result<(), ExecuteError> {
+        let Some(source) = self.assignment_output_process_substitutions.remove(target) else {
+            return Ok(());
+        };
+        // rubash#355: the recorded key is the `/dev/fd/N` word form; the
+        // bytes live in the fd's ProcessSubstitution write carrier (its
+        // temp path), not at the word itself.
+        let path = if let Some(fd) = target
+            .strip_prefix("/dev/fd/")
+            .and_then(|fd| fd.parse::<u32>().ok())
+        {
+            match self.fd_table.output_endpoint(fd) {
+                Some(FdWriteEndpoint::ProcessSubstitution { path, .. }) => path,
+                _ => return Ok(()),
+            }
+        } else {
+            shell_path_to_windows(target, &self.shell_state.env_vars)
+        };
+        let input = fs::read_to_string(&path).unwrap_or_default();
+        self.execute_persistent_output_process_substitution(&source, input)?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    pub(in crate::executor) fn cleanup_process_substitution_files(
+        &self,
+        files: ProcessSubstitutionFiles,
+    ) {
+        for path in files.inputs {
+            let _ = fs::remove_file(path);
+        }
+        for output in files.outputs {
+            let _ = fs::remove_file(output.path);
+        }
+    }
+
+    fn execute_output_process_substitution(
+        &mut self,
+        output: &OutputProcessSubstitution,
+    ) -> Result<(), ExecuteError> {
+        let input = fs::read(&output.path).unwrap_or_default();
+        let tokens = crate::lexer::tokenize(&output.source);
+        let ast = crate::parser::parse(&tokens);
+        let old_stdin = self.shell_state.env_vars.get(FUNCTION_STDIN).cloned();
+        let old_offset = self
+            .shell_state
+            .env_vars
+            .get(FUNCTION_STDIN_OFFSET)
+            .cloned();
+        let old_fd0 = self.fd_table.entries.get(&0).cloned();
+        let fd0_key = fd_stdin_key(0);
+        let fd0_offset_key = fd_stdin_offset_key(0);
+        let fd0_dynamic_key = fd_dynamic_input_key(0);
+        let fd0_closed_key = fd_closed_key(0);
+        let old_fd0_stdin = self.shell_state.env_vars.get(&fd0_key).cloned();
+        let old_fd0_offset = self.shell_state.env_vars.get(&fd0_offset_key).cloned();
+        let old_fd0_dynamic = self.shell_state.env_vars.get(&fd0_dynamic_key).cloned();
+        let old_fd0_closed = self.shell_state.env_vars.get(&fd0_closed_key).cloned();
+        self.set_fd_input_bytes(0, input.clone(), false);
+        if std::str::from_utf8(&input).is_ok() {
+            self.shell_state.env_vars.insert(
+                FUNCTION_STDIN.to_string(),
+                crate::executor::substitution_metadata::bytes_to_shell_text(&input),
+            );
+        } else {
+            self.shell_state.env_vars.remove(FUNCTION_STDIN);
+        }
+        self.shell_state
+            .env_vars
+            .insert(FUNCTION_STDIN_OFFSET.to_string(), "0".to_string());
+        let result = self.execute_ast(&ast);
+        // GNU process_substitute forks for `>(...)` as well (subst.c:6362),
+        // so $! points at that child and `wait $!` reports its status. The
+        // substitution body ran inline on this executor; register its status
+        // the same way the input form does.
+        let status = match &result {
+            Ok(()) => self.exit_code,
+            Err(ExecuteError::ExitCode(code))
+            | Err(ExecuteError::ExpansionFailure(code))
+            | Err(ExecuteError::Return(code)) => *code,
+            _ => 1,
+        };
+        self.register_process_substitution_status(status);
+        match old_fd0 {
+            Some(entry) => {
+                self.fd_table.entries.insert(0, entry);
+            }
+            None => {
+                self.fd_table.entries.remove(&0);
+            }
+        }
+        restore_optional_env_var(&mut self.shell_state.env_vars, &fd0_key, old_fd0_stdin);
+        restore_optional_env_var(
+            &mut self.shell_state.env_vars,
+            &fd0_offset_key,
+            old_fd0_offset,
+        );
+        restore_optional_env_var(
+            &mut self.shell_state.env_vars,
+            &fd0_dynamic_key,
+            old_fd0_dynamic,
+        );
+        restore_optional_env_var(
+            &mut self.shell_state.env_vars,
+            &fd0_closed_key,
+            old_fd0_closed,
+        );
+        restore_optional_env_var(&mut self.shell_state.env_vars, FUNCTION_STDIN, old_stdin);
+        restore_optional_env_var(
+            &mut self.shell_state.env_vars,
+            FUNCTION_STDIN_OFFSET,
+            old_offset,
+        );
+        result
+    }
+
+    /// GNU subst.c:6362 process_substitute(): the substituted word is
+    /// `/dev/fd/N` — the parent's end of the substitution pipe, moved to a
+    /// high fd below 64 (move_to_high_fd, the same band the coproc fds
+    /// 63/60 come from). Windows has no /dev/fd filesystem, but the
+    /// shell's virtual fd table can carry the stream: every `/dev/fd/N`
+    /// consumer already resolves through it — redirects via
+    /// execution_misc::dev_stdio_redirect_fd -> open_fd_read_endpoint
+    /// (FdReadEndpoint::ProcessSubstitution), external argv via
+    /// dev_fd_operands::materialize_dev_fd_operands ->
+    /// dev_fd_table_operand, in-shell reads via the endpoint itself
+    /// (rubash#355: `case <(echo c) in /dev/fd/*` and `echo <(cmd)` are
+    /// script-visible and GNU prints the /dev/fd form).
+    ///
+    /// The temp file stays the backing store for Windows child processes
+    /// (registered in the stream table under its path and deleted by
+    /// ProcessSubstitutionFiles::drop); the fd-table endpoint owns its own
+    /// copy so the shared-offset drain semantics (procsub.tests
+    /// count_lines 1,0,0,0,0) survive word-form changes. The fd stays
+    /// registered for the shell's lifetime — GNU marks the real fd
+    /// close-on-exec but keeps it in the parent, so a variable carrying
+    /// `/dev/fd/N` remains resolvable later.
+    fn register_process_substitution_fd(&mut self, output: &[u8]) -> u32 {
+        let mut fd = 63u32;
+        while fd > 3 && !self.fd_table_fd_free(fd) {
+            fd -= 1;
+        }
+        if fd <= 3 {
+            // move_to_high_fd (general.c:681) is dup2-backed in GNU — it
+            // scans downward from maxfd-1 via fcntl F_GETFD and dup2()s
+            // into the first free slot — a different mechanism from the
+            // fcntl F_DUPFD that backs {var} allocation (redir.c:942).
+            // The limit-aware fallback below is bounded by the same
+            // RLIMIT_NOFILE soft limit as every other dynamic allocation
+            // (rubash#773); its low-first pick order is a pre-existing
+            // simplification of GNU's high-side scan.
+            return self.allocate_dynamic_fd().unwrap_or(63);
+        }
+        self.fd_table.open_input(
+            fd,
+            FdReadEndpoint::process_substitution_bytes(output.to_vec()),
+            true,
+        );
+        fd
+    }
+
+    fn fd_table_fd_free(&self, fd: u32) -> bool {
+        match self.fd_table.entries.get(&fd) {
+            // No entry = free (GNU move_to_high_fd skips only fds the
+            // shell actually holds open).
+            None => true,
+            Some(entry) => entry.closed || (entry.read.is_none() && entry.write.is_none()),
+        }
+    }
+
+    /// The word form of a materialized input process substitution:
+    /// `/dev/fd/N` per GNU subst.c:6362, with the payload registered under
+    /// that fd (see register_process_substitution_fd). rubash#545 (cell
+    /// 2): the fd is command-scoped — execute_materialized_command closes
+    /// every fd recorded here when the creating command finishes, matching
+    /// GNU's reap (`a=(<(echo p9)); cat "${a[0]}"` reports `No such file`).
+    pub(in crate::executor) fn process_substitution_fd_word(&mut self, output: &[u8]) -> String {
+        let fd = self.register_process_substitution_fd(output);
+        self.command_scoped_procsub_input_fds.push(fd);
+        format!("/dev/fd/{fd}")
+    }
+
+    /// rubash#545 (cell 2): close the input-procsub word fds the command
+    /// created (every fd recorded at or after `base`). GNU closes a
+    /// command's process-substitution fds and reaps its processes when the
+    /// command ends (subst.c process_substitute bookkeeping), so a stored
+    /// `/dev/fd/N` string names a dead path afterwards.
+    pub(in crate::executor) fn close_command_scoped_procsub_input_fds_from(&mut self, base: usize) {
+        for fd in self.command_scoped_procsub_input_fds.drain(base..) {
+            self.fd_table.entries.remove(&fd);
+        }
+    }
+
+    /// The word form of a materialized output process substitution
+    /// (`>(cmd)`): `/dev/fd/N` naming an fd whose write side feeds the
+    /// substitution's temp carrier (the finish path reads the temp by
+    /// path and runs the body with it as stdin).
+    pub(in crate::executor) fn process_substitution_output_fd_word(
+        &mut self,
+        temp: &PathBuf,
+    ) -> String {
+        let mut fd = 63u32;
+        while fd > 3 && !self.fd_table_fd_free(fd) {
+            fd -= 1;
+        }
+        if fd <= 3 {
+            return shell_display_path(&temp.to_string_lossy());
+        }
+        self.fd_table.open_output(
+            fd,
+            FdWriteEndpoint::ProcessSubstitution {
+                path: temp.to_path_buf(),
+                command: String::new(),
+            },
+            true,
+        );
+        format!("/dev/fd/{fd}")
+    }
+
+    pub(in crate::executor) fn empty_process_substitution_temp(
+        &self,
+    ) -> Result<PathBuf, ExecuteError> {
+        let path = self.process_substitution_temp_path()?;
+        File::create(&path)?;
+        Ok(path)
+    }
+
+    pub(in crate::executor) fn process_substitution_temp_path(
+        &self,
+    ) -> Result<PathBuf, ExecuteError> {
+        self.shell_temp_path("rubash-process-subst", ".tmp")
+    }
+
+    /// Unique path in the shell's temp dir for the niubash#362 out-of-band
+    /// `-c` transport: a serialized async-child script too large for the OS
+    /// command line / a single argv entry. The child removes the file after
+    /// reading it (rubash::invocation::materialize_command_file).
+    pub(in crate::executor) fn respawn_command_temp_path(&self) -> Result<PathBuf, ExecuteError> {
+        self.shell_temp_path("rubash-respawn-cmd", ".sh")
+    }
+
+    /// Resolve `$TMPDIR` (or the platform default) into a unique,
+    /// Windows-form path in an existing directory. Shared by the process
+    /// substitution materialization and the niubash#362 respawn transport so
+    /// the TMPDIR resolution and existence handling live in one place.
+    ///
+    /// Writability probe (not just existence): a present-but-unwritable
+    /// directory (Android's /tmp) must fall through to the next candidate.
+    /// Probe files carry pid + counter so parallel spawns never share one.
+    fn dir_usable_for_scratch(dir: &std::path::Path) -> bool {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+        if std::fs::create_dir_all(dir).is_err() {
+            return false;
+        }
+        let probe = dir.join(format!(
+            ".rubash-write-probe-{}-{}",
+            std::process::id(),
+            PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let usable = std::fs::write(&probe, b"").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        usable
+    }
+    fn shell_temp_path(&self, prefix: &str, suffix: &str) -> Result<PathBuf, ExecuteError> {
+        let dir_value = self
+            .shell_state
+            .env_vars
+            .get("TMPDIR")
+            .cloned()
+            .unwrap_or_else(safe_temp_dir_string);
+        let mut dir = shell_path_to_windows(&dir_value, &self.shell_state.env_vars);
+        if !Self::dir_usable_for_scratch(&dir) {
+            // The configured/platform directory may exist but be
+            // unwritable (Android ships an unwritable /tmp) or
+            // uncreatable: fall back to the process temp dir instead of
+            // failing the transport (whose only fallback is an inline
+            // -c string that dies E2BIG past MAX_ARG_STRLEN —
+            // background_command_with_large_function_table_runs).
+            // std::env::temp_dir honors TMPDIR/TEMP/TMP first, so an
+            // explicitly configured value still wins. As a last resort
+            // use the shell cwd (uniquely named file, removed after the
+            // child reads it) — an airtight test env may leave no temp
+            // variable set at all.
+            let fallback = std::env::temp_dir();
+            if Self::dir_usable_for_scratch(&fallback) {
+                dir = fallback;
+            } else if let Ok(cwd) = std::env::current_dir() {
+                dir = cwd;
+            } else {
+                fs::create_dir_all(&dir)?;
+            }
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        dir.push(format!("{prefix}-{}-{nanos}{suffix}", std::process::id()));
+        Ok(dir)
+    }
+
+    pub(in crate::executor) fn write_process_substitution_temp(
+        &self,
+        output: &str,
+    ) -> Result<PathBuf, ExecuteError> {
+        self.write_process_substitution_temp_bytes(output.as_bytes())
+    }
+
+    /// GNU subst.c:6362 process_substitute forks an asynchronous child for
+    /// every process substitution; jobs.c adds that fork to the job list so
+    /// `$!` expands to its pid (execute_cmd.c) and `wait $!` reports the
+    /// child's exit status (procsub.tests: `cat <(exit 123); wait $!` ->
+    /// 123). Rubash evaluates `<(...)` substitutions inline while
+    /// materializing the containing command, so the already-finished status
+    /// is recorded under a synthetic pid in the dedicated high range that
+    /// cannot collide with a real OS child pid.
+    pub(in crate::executor) fn register_process_substitution_status(&mut self, status: i32) {
+        const PROCSUB_SEQ_KEY: &str = "RUBASH_INTERNAL_PROCSUB_SEQ";
+        let seq = self
+            .shell_state
+            .env_vars
+            .get(PROCSUB_SEQ_KEY)
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        self.shell_state
+            .env_vars
+            .insert(PROCSUB_SEQ_KEY.to_string(), seq.wrapping_add(1).to_string());
+        let pid = self.shell_pid.wrapping_add(0x4000_0000).wrapping_add(seq);
+        self.shell_state
+            .job_table
+            .completed_statuses
+            .insert(pid, status);
+        self.shell_state.last_background_pid = Some(pid);
+    }
+
+    pub(in crate::executor) fn write_process_substitution_temp_bytes(
+        &self,
+        output: &[u8],
+    ) -> Result<PathBuf, ExecuteError> {
+        let path = self.process_substitution_temp_path()?;
+        fs::write(&path, output)?;
+        // subst.c:7143 command_substitute — the `<(cmd)` word names a
+        // pipe-like stream: every open shares one offset that drains on
+        // read. The temp file is only the argv carrier for external
+        // children; in-shell opens must consult the registered stream
+        // instead (procsub.tests count_lines: `wc -l < $1` x5 ->
+        // 1,0,0,0,0).
+        self.shell_state.procsub_streams.borrow_mut().insert(
+            path.clone(),
+            Rc::new(RefCell::new(crate::shell::state::ProcSubStream {
+                data: output.to_vec(),
+                offset: 0,
+            })),
+        );
+        Ok(path)
+    }
+
+    /// Serve the remaining bytes of a process-substitution stream opened
+    /// through its temp-path carrier, advancing the shared offset to EOF
+    /// (GNU: the word is a `/dev/fd/N` pipe dup — redir.c:1183
+    /// open_redir_file hands every consumer the same draining stream).
+    /// Returns `None` when `path` is not a registered substitution.
+    pub(in crate::executor) fn procsub_stream_take(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<Vec<u8>> {
+        let key = {
+            let streams = self.shell_state.procsub_streams.borrow();
+            if streams.contains_key(path) {
+                path.to_path_buf()
+            } else {
+                let canon = path.canonicalize().ok()?;
+                streams
+                    .keys()
+                    .find(|key| key.canonicalize().ok().as_deref() == Some(canon.as_path()))?
+                    .clone()
+            }
+        };
+        let stream = self.shell_state.procsub_streams.borrow().get(&key)?.clone();
+        let mut stream = stream.borrow_mut();
+        let rest = stream.data[stream.offset..].to_vec();
+        stream.offset = stream.data.len();
+        Some(rest)
+    }
+
+    pub(in crate::executor) fn virtual_fd_stdin_remaining_bytes(&self, fd: u32) -> Option<Vec<u8>> {
+        match self.fd_table.materialize_for_child().remove(&fd)?.read? {
+            MaterializedRead::Bytes(input) => Some(input),
+            MaterializedRead::InheritedProcessStdin => None,
+            _ => None,
+        }
+    }
+
+    pub(in crate::executor) fn virtual_fd_stdin_remaining(&self, fd: u32) -> Option<String> {
+        self.virtual_fd_stdin_remaining_bytes(fd)
+            .map(|bytes| crate::executor::substitution_metadata::bytes_to_shell_text(&bytes))
+    }
+
+    fn virtual_fd_stdin_len(&self, fd: u32) -> String {
+        if let Some((input, _)) = self.fd_table.input_snapshot_bytes(fd) {
+            return input.len().to_string();
+        }
+        "0".to_string()
+    }
+
+    pub(in crate::executor) fn external_fd_heredoc_input(
+        &mut self,
+        cmd: &CommandNode,
+        fd: u32,
+    ) -> Option<String> {
+        let redirect = cmd
+            .heredoc_redirects
+            .iter()
+            .rev()
+            .find(|redirect| redirect.fd == Some(fd))?;
+        if redirect.body_carrier.is_some() {
+            let mut input = if redirect.here_string {
+                self.expand_here_string_mut_from_carrier(&redirect.body_carrier)
+            } else {
+                self.expand_heredoc_body_mut_from_carrier(&redirect.body_carrier)
+            };
+            if redirect.here_string {
+                input.push('\n');
+            }
+            return Some(input);
+        }
+        let body = redirect.body.as_deref()?;
+        if let Some(word) = body.strip_prefix(STORAGE_WORD_PREFIX) {
+            let mut input =
+                decode_ansi_c_quoted_word(word).unwrap_or_else(|| self.expand_word(word));
+            input.push('\n');
+            return Some(input);
+        }
+        Some(self.expand_heredoc_body_mut(body))
+    }
+}
+
+fn sync_ordered_redirect_targets(command: &mut CommandNode) {
+    for redirect in &mut command.redirects {
+        if !redirect.target.starts_with(">(") {
+            continue;
+        }
+        let source = if redirect.fd.unwrap_or(1) == 2 {
+            command
+                .redirect_err_append
+                .as_ref()
+                .or(command.redirect_err.as_ref())
+        } else {
+            command.redirect_out.as_ref().or(command.append.as_ref())
+        };
+        if let Some(source) = source {
+            redirect.target = source.target.clone();
+            redirect.target_metadata = source.target_metadata.clone();
+        }
+    }
+}
+
+fn raw_word_contains_process_substitution(raw: &str) -> bool {
+    let chars = raw.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if ch == '\\' && !single {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if ch == '\'' && !double {
+            single = !single;
+            index += 1;
+            continue;
+        }
+        if ch == '"' && !single {
+            double = !double;
+            index += 1;
+            continue;
+        }
+        if !single && !double && matches!(ch, '<' | '>') && chars.get(index + 1) == Some(&'(') {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
