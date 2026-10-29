@@ -235,9 +235,24 @@ The engine also runs the [bashdb](https://github.com/Trepan-Debuggers/bashdb) co
 
 Rubash is a **from-scratch rewrite of GNU Bash semantics in Rust** — not a port or translation of the GNU Bash C code. No GNU Bash source is compiled into, linked with, or copied into Rubash's own code. Compatibility is defined against the *observable behavior* of GNU Bash 5.3.x and verified by black-box differential testing. The vendored GNU Bash source lives in the separate `third_party/bash` submodule under its original GPL-3.0-or-later license and serves only as a semantic reference and test oracle. Full statement and contributor rules in [`docs/PROVENANCE.md`](docs/PROVENANCE.md).
 
+This repository is a **renamed fork** of [unixwin/rubash](https://github.com/unixwin/rubash),
+republished as `JayWanX/rubash` so native-shell can pin a specific engine
+revision. The engine is upstream's work; upstream remains the canonical
+project. The fork carries two commits native-shell needs, both additive:
+
+1. `bash.rs` locates the host shell by its current name (`native-shell.exe`)
+   instead of the pre-rename names it used to probe.
+2. The invocation-face variable is read under the current name
+   (`NATIVE_SHELL_INVOKED_AS`) instead of the pre-rename one.
+
+Both are pinned by `scripts/release/rubash-pin.json` in the native-shell
+repository. No upstream file is relicensed, and the MIT copyright notice
+("Copyright (c) 2024 unixwin team") is unchanged — see [`LICENSE`](LICENSE).
+
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT — see [`LICENSE`](LICENSE) ("Copyright (c) 2024 unixwin team", unchanged
+from upstream; the fork does not relicense anything).
 
 ## Contributing
 
